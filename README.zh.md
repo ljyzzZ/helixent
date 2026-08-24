@@ -13,6 +13,8 @@
 
 Helixent 是一只写代码的蓝色兔子。它包含一个 Agent Loop（智能体循环）、一个 Coding Agent（编码智能体），以及一个简洁的 CLI。
 
+希望从零复刻并深入学习 Agent Harness，可以阅读：[从零构建可观测、可恢复、可评测的 Coding Agent Harness](./docs/tutorial/README.md)。
+
 ## Demo
 
 https://github.com/user-attachments/assets/4ad89f14-e338-43e4-82ce-91cb83d58be2

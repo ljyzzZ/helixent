@@ -13,6 +13,8 @@
 
 Helixent is a blue rabbit that writes code. It includes an Agent Loop, a Coding Agent, and a nice CLI.
 
+For a staged, from-scratch learning path, see the Chinese tutorial: [Build an observable, recoverable, and evaluable Coding Agent Harness](./docs/tutorial/README.md).
+
 ## Demo
 
 https://github.com/user-attachments/assets/4ad89f14-e338-43e4-82ce-91cb83d58be2
