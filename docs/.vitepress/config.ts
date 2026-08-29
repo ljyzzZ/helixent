@@ -17,6 +17,10 @@ export default defineConfig({
           text: "Coding Agent Harness 教程",
           items: [
             { text: "课程介绍", link: "/tutorial/" },
+            {
+              text: "第零部分：TypeScript 必备基础",
+              link: "/tutorial/part-0-typescript-basics",
+            },
             { text: "第一部分：Foundation", link: "/tutorial/part-1-foundation" },
             { text: "第二部分：Agent Runtime", link: "/tutorial/part-2-agent-runtime" },
             { text: "第三部分：Coding Agent", link: "/tutorial/part-3-coding-agent" },

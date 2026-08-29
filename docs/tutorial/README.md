@@ -58,9 +58,12 @@ Eval runner → fixtures → isolated workspace → agent run → graders → re
 
 最低要求：
 
-- 会使用 TypeScript 的 interface、union、generic 和 async/await；
 - 知道 JSON、HTTP API、环境变量和 Git 的基本用法；
 - 能阅读一个失败测试的错误信息。
+
+如果还不熟悉 TypeScript，可以先完成[第零部分：TypeScript 必备基础](./part-0-typescript-basics.md)。
+它覆盖后续代码会用到的 interface、union、generic、class、async/await 和
+`AsyncGenerator`，不要求预先具备 TypeScript 开发经验。
 
 不要求提前掌握：
 
@@ -95,6 +98,7 @@ Eval runner → fixtures → isolated workspace → agent run → graders → re
 
 ## 5. 章节导航
 
+- [第零部分：TypeScript 必备基础](./part-0-typescript-basics.md)
 - [第一部分：工程基础与 Foundation](./part-1-foundation.md)
 - [第二部分：Agent Runtime](./part-2-agent-runtime.md)
 - [第三部分：Coding Agent 与交互客户端](./part-3-coding-agent.md)

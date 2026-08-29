@@ -2,6 +2,8 @@
 
 这一部分完成阶段 0～3。结束时你还没有真正的 Agent，但已经拥有 Agent runtime 最重要的三组稳定契约：Message、Model 和 Tool。
 
+如果你还不熟悉 TypeScript 的类型、union、generic、class 或 async/await，请先阅读[第零部分：TypeScript 必备基础](./part-0-typescript-basics.md)。
+
 不要急着调用真实模型。先使用 deterministic fake 建立可重复测试，后面出现错误时才能判断问题来自 harness 还是 provider。
 
 ## 阶段 0：建立可运行工程
@@ -463,7 +465,10 @@ describe("formatTranscript", () => {
 ### 运行与观察
 
 ```bash
+# 执行示例程序，在终端观察格式化后的 transcript
 bun run examples/stage-01-transcript.ts
+
+# 运行自动化测试，验证 formatter 的输出
 bun test src/foundation/messages
 ```
 
