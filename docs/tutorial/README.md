@@ -199,30 +199,6 @@ bun test path/to/test.ts
 - 第一个关键分支给出标准实现，并用注释解释输入、输出和不变量；
 - 其余分支保留为练习，但每个 `TODO` 都提供独立提示、边界条件和失败语义。
 
-读者不需要猜测“这个 TODO 想考什么”，但仍需要自己完成核心逻辑。
-
-所有会被后续章节、测试或其他文件 import 的公共契约，都由教程预先固定名称、export
-方式和签名。读者不能自行把 `AssistantMessage` 改名为 `AIMessage`，也不需要猜测 factory
-应该叫 `createX` 还是 `defineX`。练习只发生在契约内部，例如：
-
-```ts
-// 固定公共类型名；读者根据逐字段提示填写 interface body。
-export interface AssistantMessage {
-  // TODO 1：添加 role，类型必须是 string literal "assistant"。
-  // TODO 2：添加 content，类型使用 AssistantMessageContent。
-  // TODO 3：添加可选 usage，类型使用 TokenUsage。
-}
-
-// 固定函数名、参数和返回类型；读者只实现函数体。
-export function parseMessage(input: unknown): Message {
-  throw new Error("TODO: implement parseMessage");
-}
-```
-
-空 `interface` 和抛出 `TODO` 的函数体只是暂时骨架；完整测试会在字段或行为缺失时失败。
-对无法写成空声明的 union，教程使用 `never` 作为明确占位，并提示读者替换，而不是使用
-未声明的 `TODO` 类型标识符。
-
 ### 8.4 代码块路径、示例输入和示例输出
 
 所有实现代码块之前都标明目标文件。示例数据统一写成“示例输入”“示例输出”，并说明：

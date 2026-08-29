@@ -55,7 +55,7 @@ export type AgentEvent =
 
 目标文件：`src/agent/errors.ts`
 
-后续测试会按名称 import `MaximumStepsError`，因此先固定完整 public error 契约：
+`MaximumStepsError` 表示 Agent 达到最大步数后仍未结束：
 
 ```ts
 export class MaximumStepsError extends Error {

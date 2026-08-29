@@ -102,8 +102,7 @@ export function parseOpenAIAssistantMessage(
 
 目标文件：`src/community/anthropic/utils.ts`
 
-Anthropic adapter 的 public 函数名和签名同样由教程固定。下面先给出可编译的空函数体；
-读者只替换临时 `throw`，不要把这些函数改名：
+实现 Anthropic 协议转换函数：
 
 ```ts
 export function extractSystemPrompt(messages: Message[]): string | undefined {
@@ -685,10 +684,9 @@ touch src/coding/tools/index.ts examples/stage-08-coding-tools.ts
 这个循环只创建空文件，不覆盖内容。所有 Tool 的公开行为集中在一个完整 contract test，
 路径安全单独测试；迭代时可用 `bun test -t "read_file"` 只运行相关用例。
 
-每个 Tool factory 的 export 名称固定如下；文件内部实现可以拆 helper，但不要改动这些
-composition root 会引用的名称：
+各 Tool factory 的导出如下：
 
-| 文件 | 固定 public export |
+| 文件 | public export |
 |---|---|
 | `file-info.ts` | `defineFileInfoTool` |
 | `list-files.ts` | `defineListFilesTool` |
@@ -823,7 +821,7 @@ ABORTED
 
 目标文件：`src/coding/tools/index.ts`
 
-测试和 Coding Agent composition root 都只依赖一个固定入口，避免各自猜测 Tool 的导出名：
+用 `defineCodingTools()` 创建阶段 8 的全部 Tool：
 
 ```ts
 export interface DefineCodingToolsOptions {
@@ -839,9 +837,6 @@ export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
   throw new Error("TODO: implement defineCodingTools");
 }
 ```
-
-`DefineCodingToolsOptions`、`defineCodingTools` 和 `Tool[]` 返回类型是后续阶段的固定公共
-契约；读者可以自行拆分内部 factory，但不能改变这个 composition 入口。
 
 目标文件：`src/coding/tools/__tests__/tool-utils.test.ts`
 
@@ -1102,7 +1097,7 @@ Skill discovery 只读取 `name`、`description`、`path`，把列表注入 mode
 
 目标文件：`src/agent/skills/skill-reader.ts`
 
-本阶段固定以下公开契约，避免测试和调用方猜函数名：
+实现 Skill 发现与读取接口：
 
 ```ts
 export interface SkillDescriptor {
@@ -1153,7 +1148,7 @@ Todo 由一个 Tool 和一个 Middleware 组成：
 
 目标文件：`src/agent/todos/todo-system.ts`
 
-先固定测试、Middleware 和 TUI 共同使用的数据名称；方法体保留给读者：
+定义 Todo 数据类型和状态管理类：
 
 ```ts
 export type TodoStatus = "pending" | "in_progress" | "completed";
@@ -1521,7 +1516,7 @@ models:
       temperature: 0
 ```
 
-在读取 YAML 之前先固定解析后的内部类型和两个 public 函数；测试不会自行发明命名：
+定义解析后的内部类型和配置解析函数：
 
 ```ts
 export type ModelProviderName = "openai" | "anthropic";

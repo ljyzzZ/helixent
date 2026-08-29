@@ -158,7 +158,7 @@ export interface EvalSuite {
 
 目标文件：`src/eval/task-loader.ts`
 
-测试会直接构造 `TaskLoader`，因此类名、构造参数和方法签名必须先固定：
+实现任务加载器：
 
 ```ts
 export class TaskLoader {
@@ -244,8 +244,7 @@ LLM judge 适合评价解释质量或开放式结果，但会引入额外模型�
 
 目标文件：`src/eval/types.ts`
 
-先固定 Runner、依赖 fake 和测试共同使用的名称。字段可以后续扩展，但不能在各实现中
-分别发明另一套 method name：
+定义 `EvalRunner` 依赖的接口：
 
 ```ts
 export type EvalConfig = Record<string, unknown>;

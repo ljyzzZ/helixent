@@ -181,8 +181,6 @@ export function createTraceRedactor(options: {
 }
 ```
 
-`TraceRedactor` 和 `createTraceRedactor` 是 TraceStore 与测试共享的固定 public 契约。
-
 目标文件：`src/runtime/trace/jsonl-trace-store.ts`
 
 ```ts

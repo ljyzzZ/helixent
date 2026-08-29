@@ -182,8 +182,8 @@ src/foundation/messages/
 目标文件：`src/foundation/messages/types/content.ts`
 
 下面先完整实现 `SystemMessageContent` 作为标准示例。它只允许文本，原因是本课程把
-system prompt 视为纯文本运行时配置。其余三个 public type 名称已经固定；`never[]` 是
-临时空实现，请根据各自注释替换数组元素类型，不要重命名这些 type。
+system prompt 视为纯文本运行时配置。其余三个内容类型暂时使用 `never[]`，请根据各自
+注释替换数组元素类型。
 
 ```ts
 export interface TextContent {
@@ -244,8 +244,8 @@ export type MessageContent =
 目标文件：`src/foundation/messages/types/message.ts`
 
 `UserMessage` 是本文件的标准实现示例。注意 `role` 必须是 string literal，不能放宽为
-`string`。`AssistantMessage` 和 `ToolMessage` 的固定类型名及空 interface 已经给出，读者
-只填写字段；两个顶层 union 使用 `never` 暂时占位。
+`string`。请根据注释填写 `AssistantMessage` 和 `ToolMessage` 的字段，并替换两个顶层
+union 中的 `never` 占位。
 
 ```ts
 import type {
@@ -291,10 +291,6 @@ export type NonSystemMessage = never;
 // Message 同样表示单条消息，Message[] 才表示 transcript。
 export type Message = never;
 ```
-
-这里刻意不让读者自行命名 `AssistantMessage` 或 `ToolMessage`。后续 formatter、Model、
-Agent 和测试都从 barrel import 这些 canonical 名称；练习目标是填写协议字段和 union，
-不是重新设计公共 API。
 
 目标文件：`src/foundation/messages/types/index.ts`
 
@@ -864,9 +860,6 @@ export function errorToolResult(
   throw new Error("TODO: implement errorToolResult");
 }
 ```
-
-两个 factory 的 public 名称、参数顺序和返回类型已经固定；读者只替换函数体中的临时
-`throw`，后续 Tool 和测试不需要猜测 factory 命名。
 
 完成 Tool 类型后，回到以下两个文件加入 `tools?: Tool[]`：
 
