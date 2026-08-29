@@ -40,6 +40,9 @@
     "check": "tsc --noEmit && eslint . --ext .ts && bun test",
     "check:types": "tsc --noEmit",
     "dev": "bun run index.ts",
+    "docs:build": "vitepress build docs",
+    "docs:dev": "vitepress dev docs --port 5173",
+    "docs:preview": "vitepress preview docs --port 4173",
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix"
   },
@@ -52,7 +55,8 @@
     "eslint-plugin-import-x": "^4.16.1",
     "prettier": "^3.8.1",
     "react-devtools-core": "^7.0.1",
-    "typescript-eslint": "^8.56.1"
+    "typescript-eslint": "^8.56.1",
+    "vitepress": "^1.6.4"
   },
   "peerDependencies": {
     "typescript": "^5"

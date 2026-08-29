@@ -23,7 +23,18 @@ act:   tool_use → tool runtime → tool_result → transcript
 - 暂不实现 Ctrl+C abort；
 - 每轮 model 只读取最终 response，不展示中间 progress。
 
+创建文件：
+
+```bash
+mkdir -p src/agent/__tests__ examples
+touch src/agent/agent-context.ts src/agent/agent-event.ts src/agent/agent.ts
+touch src/agent/errors.ts src/agent/serialize-tool-result.ts src/agent/index.ts
+touch src/agent/__tests__/agent.test.ts examples/stage-04-react-loop.ts
+```
+
 ### 4.1 AgentContext 和 AgentEvent
+
+目标文件：`src/agent/agent-context.ts` 和 `src/agent/agent-event.ts`
 
 ```ts
 export interface AgentContext {
@@ -42,6 +53,11 @@ export type AgentEvent =
 
 ### 4.2 Agent 骨架
 
+目标文件：`src/agent/agent.ts`
+
+构造函数和 getter 是标准实现示例。getter 返回数组副本，防止调用方绕过 Agent
+直接篡改 transcript；核心 loop 留给读者按分项提示完成。
+
 ```ts
 export class Agent {
   private readonly _context: AgentContext;
@@ -56,31 +72,38 @@ export class Agent {
     tools?: Tool[];
     maxSteps?: number;
   }) {
-    // TODO
+    // 标准实现示例：复制外部数组，默认最多运行 20 个 step。
+    this.model = model;
+    this.maxSteps = maxSteps ?? 20;
+    this._context = {
+      prompt,
+      messages: [...(messages ?? [])],
+      tools: [...(tools ?? [])],
+    };
   }
 
   get messages(): NonSystemMessage[] {
-    // TODO
+    return [...this._context.messages];
   }
 
   async *stream(userMessage: UserMessage): AsyncGenerator<AgentEvent> {
-    // TODO:
-    // 1. append userMessage
-    // 2. for step = 1 ... maxSteps
-    // 3. think：调用 model.stream，保留最后一个 snapshot
-    // 4. append/yield assistantMessage
-    // 5. 提取 tool_use
-    // 6. 没有 tool_use 就 return
-    // 7. 顺序执行 tool，并 append/yield ToolMessage
-    // 8. 超过 maxSteps 时抛出 MaximumStepsError
+    // TODO 1：先 append userMessage，同一个对象只能追加一次。
+    // TODO 2：for step = 1 ... maxSteps，调用 model.stream。
+    // TODO 3：遍历累计 snapshot，但只保留最后一个完整 AssistantMessage。
+    // TODO 4：append/yield assistant message，保持 transcript 与 event 顺序一致。
+    // TODO 5：提取 tool_use；没有 Tool call 时立即 return。
+    // TODO 6：本阶段按数组顺序逐个执行，并 append/yield ToolMessage。
+    // TODO 7：Tool failure 也序列化成 observation，不从 loop 直接 throw。
+    // TODO 8：循环耗尽后抛出带 maxSteps 的 MaximumStepsError。
   }
 
   private _extractToolUses(message: AssistantMessage): ToolUseContent[] {
-    // TODO: 使用 type predicate，禁止 as ToolUseContent[]
+    // TODO 9：使用 filter + type predicate；禁止 `as ToolUseContent[]`。
   }
 
   private async _invokeTool(toolUse: ToolUseContent): Promise<ToolMessage> {
-    // TODO: 通过 ToolRegistry 执行并关联 tool_use_id
+    // TODO 10：通过 ToolRegistry 执行并用 serializeToolResult 转为字符串；
+    // tool_use_id 必须原样复制 toolUse.id。
   }
 }
 ```
@@ -88,6 +111,8 @@ export class Agent {
 ### 4.3 Tool result 序列化策略
 
 Provider wire protocol 通常要求 Tool result content 是字符串。定义一个明确的边界函数：
+
+目标文件：`src/agent/serialize-tool-result.ts`
 
 ```ts
 export function serializeToolResult(result: unknown): string {
@@ -109,7 +134,10 @@ export function serializeToolResult(result: unknown): string {
 
 ### 4.4 离线 weather agent
 
-准备两个 scripted responses：
+目标文件：`examples/stage-04-react-loop.ts`
+
+准备两个 scripted responses。以下是示例输入：第一个 response 发出 Tool call，第二个
+response 给最终文本；`weather-1` 在这次 run 中必须唯一。
 
 ```ts
 const responses: AssistantMessage[] = [
@@ -137,7 +165,7 @@ const responses: AssistantMessage[] = [
 bun run examples/stage-04-react-loop.ts
 ```
 
-示例程序应该根据 `AgentEvent` 打印：
+示例程序应该根据 `AgentEvent` 打印以下示例输出：
 
 ```text
 [user] 北京天气如何？
@@ -147,23 +175,109 @@ bun run examples/stage-04-react-loop.ts
 [done] steps=2 messages=4
 ```
 
-### 4.5 必写测试
+### 4.5 完整测试
+
+目标文件：`src/agent/__tests__/agent.test.ts`
 
 ```ts
-test("runs think-act-observe until the model returns text", async () => {
-  // 断言 role 顺序 user → assistant → tool → assistant
+import { describe, expect, test } from "bun:test";
+import { z } from "zod";
+
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model, ScriptedModelProvider } from "@/foundation/models";
+import { defineTool } from "@/foundation/tools";
+
+import { Agent } from "../agent";
+import { MaximumStepsError } from "../errors";
+
+const USER_MESSAGE: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "北京天气如何？" }],
+};
+
+const WEATHER_CALL: AssistantMessage = {
+  role: "assistant",
+  content: [
+    {
+      type: "tool_use",
+      id: "weather-1",
+      name: "get_weather",
+      input: { description: "查询北京天气", city: "北京" },
+    },
+  ],
+};
+
+const FINAL_ANSWER: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "北京今天晴，26°C。" }],
+};
+
+const weatherTool = defineTool({
+  name: "get_weather",
+  description: "Return deterministic weather",
+  parameters: z.object({ description: z.string(), city: z.string() }),
+  invoke: async ({ city }) => ({ city, condition: "晴", temperatureC: 26 }),
 });
 
-test("preserves tool_use_id in the result message", async () => {
-  // TODO
-});
+async function drain(agent: Agent): Promise<void> {
+  for await (const _event of agent.stream(USER_MESSAGE)) {
+    // 消费完整 event stream；断言统一读取 agent.messages。
+  }
+}
 
-test("turns an unknown tool into an observation", async () => {
-  // Agent 不应崩溃，下一轮模型应看到 TOOL_NOT_FOUND
-});
+function defineWeatherAgent(options: {
+  responses?: AssistantMessage[];
+  tools?: typeof weatherTool[];
+  maxSteps?: number;
+} = {}): Agent {
+  const provider = new ScriptedModelProvider({
+    responses: options.responses ?? [WEATHER_CALL, FINAL_ANSWER],
+  });
+  return new Agent({
+    model: new Model({ name: "scripted", provider }),
+    prompt: "Answer with tools when needed",
+    tools: options.tools ?? [weatherTool],
+    maxSteps: options.maxSteps,
+  });
+}
 
-test("fails with a typed error after maxSteps", async () => {
-  // scripted provider 每轮都返回 tool_use
+describe("Agent", () => {
+  test("runs think-act-observe until the model returns text", async () => {
+    const agent = defineWeatherAgent();
+    await drain(agent);
+
+    expect(agent.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "assistant",
+    ]);
+  });
+
+  test("preserves tool_use_id in the result message", async () => {
+    const agent = defineWeatherAgent();
+    await drain(agent);
+    const toolMessage = agent.messages.find((message) => message.role === "tool");
+
+    expect(toolMessage?.content[0]).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "weather-1",
+    });
+  });
+
+  test("turns an unknown tool into an observation", async () => {
+    const agent = defineWeatherAgent({ tools: [] });
+    await drain(agent);
+    const toolMessage = agent.messages.find((message) => message.role === "tool");
+
+    expect(toolMessage?.content[0]?.content).toContain("TOOL_NOT_FOUND");
+    expect(agent.messages.at(-1)).toEqual(FINAL_ANSWER);
+  });
+
+  test("fails with a typed error after maxSteps", async () => {
+    const agent = defineWeatherAgent({ responses: [WEATHER_CALL], maxSteps: 1 });
+    expect(drain(agent)).rejects.toBeInstanceOf(MaximumStepsError);
+  });
 });
 ```
 
@@ -193,9 +307,19 @@ test("fails with a typed error after maxSteps", async () => {
 2. 同一 assistant message 中的独立 Tool 被串行执行；
 3. 用户中止后网络请求或子进程仍可能继续运行。
 
+创建新增文件：
+
+```bash
+touch src/agent/__tests__/agent-streaming.test.ts
+touch examples/stage-05-parallel-tools.ts examples/stage-05-abort.ts
+```
+
 ### 5.1 Streaming 状态机
 
-在 `Agent` 增加：
+目标文件：`src/agent/agent.ts`
+
+在 `Agent` 增加。`abort()` 是标准实现示例：它只发出中止信号，资源清理由持有资源的
+provider/Tool 完成。
 
 ```ts
 private _streaming = false;
@@ -219,7 +343,8 @@ async *stream(message: UserMessage): AsyncGenerator<AgentEvent> {
   this._abortController = new AbortController();
   this._streaming = true;
   try {
-    // TODO: run loop
+    // TODO 1：复用阶段 4 loop，并把 this._abortController.signal 同时传入 Model 和 Tool。
+    // TODO 2：累计 snapshot 只产生 progress；最后一个 snapshot 才进入 transcript。
   } finally {
     this._streaming = false;
     this._abortController = null;
@@ -244,7 +369,9 @@ async *stream(message: UserMessage): AsyncGenerator<AgentEvent> {
 - Tool 启动顺序：按模型给出的数组顺序；
 - Tool result 进入 transcript 的顺序：按实际完成顺序。
 
-核心骨架：
+目标文件：`src/agent/agent.ts` 的 `_act()`（从阶段 4 的顺序执行逻辑中提取）。
+
+核心骨架已实现“启动全部 promise”和“按完成顺序取结果”；最后一步留给读者：
 
 ```ts
 const pending = toolUses.map(async (toolUse, index) => {
@@ -266,7 +393,8 @@ while (remaining.size > 0) {
   const candidates = [...remaining].map((index) => pending[index]!);
   const resolved = await Promise.race(candidates);
   remaining.delete(resolved.index);
-  // TODO: append/yield resolved tool result
+  // TODO 3：把 resolved.result 序列化成与 resolved.toolUse.id 关联的 ToolMessage；
+  // 先 append transcript，再 yield message event。不得按 resolved.index 重新排序。
 }
 ```
 
@@ -276,7 +404,10 @@ while (remaining.size > 0) {
 
 ### 5.3 Abort Tool
 
-实现一个 `delay` Tool：
+目标文件：`examples/stage-05-abort.ts`
+
+实现一个 `delay` Tool。示例输入规则：`ms` 是非负有限整数，`label` 非空；signal
+可以缺省，但一旦中止必须清理 timer 并以 AbortError 结束。
 
 ```ts
 invoke: async ({ ms, label }, signal) => {
@@ -321,15 +452,211 @@ bun run examples/stage-05-abort.ts
 
 程序在 100ms 后调用 `agent.abort()`，应快速退出且没有悬挂 timer/process。
 
-### 5.4 必写测试
+### 5.4 完整测试
 
-- 快 Tool 的 `tool_result` 先进入 transcript；
-- 总耗时接近最慢 Tool，而不是所有耗时之和；
-- abort 时 provider 收到同一个 signal；
-- abort 时 Tool 收到同一个 signal；
-- abort 后 `agent.streaming === false`；
-- 运行中再次调用 `stream()` 会失败；
-- 一个 Tool 失败不会取消同批次其他 Tool。
+目标文件：`src/agent/__tests__/agent-streaming.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+import { z } from "zod";
+
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model, ScriptedModelProvider } from "@/foundation/models";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
+import { defineTool } from "@/foundation/tools";
+
+import { Agent } from "../agent";
+
+const USER: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "run tools" }],
+};
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function defineDelayTool(name: string, ms: number, onSignal?: (signal?: AbortSignal) => void) {
+  return defineTool({
+    name,
+    description: `Wait ${ms}ms`,
+    parameters: z.object({ description: z.string() }),
+    invoke: async (_input, signal) => {
+      onSignal?.(signal);
+      await delay(ms, signal);
+      return { name, ms };
+    },
+  });
+}
+
+function toolBatch(names: string[]): AssistantMessage {
+  return {
+    role: "assistant",
+    content: names.map((name) => ({
+      type: "tool_use" as const,
+      id: `call-${name}`,
+      name,
+      input: { description: `run ${name}` },
+    })),
+  };
+}
+
+async function drain(agent: Agent): Promise<void> {
+  for await (const _event of agent.stream(USER)) {
+    // consume
+  }
+}
+
+describe("Agent streaming runtime", () => {
+  test("appends tool results in completion order and runs them concurrently", async () => {
+    const provider = new ScriptedModelProvider({
+      responses: [
+        toolBatch(["slow", "fast"]),
+        { role: "assistant", content: [{ type: "text", text: "done" }] },
+      ],
+    });
+    const agent = new Agent({
+      model: new Model({ name: "scripted", provider }),
+      prompt: "",
+      tools: [defineDelayTool("slow", 180), defineDelayTool("fast", 30)],
+    });
+
+    const startedAt = performance.now();
+    await drain(agent);
+    const elapsed = performance.now() - startedAt;
+    const resultIds = agent.messages
+      .filter((message) => message.role === "tool")
+      .map((message) => message.content[0]?.tool_use_id);
+
+    expect(resultIds).toEqual(["call-fast", "call-slow"]);
+    expect(elapsed).toBeLessThan(280);
+  });
+
+  test("passes the same signal to tools and resets streaming after abort", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    let started!: () => void;
+    const toolStarted = new Promise<void>((resolve) => (started = resolve));
+    const blockingTool = defineDelayTool("blocking", 10_000, (signal) => {
+      receivedSignal = signal;
+      started();
+    });
+    const provider = new ScriptedModelProvider({ responses: [toolBatch(["blocking"])] });
+    const agent = new Agent({
+      model: new Model({ name: "scripted", provider }),
+      prompt: "",
+      tools: [blockingTool],
+    });
+
+    const run = drain(agent);
+    await toolStarted;
+    agent.abort();
+    await expect(run).rejects.toBeDefined();
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(agent.streaming).toBe(false);
+  });
+
+  test("does not cancel a sibling tool when one tool throws", async () => {
+    let completed = false;
+    const brokenTool = defineTool({
+      name: "broken",
+      description: "Throw",
+      parameters: z.object({ description: z.string() }),
+      invoke: async () => {
+        throw new Error("boom");
+      },
+    });
+    const healthyTool = defineTool({
+      name: "healthy",
+      description: "Complete",
+      parameters: z.object({ description: z.string() }),
+      invoke: async () => {
+        await delay(20);
+        completed = true;
+        return "ok";
+      },
+    });
+    const provider = new ScriptedModelProvider({
+      responses: [
+        toolBatch(["broken", "healthy"]),
+        { role: "assistant", content: [{ type: "text", text: "observed" }] },
+      ],
+    });
+    const agent = new Agent({
+      model: new Model({ name: "scripted", provider }),
+      prompt: "",
+      tools: [brokenTool, healthyTool],
+    });
+
+    await drain(agent);
+    expect(completed).toBe(true);
+    expect(agent.messages.filter((message) => message.role === "tool")).toHaveLength(2);
+  });
+
+  test("passes abort to the active model request", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    let started!: () => void;
+    const modelStarted = new Promise<void>((resolve) => (started = resolve));
+    const provider: ModelProvider = {
+      invoke: async () => ({ role: "assistant", content: [] }),
+      stream: async function* (params: ModelProviderInvokeParams) {
+        receivedSignal = params.signal;
+        started();
+        await new Promise<void>((_resolve, reject) => {
+          params.signal?.addEventListener("abort", () => reject(params.signal?.reason), {
+            once: true,
+          });
+        });
+        yield { role: "assistant", content: [] };
+      },
+    };
+    const agent = new Agent({
+      model: new Model({ name: "blocking", provider }),
+      prompt: "",
+      tools: [],
+    });
+
+    const run = drain(agent);
+    await modelStarted;
+    agent.abort();
+    await expect(run).rejects.toBeDefined();
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
+  test("rejects a reentrant stream while a run is active", async () => {
+    let started!: () => void;
+    const modelStarted = new Promise<void>((resolve) => (started = resolve));
+    const provider: ModelProvider = {
+      invoke: async () => ({ role: "assistant", content: [] }),
+      stream: async function* ({ signal }: ModelProviderInvokeParams) {
+        started();
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        yield { role: "assistant", content: [] };
+      },
+    };
+    const agent = new Agent({
+      model: new Model({ name: "blocking", provider }),
+      prompt: "",
+      tools: [],
+    });
+
+    const firstRun = drain(agent);
+    await modelStarted;
+    await expect(drain(agent)).rejects.toThrow("already streaming");
+    agent.abort();
+    await expect(firstRun).rejects.toBeDefined();
+  });
+});
+```
 
 时间测试不要断言精确毫秒。用足够大的快慢差并设置宽松上限，减少 CI 抖动。
 
@@ -355,7 +682,16 @@ bun run examples/stage-05-abort.ts
 
 本阶段的核心不是“支持插件”，而是定义清晰的 mutation boundary。
 
+创建新增文件：
+
+```bash
+touch src/agent/agent-middleware.ts src/agent/lifecycle-recorder.ts
+touch src/agent/__tests__/middleware.test.ts examples/stage-06-middleware.ts
+```
+
 ### 6.1 Hook 契约
+
+目标文件：`src/agent/agent-middleware.ts`
 
 定义以下 hooks：
 
@@ -415,7 +751,10 @@ export interface AgentMiddleware {
 
 ### 6.3 Hook host 实现
 
-在 `Agent` 内实现 `_beforeAgentRun()` 等私有方法：
+目标文件：`src/agent/agent.ts`
+
+在 `Agent` 内实现 `_beforeAgentRun()` 等私有方法。`_beforeModel()` 是标准实现示例；
+其余 host 方法保持相同的 middleware 顺序和合并规则。
 
 ```ts
 private async _beforeModel(modelContext: ModelContext) {
@@ -441,26 +780,52 @@ type BeforeToolUseDecision =
 
 当 middleware 返回 `{ __skip: true, result }` 时，runtime 不调用真实 Tool，但仍然生成正常的 `tool_result` observation。
 
+其余实现提示：
+
+- TODO 1：`beforeAgentRun`、`beforeAgentStep`、`afterAgentStep` 和 `afterAgentRun` 的返回值只合并到 `AgentContext`；
+- TODO 2：`afterModel` 的返回值只合并到本次 `AssistantMessage`；
+- TODO 3：`beforeToolUse` 遇到第一个 `__skip` 后停止调用后续 `beforeToolUse`，但正常进入 observation；
+- TODO 4：本课程规定 `afterAgentRun` 放在外层 `finally`，成功、abort、error、maxSteps 都调用一次；
+- TODO 5：`afterAgentStep` 只在该 step 的 Tool observations 全部追加后调用，最终纯文本 step 不调用。
+
 ### 6.4 Lifecycle recorder
 
-实现一个只记录 hook 名称的 Middleware：
+目标文件：`src/agent/lifecycle-recorder.ts`
+
+实现一个只记录 hook 名称的 Middleware。第一个 hook 展示标准的 async block 写法，
+其余 hook 完整给出，复制后可直接通过 Promise return type 检查。
 
 ```ts
 export function defineLifecycleRecorder(log: string[]): AgentMiddleware {
   return {
-    beforeAgentRun: async () => void log.push("beforeAgentRun"),
-    beforeAgentStep: async ({ step }) => void log.push(`beforeAgentStep:${step}`),
-    beforeModel: async () => void log.push("beforeModel"),
-    afterModel: async () => void log.push("afterModel"),
-    beforeToolUse: async ({ toolUse }) => void log.push(`beforeToolUse:${toolUse.name}`),
-    afterToolUse: async ({ toolUse }) => void log.push(`afterToolUse:${toolUse.name}`),
-    afterAgentStep: async ({ step }) => void log.push(`afterAgentStep:${step}`),
-    afterAgentRun: async () => void log.push("afterAgentRun"),
+    beforeAgentRun: async () => {
+      // 标准实现示例：async hook 不返回 mutation 时自然解析为 undefined。
+      log.push("beforeAgentRun");
+    },
+    beforeAgentStep: async ({ step }) => {
+      log.push(`beforeAgentStep:${step}`);
+    },
+    beforeModel: async () => {
+      log.push("beforeModel");
+    },
+    afterModel: async () => {
+      log.push("afterModel");
+    },
+    beforeToolUse: async ({ toolUse }) => {
+      log.push(`beforeToolUse:${toolUse.name}`);
+    },
+    afterToolUse: async ({ toolUse }) => {
+      log.push(`afterToolUse:${toolUse.name}`);
+    },
+    afterAgentStep: async ({ step }) => {
+      log.push(`afterAgentStep:${step}`);
+    },
+    afterAgentRun: async () => {
+      log.push("afterAgentRun");
+    },
   };
 }
 ```
-
-调整 TypeScript 写法，使每个 hook 符合定义的 Promise return type；不要为了照搬示例而保留类型错误。
 
 ### 运行与观察
 
@@ -486,17 +851,186 @@ afterAgentRun
 
 本课程定义：没有 Tool 的终止 step 不调用 `afterAgentStep`，与 Helixent 当前语义保持一致。你可以选择不同语义，但必须在 ADR 和测试中固定下来。
 
-### 6.5 必写测试
+### 6.5 完整测试
 
-- lifecycle 完整顺序；
-- 多个 middleware 按数组顺序执行；
-- `beforeModel` 只修改单次 `ModelContext`；
-- `beforeToolUse` skip 后真实 Tool invoke count 为 0；
-- skip result 仍进入 transcript；
-- Tool throw 时普通 middleware 的行为有明确测试；
-- maxSteps/error 时 `afterAgentRun` 是否调用有明确语义。
+目标文件：`src/agent/__tests__/middleware.test.ts`
 
-最后两条不要求唯一答案，但不能依赖偶然的控制流。
+```ts
+import { describe, expect, test } from "bun:test";
+import { z } from "zod";
+
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model, ScriptedModelProvider } from "@/foundation/models";
+import { defineTool } from "@/foundation/tools";
+
+import { Agent } from "../agent";
+import type { AgentMiddleware } from "../agent-middleware";
+import { defineLifecycleRecorder } from "../lifecycle-recorder";
+
+const USER: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "run" }],
+};
+const TOOL_CALL: AssistantMessage = {
+  role: "assistant",
+  content: [
+    {
+      type: "tool_use",
+      id: "call-1",
+      name: "work",
+      input: { description: "do work" },
+    },
+  ],
+};
+const FINAL: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "done" }],
+};
+
+async function drain(agent: Agent): Promise<void> {
+  for await (const _event of agent.stream(USER)) {
+    // consume
+  }
+}
+
+function defineAgent(options: {
+  middlewares: AgentMiddleware[];
+  invoke?: () => Promise<unknown>;
+  responses?: AssistantMessage[];
+  maxSteps?: number;
+}): Agent {
+  const tool = defineTool({
+    name: "work",
+    description: "Test work",
+    parameters: z.object({ description: z.string() }),
+    invoke: options.invoke ?? (async () => "ok"),
+  });
+  return new Agent({
+    model: new Model({
+      name: "scripted",
+      provider: new ScriptedModelProvider({ responses: options.responses ?? [TOOL_CALL, FINAL] }),
+    }),
+    prompt: "test",
+    tools: [tool],
+    middlewares: options.middlewares,
+    maxSteps: options.maxSteps,
+  });
+}
+
+describe("Agent middleware", () => {
+  test("runs the complete lifecycle in the documented order", async () => {
+    const log: string[] = [];
+    await drain(defineAgent({ middlewares: [defineLifecycleRecorder(log)] }));
+
+    expect(log).toEqual([
+      "beforeAgentRun",
+      "beforeAgentStep:1",
+      "beforeModel",
+      "afterModel",
+      "beforeToolUse:work",
+      "afterToolUse:work",
+      "afterAgentStep:1",
+      "beforeAgentStep:2",
+      "beforeModel",
+      "afterModel",
+      "afterAgentRun",
+    ]);
+  });
+
+  test("runs multiple middleware in array order", async () => {
+    const log: string[] = [];
+    const defineOrderMiddleware = (name: string): AgentMiddleware => ({
+      beforeModel: async () => {
+        log.push(name);
+      },
+    });
+    await drain(
+      defineAgent({
+        middlewares: [defineOrderMiddleware("first"), defineOrderMiddleware("second")],
+      }),
+    );
+
+    expect(log.slice(0, 2)).toEqual(["first", "second"]);
+  });
+
+  test("keeps beforeModel messages out of the canonical transcript", async () => {
+    const temporaryView: AgentMiddleware = {
+      beforeModel: async ({ modelContext }) => ({
+        messages: [
+          ...modelContext.messages,
+          { role: "user", content: [{ type: "text", text: "temporary reminder" }] },
+        ],
+      }),
+    };
+    const agent = defineAgent({ middlewares: [temporaryView] });
+
+    await drain(agent);
+    expect(JSON.stringify(agent.messages)).not.toContain("temporary reminder");
+  });
+
+  test("turns a skipped tool into an observation without invoking it", async () => {
+    let invokeCount = 0;
+    const deny: AgentMiddleware = {
+      beforeToolUse: async () => ({
+        __skip: true,
+        result: { ok: false, code: "DENIED", error: "Denied by test" },
+      }),
+    };
+    const agent = defineAgent({
+      middlewares: [deny],
+      invoke: async () => {
+        invokeCount += 1;
+        return "unexpected";
+      },
+    });
+
+    await drain(agent);
+    const toolMessage = agent.messages.find((message) => message.role === "tool");
+    expect(invokeCount).toBe(0);
+    expect(toolMessage?.content[0]?.content).toContain("DENIED");
+  });
+
+  test("calls afterToolUse with a normalized tool failure", async () => {
+    let afterToolUseCount = 0;
+    const observe: AgentMiddleware = {
+      afterToolUse: async ({ toolResult }) => {
+        expect(toolResult).toMatchObject({ ok: false });
+        afterToolUseCount += 1;
+      },
+    };
+    const agent = defineAgent({
+      middlewares: [observe],
+      invoke: async () => {
+        throw new Error("boom");
+      },
+    });
+
+    await drain(agent);
+    expect(afterToolUseCount).toBe(1);
+  });
+
+  test("calls afterAgentRun once when maxSteps fails", async () => {
+    let afterRunCount = 0;
+    const agent = defineAgent({
+      middlewares: [
+        {
+          afterAgentRun: async () => {
+            afterRunCount += 1;
+          },
+        },
+      ],
+      responses: [TOOL_CALL],
+      maxSteps: 1,
+    });
+
+    await expect(drain(agent)).rejects.toBeDefined();
+    expect(afterRunCount).toBe(1);
+  });
+});
+```
+
+这里固定的标准语义是：Tool throw 先被规范化，再调用 `afterToolUse`；`afterAgentRun`
+在外层 `finally` 中调用一次。若你选择不同语义，必须同时修改说明和完整测试。
 
 ### 阶段后对照
 

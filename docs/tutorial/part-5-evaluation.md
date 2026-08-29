@@ -17,6 +17,22 @@
 
 ### 14.2 Eval task 结构
 
+一键创建首个任务、suite、runner 和测试文件：
+
+```bash
+mkdir -p evals/tasks/fix-add/fixture/src evals/tasks/fix-add/graders
+mkdir -p evals/suites evals/reports src/eval/__tests__
+touch evals/tasks/fix-add/task.yaml evals/tasks/fix-add/prompt.md
+touch evals/tasks/fix-add/graders/test.ts evals/suites/smoke.yaml
+touch evals/tasks/fix-add/fixture/package.json evals/tasks/fix-add/fixture/src/add.ts
+touch src/eval/types.ts src/eval/task-loader.ts src/eval/workspace-factory.ts
+touch src/eval/grader-runner.ts src/eval/artifact-store.ts src/eval/eval-runner.ts src/eval/index.ts
+touch src/eval/__tests__/task-loader.test.ts src/eval/__tests__/test-harness.ts
+touch src/eval/__tests__/eval-runner.test.ts
+```
+
+命令不会替你生成 fixture 题目答案；`fixture/` 必须是 Agent 每次 trial 收到的干净项目。
+
 ```text
 evals/
 ├── tasks/
@@ -54,6 +70,68 @@ grader:
 ```
 
 `prompt.md` 只描述用户可见需求，不泄漏 grader 断言和答案位置。
+
+下面把首个 eval task 完整写好。目标文件：`evals/tasks/fix-add/prompt.md`
+
+```markdown
+`src/add.ts` 中的 `add` 函数在部分输入下返回错误结果。请定位并修复问题，保留现有
+函数签名，不要引入新依赖。完成后运行项目测试。
+```
+
+目标文件：`evals/tasks/fix-add/fixture/package.json`
+
+```json
+{
+  "name": "eval-fix-add",
+  "private": true,
+  "type": "module"
+}
+```
+
+目标文件：`evals/tasks/fix-add/fixture/src/add.ts`（这是每个 trial 的示例输入）：
+
+```ts
+export function add(left: number, right: number): number {
+  return left - right;
+}
+```
+
+参数规则：`left/right` 都是有限 number，输出是两者算术和；不得把只针对一个 fixture
+值的常量当作实现。目标文件：`evals/tasks/fix-add/graders/test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+import { pathToFileURL } from "node:url";
+import { join } from "node:path";
+
+const workspace = process.env.HARNESS_EVAL_WORKSPACE;
+if (!workspace) throw new Error("HARNESS_EVAL_WORKSPACE is required");
+
+const moduleUrl = pathToFileURL(join(workspace, "src", "add.ts")).href;
+const { add } = await import(moduleUrl) as {
+  add(left: number, right: number): number;
+};
+
+describe("add", () => {
+  test("adds positive, negative and fractional values", () => {
+    expect(add(2, 3)).toBe(5);
+    expect(add(-2, 5)).toBe(3);
+    expect(add(0.25, 0.5)).toBe(0.75);
+  });
+});
+```
+
+目标文件：`evals/suites/smoke.yaml`
+
+```yaml
+name: smoke
+version: 1
+tasks:
+  - ../tasks/fix-add
+```
+
+这个 grader 是教程完整提供的隐藏测试，读者不需要补断言；Agent workspace 只收到
+`fixture/`，不会收到 `graders/`。示例输出是 grader exit code 0 和 `1 pass`。
 
 Runner 只把 `fixture/` 复制到 trial workspace，并把 Agent 的 `cwd` 限制在该目录。Grader 从 task root 运行，通过只读环境变量 `HARNESS_EVAL_WORKSPACE` 获取 trial workspace 路径；`graders/` 不复制进 Agent workspace，因此模型不能直接读取隐藏断言。
 
@@ -118,13 +196,17 @@ LLM judge 适合评价解释质量或开放式结果，但会引入额外模型�
 
 ### 14.6 EvalRunner 骨架
 
+目标文件：`src/eval/eval-runner.ts`
+
 ```ts
 export class EvalRunner {
   constructor(options: {
+    taskLoader: EvalTaskLoader;
     workspaceFactory: EvalWorkspaceFactory;
     agentFactory: EvalAgentFactory;
     graderRunner: GraderRunner;
     artifactStore: EvalArtifactStore;
+    identityProvider: EvalIdentityProvider;
     concurrency: number;
   }) {}
 
@@ -134,13 +216,15 @@ export class EvalRunner {
     config: EvalConfig;
     signal?: AbortSignal;
   }): Promise<EvalSuiteResult> {
-    // TODO:
-    // load/validate tasks
-    // → bounded concurrency
-    // → isolated trials
-    // → grade
-    // → aggregate
-    // → persist report
+    // 标准实现示例：先加载并完整校验 suite，再创建任何 trial workspace。
+    const suite = await this._taskLoader.loadSuite(options.suitePath);
+
+    // TODO 1：根据 concurrency 建固定数量 worker；不得一次启动所有 Promise。
+    // TODO 2：每个 trial 调 workspaceFactory，fixture 复制完成后再创建 Agent。
+    // TODO 3：区分 Agent failed、timeout 与 grader/fixture infra_error。
+    // TODO 4：无论成功失败都保存 patch、trace、grader output；路径必须在 eval root 内。
+    // TODO 5：aggregate 时排除 infra_error 的能力分母，同时单独报告其数量。
+    // TODO 6：signal 中止后不启动新 trial，等待已启动 trial 清理后持久化部分报告。
   }
 }
 ```
@@ -148,6 +232,8 @@ export class EvalRunner {
 并发数必须有上限，否则会同时打满 provider rate limit、CPU 和临时磁盘。Agent 内 Tool 并发与 eval task 并发是两个不同层级的并发控制。
 
 ### 14.7 保存实验身份
+
+目标文件：`src/eval/types.ts`
 
 每份 report 必须包含：
 
@@ -258,18 +344,325 @@ avgWallTime            42.1s          40.8s           -3.1%
 
 `pp` 是 percentage point，不要把 80% 到 85% 写成“提升 5%”；相对提升是 6.25%。
 
-### 必写测试
+### 14.11 完整测试
 
-- task manifest schema；
-- fixture 每个 trial 都是干净副本；
-- grader timeout；
-- Agent failure 与 infra error 分类；
-- bounded concurrency；
-- abort 整个 suite 后不再启动新 trial；
-- artifact 路径不会逃逸 eval root；
-- report identity 包含 commit/config fingerprints；
-- aggregate 对空集合、timeout、重复 task id 的处理；
-- baseline/candidate 不兼容时拒绝比较。
+完整测试使用运行时创建的临时 fixture、fake Agent 和内存 artifact store；不会访问真实
+模型，也不要求读者维护一份容易过期的固定 fixture。
+
+目标文件：`src/eval/__tests__/task-loader.test.ts`
+
+```ts
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { TaskLoader } from "../task-loader";
+
+let root: string | undefined;
+
+afterEach(async () => {
+  if (root) await rm(root, { recursive: true, force: true });
+  root = undefined;
+});
+
+async function taskFixture(id = "fix-add") {
+  root = await mkdtemp(join(tmpdir(), "harness-eval-loader-"));
+  const taskDir = join(root, "tasks", id);
+  await mkdir(join(taskDir, "fixture"), { recursive: true });
+  await mkdir(join(root, "suites"), { recursive: true });
+  await writeFile(join(taskDir, "prompt.md"), "Fix add.", "utf8");
+  await writeFile(join(taskDir, "task.yaml"), [
+    `id: ${id}`,
+    "version: 1",
+    "category: bug-fix",
+    "difficulty: easy",
+    "timeoutMs: 1000",
+    "maxSteps: 5",
+    "allowedTools: [read_file]",
+    "grader:",
+    "  command: bun test",
+    "  timeoutMs: 500",
+  ].join("\n"), "utf8");
+  return { taskDir, loader: new TaskLoader({ evalRoot: root }) };
+}
+
+describe("TaskLoader", () => {
+  test("loads and validates a complete task", async () => {
+    const { taskDir, loader } = await taskFixture();
+    expect(await loader.loadTask(taskDir)).toMatchObject({
+      id: "fix-add",
+      version: 1,
+      prompt: "Fix add.",
+      allowedTools: ["read_file"],
+    });
+  });
+
+  test("reports the manifest field path on invalid data", async () => {
+    const { taskDir, loader } = await taskFixture();
+    await writeFile(join(taskDir, "task.yaml"), "id: fix-add\ntimeoutMs: -1\n", "utf8");
+    await expect(loader.loadTask(taskDir)).rejects.toThrow("timeoutMs");
+  });
+
+  test("rejects duplicate task ids in a suite", async () => {
+    const { loader } = await taskFixture();
+    const suitePath = join(root!, "suites", "duplicate.yaml");
+    await writeFile(suitePath, [
+      "name: duplicate",
+      "version: 1",
+      "tasks:",
+      "  - ../tasks/fix-add",
+      "  - ../tasks/fix-add",
+    ].join("\n"), "utf8");
+
+    await expect(loader.loadSuite(suitePath)).rejects.toThrow("duplicate");
+  });
+
+  test("rejects task paths outside eval root", async () => {
+    const { loader } = await taskFixture();
+    const suitePath = join(root!, "suites", "escape.yaml");
+    await writeFile(suitePath, [
+      "name: escape",
+      "version: 1",
+      "tasks:",
+      "  - ../../../outside-task",
+    ].join("\n"), "utf8");
+
+    await expect(loader.loadSuite(suitePath)).rejects.toThrow("outside eval root");
+  });
+});
+```
+
+为使调度测试可读，先完整复制测试专用 harness。
+
+目标文件：`src/eval/__tests__/test-harness.ts`
+
+```ts
+interface HarnessOptions {
+  taskCount?: number;
+  delayMs?: number;
+  timeoutMs?: number;
+  agentError?: Error;
+  graderError?: Error;
+  onTrialStart?: (params: { index: number }) => void;
+}
+
+const ZERO_METRICS = {
+  steps: 1,
+  modelCalls: 1,
+  toolCalls: 0,
+  failedToolCalls: 0,
+  deniedToolCalls: 0,
+  inputTokens: 1,
+  outputTokens: 1,
+  totalTokens: 2,
+  modelTimeMs: 1,
+  toolTimeMs: 0,
+  approvalWaitMs: 0,
+  wallTimeMs: 1,
+};
+
+export function defineEvalTestHarness(options: HarnessOptions = {}) {
+  const taskCount = options.taskCount ?? 1;
+  let active = 0;
+  let maximumActive = 0;
+  let started = 0;
+  const paths: string[] = [];
+  const hashes: string[] = [];
+  const savedArtifacts: unknown[] = [];
+  const expectedFixtureHash = "fixture-v1";
+  const tasks = Array.from({ length: taskCount }, (_, index) => ({
+    id: `task-${index}`,
+    version: 1,
+    prompt: `Task ${index}`,
+    fixturePath: `/fixtures/task-${index}`,
+    timeoutMs: options.timeoutMs ?? 1000,
+    maxSteps: 5,
+    allowedTools: ["read_file"],
+    grader: { command: "fake-grade", timeoutMs: 100 },
+  }));
+
+  const dependencies = {
+    taskLoader: {
+      loadSuite: async () => ({ name: "fixture-suite", version: 1, tasks }),
+    },
+    workspaceFactory: {
+      create: async ({ task, trial }: { task: { id: string }; trial: number }) => {
+        const path = `/tmp/eval-${task.id}-${trial}-${paths.length}`;
+        paths.push(path);
+        hashes.push(expectedFixtureHash);
+        return {
+          path,
+          initialFixtureHash: expectedFixtureHash,
+          cleanup: async () => undefined,
+        };
+      },
+    },
+    agentFactory: {
+      runTrial: async ({ index, signal }: { index: number; signal?: AbortSignal }) => {
+        options.onTrialStart?.({ index });
+        started += 1;
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        try {
+          if (options.delayMs) await Bun.sleep(options.delayMs);
+          signal?.throwIfAborted();
+          if (options.agentError) throw options.agentError;
+          return { runId: `run-${index}`, metrics: ZERO_METRICS };
+        } finally {
+          active -= 1;
+        }
+      },
+    },
+    graderRunner: {
+      grade: async () => {
+        if (options.graderError) throw options.graderError;
+        return { passed: true, score: 1, output: "ok" };
+      },
+    },
+    artifactStore: {
+      saveTrial: async (artifact: unknown) => {
+        savedArtifacts.push(structuredClone(artifact));
+        return {
+          patchPath: "/reports/patch.diff",
+          tracePath: "/reports/trace.jsonl",
+        };
+      },
+    },
+    identityProvider: {
+      create: async () => ({
+        evalRunId: "eval-1",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        gitCommit: "abc123",
+        dirtyWorktree: false,
+        suite: "fixture-suite",
+        suiteVersion: 1,
+        modelProvider: "scripted",
+        modelName: "fake",
+        modelOptions: {},
+        promptFingerprint: "prompt-v1",
+        toolsetFingerprint: "tools-v1",
+        harnessConfig: {},
+        runtimeVersion: "0.1.0",
+        platform: "test",
+      }),
+    },
+  };
+
+  return {
+    dependencies,
+    suitePath: "/evals/suites/fixture.yaml",
+    config: {} as never,
+    expectedFixtureHash,
+    maxActiveTrials: () => maximumActive,
+    startedTrialCount: () => started,
+    workspacePaths: () => [...paths],
+    initialFixtureHashes: () => [...hashes],
+    savedArtifacts: () => structuredClone(savedArtifacts),
+  };
+}
+```
+
+目标文件：`src/eval/__tests__/eval-runner.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { EvalRunner } from "../eval-runner";
+import { defineEvalTestHarness } from "./test-harness";
+
+describe("EvalRunner", () => {
+  test("never exceeds configured concurrency", async () => {
+    const harness = defineEvalTestHarness({ taskCount: 6, delayMs: 20 });
+    const runner = new EvalRunner({ ...harness.dependencies, concurrency: 2 });
+
+    await runner.runSuite({ suitePath: harness.suitePath, trials: 1, config: harness.config });
+    expect(harness.maxActiveTrials()).toBe(2);
+  });
+
+  test("creates a clean fixture copy for every trial", async () => {
+    const harness = defineEvalTestHarness({ taskCount: 1 });
+    const runner = new EvalRunner({ ...harness.dependencies, concurrency: 1 });
+
+    await runner.runSuite({ suitePath: harness.suitePath, trials: 2, config: harness.config });
+    expect(harness.workspacePaths()).toHaveLength(2);
+    expect(new Set(harness.workspacePaths()).size).toBe(2);
+    expect(harness.initialFixtureHashes()).toEqual([
+      harness.expectedFixtureHash,
+      harness.expectedFixtureHash,
+    ]);
+  });
+
+  test("classifies grader crashes as infra_error and still saves artifacts", async () => {
+    const harness = defineEvalTestHarness({ graderError: new Error("grader crashed") });
+    const runner = new EvalRunner({ ...harness.dependencies, concurrency: 1 });
+    const result = await runner.runSuite({
+      suitePath: harness.suitePath,
+      trials: 1,
+      config: harness.config,
+    });
+
+    expect(result.trials[0]).toMatchObject({ status: "infra_error" });
+    expect(harness.savedArtifacts()).toHaveLength(1);
+  });
+
+  test("separates Agent failure and timeout from infrastructure errors", async () => {
+    const failed = defineEvalTestHarness({ agentError: new Error("agent failed") });
+    const failedResult = await new EvalRunner({
+      ...failed.dependencies,
+      concurrency: 1,
+    }).runSuite({ suitePath: failed.suitePath, trials: 1, config: failed.config });
+    expect(failedResult.trials[0]).toMatchObject({ status: "failed" });
+
+    const timedOut = defineEvalTestHarness({ delayMs: 30, timeoutMs: 5 });
+    const timeoutResult = await new EvalRunner({
+      ...timedOut.dependencies,
+      concurrency: 1,
+    }).runSuite({ suitePath: timedOut.suitePath, trials: 1, config: timedOut.config });
+    expect(timeoutResult.trials[0]).toMatchObject({ status: "timeout" });
+  });
+
+  test("does not start new trials after suite abort", async () => {
+    const controller = new AbortController();
+    const harness = defineEvalTestHarness({
+      taskCount: 5,
+      onTrialStart: ({ index }) => {
+        if (index === 0) controller.abort();
+      },
+    });
+    const runner = new EvalRunner({ ...harness.dependencies, concurrency: 1 });
+
+    await expect(runner.runSuite({
+      suitePath: harness.suitePath,
+      trials: 1,
+      config: harness.config,
+      signal: controller.signal,
+    })).rejects.toBeDefined();
+    expect(harness.startedTrialCount()).toBe(1);
+  });
+
+  test("stores identity and excludes infra errors from the capability denominator", async () => {
+    const harness = defineEvalTestHarness({ taskCount: 2, graderError: new Error("grader") });
+    const runner = new EvalRunner({ ...harness.dependencies, concurrency: 2 });
+    const result = await runner.runSuite({
+      suitePath: harness.suitePath,
+      trials: 1,
+      config: harness.config,
+    });
+
+    expect(result.identity).toMatchObject({
+      evalRunId: "eval-1",
+      gitCommit: "abc123",
+      suiteVersion: 1,
+      toolsetFingerprint: "tools-v1",
+    });
+    expect(result.aggregate).toMatchObject({ validTrials: 0, infraErrors: 2 });
+  });
+});
+```
+
+这些测试固定了 schema、path boundary、干净 workspace、timeout、错误分类、并发上限、
+abort、artifact、identity 和 aggregate；没有需要读者填写的测试 TODO。
 
 ### 验收
 
@@ -299,6 +692,15 @@ avgWallTime            42.1s          40.8s           -3.1%
 > Harness Lab 是一个基于 Bun/TypeScript 的 Coding Agent runtime。项目从统一 transcript 和 ReAct loop 出发，提供并发 Tool 调度、策略审批、结构化 tracing、原子 checkpoint、resume/replay、context compaction 和可复现 eval。
 
 ### 15.2 必备文档
+
+一键创建文档文件（已有文件不会被清空）：
+
+```bash
+mkdir -p docs/decisions
+touch docs/architecture.md docs/security-model.md docs/recovery-semantics.md
+touch docs/context-management.md docs/evaluation-methodology.md
+touch docs/benchmark-report.md docs/manual-test.md
+```
 
 ```text
 README.md

@@ -27,6 +27,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .cache
 *.tsbuildinfo
 .bun-cache/
+docs/.vitepress/cache/
+docs/.vitepress/.temp/
 
 # IntelliJ based IDEs
 .idea

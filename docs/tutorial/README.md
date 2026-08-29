@@ -5,10 +5,10 @@
 教程不要求逐行抄写 Helixent。每个阶段都采用同一种节奏：
 
 1. 先明确本阶段新增的系统能力和不变量。
-2. 复制类型、接口或测试骨架，不复制核心方法实现。
-3. 自己完成标有 `TODO` 的实现。
-4. 运行示例，看到真实的终端反馈。
-5. 运行自动化测试并回答复盘问题。
+2. 复制“文件创建命令”，一次建立本阶段目录和空文件。
+3. 复制教程给出的完整测试，先看到符合预期的失败。
+4. 阅读一个带讲解的标准实现示例，再根据分项提示完成其余 `TODO`。
+5. 运行示例和自动化测试，看到真实反馈并回答复盘问题。
 6. 提交一个可以单独运行的 Git checkpoint。
 
 最终项目建议命名为 `harness-lab`。如果用于简历，请写明“基于 Helixent 的架构进行独立复刻和扩展”，不要声称原始设计全部由自己从零发明。
@@ -167,9 +167,24 @@ git switch -c course/stage-01-messages
 
 每一章都按下面的协议完成。
 
-### 8.1 Red：先运行失败测试
+### 8.1 Scaffold：复制命令创建文件
 
-复制测试骨架并执行：
+每个阶段先给出可从练习仓库根目录直接执行的命令，例如：
+
+```bash
+mkdir -p src/foundation/messages/types src/foundation/messages/__tests__ examples
+touch src/foundation/messages/types/content.ts
+touch src/foundation/messages/types/message.ts
+touch src/foundation/messages/__tests__/transcript.test.ts
+touch examples/stage-01-transcript.ts
+```
+
+命令只负责创建目录和空文件，不会覆盖已有内容。若文件已经存在，`touch` 只更新时间戳；
+执行前仍应使用 `git status --short` 确认没有不希望覆盖的修改。
+
+### 8.2 Red：先运行完整失败测试
+
+教程中的测试文件是完整内容，不留待填写的 `TODO`。复制后执行：
 
 ```bash
 bun test path/to/test.ts
@@ -177,15 +192,33 @@ bun test path/to/test.ts
 
 确认它因为缺少当前能力而失败。测试一开始就通过，通常说明测试没有覆盖目标行为。
 
-### 8.2 Green：只实现当前阶段
+### 8.3 Green：一个示例 + 分项提示
+
+当一个代码块含有多个待实现点时，教程遵循两条规则：
+
+- 第一个关键分支给出标准实现，并用注释解释输入、输出和不变量；
+- 其余分支保留为练习，但每个 `TODO` 都提供独立提示、边界条件和失败语义。
+
+读者不需要猜测“这个 TODO 想考什么”，但仍需要自己完成核心逻辑。
+
+### 8.4 代码块路径、示例输入和示例输出
+
+所有实现代码块之前都标明目标文件。示例数据统一写成“示例输入”“示例输出”，并说明：
+
+- 参数是否必填、是否允许空值；
+- 数组或事件是否要求顺序；
+- id、路径和 Tool result 的关联规则；
+- error 是 throw、structured result 还是 observation。
+
+### 8.5 只实现当前阶段
 
 不要提前实现后续能力。例如阶段 4 只需要顺序 Tool 执行；并发、abort 和 Middleware 留到后续阶段。限制变量能让你真正看见每项设计解决的具体问题。
 
-### 8.3 Observe：运行真实示例
+### 8.6 Observe：运行真实示例
 
 测试证明程序符合断言，终端反馈帮助你建立运行时心智模型。每阶段必须保留一个 `examples/stage-xx-*.ts`，不能只保留单元测试。
 
-### 8.4 Refactor：写决策记录
+### 8.7 Refactor：写决策记录
 
 在 `docs/decisions/` 新增简短 ADR，回答：
 
@@ -202,7 +235,7 @@ bun test path/to/test.ts
 获得什么，牺牲什么？
 ```
 
-### 8.5 Gate：提交可运行 checkpoint
+### 8.8 Gate：提交可运行 checkpoint
 
 ```bash
 bun run check

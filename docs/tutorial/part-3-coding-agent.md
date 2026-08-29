@@ -26,7 +26,23 @@ Adapter 的职责是吸收这些差异，让 Agent runtime 只看到 canonical M
 bun add openai @anthropic-ai/sdk
 ```
 
-目录：
+一键创建目录和文件：
+
+```bash
+mkdir -p src/community/openai/__tests__ src/community/anthropic/__tests__ examples
+touch src/community/openai/model-provider.ts src/community/openai/stream-accumulator.ts
+touch src/community/openai/utils.ts src/community/openai/index.ts
+touch src/community/openai/__tests__/utils.test.ts
+touch src/community/openai/__tests__/stream-accumulator.test.ts
+touch src/community/openai/__tests__/model-provider.test.ts
+touch src/community/anthropic/model-provider.ts src/community/anthropic/stream-accumulator.ts
+touch src/community/anthropic/utils.ts src/community/anthropic/index.ts
+touch src/community/anthropic/__tests__/utils.test.ts
+touch src/community/anthropic/__tests__/stream-accumulator.test.ts
+touch examples/stage-07-real-model.ts
+```
+
+执行后目录应为：
 
 ```text
 src/community/
@@ -46,30 +62,47 @@ src/community/
 
 ### 7.2 先写纯转换函数
 
-OpenAI adapter 至少拆成：
+目标文件：`src/community/openai/utils.ts`
+
+OpenAI adapter 至少拆成以下函数。`convertToOpenAITools()` 是标准实现示例；其余 TODO
+按 content variant 分支完成，未知 variant 必须走 `assertNever`。
 
 ```ts
 export function convertToOpenAIMessages(
   messages: Message[],
 ): OpenAI.ChatCompletionMessageParam[] {
-  // TODO
+  // TODO 1：system/user text 直接转换；image_url 只允许出现在 user。
+  // TODO 2：assistant 的 text 与 tool_use 合并为一条 wire message。
+  // TODO 3：每个 ToolResultContent 转成带 tool_call_id 的 tool role message。
 }
 
 export function convertToOpenAITools(
   tools: Tool[],
 ): OpenAI.ChatCompletionTool[] {
-  // TODO: parameters.toJSONSchema()
+  // 标准实现示例：schema 转换只发生在 provider adapter。
+  return tools.map((tool) => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters.toJSONSchema(),
+    },
+  }));
 }
 
 export function parseOpenAIAssistantMessage(
   message: OpenAI.ChatCompletionMessage,
   usage?: TokenUsage,
 ): AssistantMessage {
-  // TODO
+  // TODO 4：content 转为 text；reasoning_content 转为 thinking（若 endpoint 提供）。
+  // TODO 5：tool_calls arguments 用 JSON.parse；最终仍非法时抛出带 call id 的转换错误。
+  // TODO 6：usage 缺省时不要伪造 0，保持 AssistantMessage.usage 为 undefined。
 }
 ```
 
-Anthropic adapter至少拆成：
+目标文件：`src/community/anthropic/utils.ts`
+
+Anthropic adapter 至少拆成；每个声明都必须补成带函数体的纯函数：
 
 ```ts
 export function extractSystemPrompt(messages: Message[]): string | undefined;
@@ -78,28 +111,229 @@ export function convertToAnthropicTools(tools: Tool[]): Anthropic.Tool[];
 export function parseAnthropicAssistantMessage(message: Anthropic.Message): AssistantMessage;
 ```
 
+实现提示：
+
+- TODO 1：`extractSystemPrompt` 只收集 system text，并用两个换行连接；没有 system 时返回 `undefined`；
+- TODO 2：`convertToAnthropicMessages` 排除 system，并把 tool result 放入 user role content；
+- TODO 3：Tool schema 使用 `input_schema`，不要复用 OpenAI wire type；
+- TODO 4：解析 `text`、`thinking`、`tool_use` 三种 block，并原样保存 Tool id。
+
 这些函数必须是纯函数。先用固定 fixture 测完，再调用 SDK。
 
-### 7.3 必须覆盖的协议案例
+### 7.3 完整协议测试
 
-为两个 adapter 分别测试：
+目标文件：`src/community/openai/__tests__/utils.test.ts`
 
-- user text；
-- system prompt；
-- assistant text；
-- assistant 同时包含 text 和 `tool_use`；
-- 多个 Tool calls；
-- `tool_result` 与 call id 关联；
-- provider 缺少 usage；
-- 空文本；
-- thinking/reasoning content；
-- malformed Tool arguments。
+下面是可直接复制的完整 OpenAI 转换测试。测试中的 `as never` 只把精简 fixture
+适配成 SDK 的庞大 wire type；生产代码不得借此跳过 canonical type 检查。
 
-Malformed Tool arguments 不应让 streaming accumulator 每收到一个 fragment 就崩溃。在 JSON 尚未完整时，可以保留 partial object 或空 object；最终 chunk 仍无法解析时，返回可诊断错误。
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { Message } from "@/foundation/messages";
+
+import {
+  convertToOpenAIMessages,
+  parseOpenAIAssistantMessage,
+} from "../utils";
+
+describe("OpenAI protocol conversion", () => {
+  test("converts system and user content without losing order", () => {
+    const messages: Message[] = [
+      { role: "system", content: [{ type: "text", text: "Be concise" }] },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "inspect" },
+          { type: "image_url", image_url: { url: "https://example.test/a.png" } },
+        ],
+      },
+    ];
+
+    expect(convertToOpenAIMessages(messages)).toMatchObject([
+      { role: "system" },
+      { role: "user" },
+    ]);
+  });
+
+  test("keeps text and multiple tool calls in one assistant message", () => {
+    const result = convertToOpenAIMessages([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "I will inspect both files" },
+          { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+          { type: "tool_use", id: "call-2", name: "read_file", input: { path: "b.ts" } },
+        ],
+      },
+    ]);
+
+    expect(result[0]).toMatchObject({
+      role: "assistant",
+      tool_calls: [
+        { id: "call-1", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+        { id: "call-2", function: { name: "read_file", arguments: '{"path":"b.ts"}' } },
+      ],
+    });
+  });
+
+  test("expands tool results and preserves their call ids", () => {
+    const result = convertToOpenAIMessages([
+      {
+        role: "tool",
+        content: [
+          { type: "tool_result", tool_use_id: "call-1", content: "A" },
+          { type: "tool_result", tool_use_id: "call-2", content: "B" },
+        ],
+      },
+    ]);
+
+    expect(result).toMatchObject([
+      { role: "tool", tool_call_id: "call-1", content: "A" },
+      { role: "tool", tool_call_id: "call-2", content: "B" },
+    ]);
+  });
+
+  test("parses reasoning, empty text and tool arguments", () => {
+    const result = parseOpenAIAssistantMessage({
+      role: "assistant",
+      content: "",
+      reasoning_content: "inspect first",
+      tool_calls: [
+        {
+          type: "function",
+          id: "call-1",
+          function: { name: "read_file", arguments: '{"path":"a.ts"}' },
+        },
+      ],
+    } as never);
+
+    expect(result.content).toEqual([
+      { type: "thinking", thinking: "inspect first" },
+      { type: "text", text: "" },
+      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+    ]);
+    expect(result.usage).toBeUndefined();
+  });
+
+  test("reports malformed final tool arguments with the call id", () => {
+    expect(() =>
+      parseOpenAIAssistantMessage({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            type: "function",
+            id: "broken-call",
+            function: { name: "read_file", arguments: '{"path"' },
+          },
+        ],
+      } as never),
+    ).toThrow("broken-call");
+  });
+});
+```
+
+目标文件：`src/community/anthropic/__tests__/utils.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { Message } from "@/foundation/messages";
+
+import {
+  convertToAnthropicMessages,
+  extractSystemPrompt,
+  parseAnthropicAssistantMessage,
+} from "../utils";
+
+describe("Anthropic protocol conversion", () => {
+  test("extracts system text separately and excludes it from messages", () => {
+    const messages: Message[] = [
+      { role: "system", content: [{ type: "text", text: "Rule A" }] },
+      { role: "system", content: [{ type: "text", text: "Rule B" }] },
+      { role: "user", content: [{ type: "text", text: "Hello" }] },
+    ];
+
+    expect(extractSystemPrompt(messages)).toBe("Rule A\n\nRule B");
+    expect(convertToAnthropicMessages(messages)).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "Hello" }] },
+    ]);
+  });
+
+  test("keeps assistant text, thinking and multiple tool ids", () => {
+    const result = convertToAnthropicMessages([
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "plan" },
+          { type: "text", text: "running" },
+          { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+          { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+        ],
+      },
+    ]);
+
+    expect(result[0]).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "plan" },
+        { type: "text", text: "running" },
+        { type: "tool_use", id: "a" },
+        { type: "tool_use", id: "b" },
+      ],
+    });
+  });
+
+  test("converts tool results into user-role content", () => {
+    expect(convertToAnthropicMessages([
+      {
+        role: "tool",
+        content: [{ type: "tool_result", tool_use_id: "a", content: "result" }],
+      },
+    ])).toMatchObject([
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "a", content: "result" }],
+      },
+    ]);
+  });
+
+  test("parses text, thinking, tool use and usage", () => {
+    const result = parseAnthropicAssistantMessage({
+      id: "message-1",
+      type: "message",
+      role: "assistant",
+      model: "test-model",
+      stop_reason: "tool_use",
+      content: [
+        { type: "thinking", thinking: "plan", signature: "signature" },
+        { type: "text", text: "running" },
+        { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+      ],
+      usage: { input_tokens: 8, output_tokens: 5 },
+    } as never);
+
+    expect(result.content).toMatchObject([
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "running" },
+      { type: "tool_use", id: "a", input: { path: "a.ts" } },
+    ]);
+    expect(result.usage).toEqual({ promptTokens: 8, completionTokens: 5, totalTokens: 13 });
+  });
+});
+```
+
+这两个文件已经覆盖 user/system/assistant、混合内容、多 Tool call、call id、空文本、
+thinking、缺少 usage 和 malformed arguments。Malformed arguments 在最终非流式响应中必须
+抛出带 call id 的诊断错误；流式 fragment 的规则由下一节的完整 accumulator 测试固定。
 
 ### 7.4 StreamAccumulator
 
-定义 provider-local accumulator：
+目标文件：两个 provider 各自的 `stream-accumulator.ts`
+
+定义 provider-local accumulator。文本 delta 分支是标准实现示例；thinking、Tool fragment
+和 usage 分别保留为独立 TODO，不能共享可变字符串。
 
 ```ts
 export class StreamAccumulator {
@@ -113,40 +347,146 @@ export class StreamAccumulator {
   private _usage?: TokenUsage;
 
   push(chunk: ProviderChunk): void {
-    // TODO: 合并 delta，不产生 canonical transcript side effect
+    if (chunk.textDelta) {
+      // 标准实现示例：delta 只写 accumulator，不写 Agent transcript。
+      this._text += chunk.textDelta;
+    }
+    // TODO 1：thinking delta 追加到 _thinking。
+    // TODO 2：按 Tool call index 合并 id、name 和 argumentsText，不能按到达顺序串线。
+    // TODO 3：provider 给出 usage 时覆盖 _usage。
   }
 
   snapshot(): AssistantMessage {
-    // TODO: 每次返回完整累计快照
+    // TODO 4：按稳定顺序构造完整 content 数组；argumentsText 不完整时暂用 {}。
+    // TODO 5：返回新对象和新数组，调用方修改 snapshot 不能污染 accumulator。
   }
 }
 ```
 
-最关键的测试是 fragmented JSON：
+目标文件：`src/community/openai/__tests__/stream-accumulator.test.ts`
 
-```text
-chunk 1: {"path":"/tmp/
-chunk 2: demo","line":1}
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { StreamAccumulator } from "../stream-accumulator";
+
+describe("OpenAI StreamAccumulator", () => {
+  test("accumulates text and usage into independent snapshots", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ textDelta: "hel" } as never);
+    const first = accumulator.snapshot();
+    accumulator.push({ textDelta: "lo" } as never);
+    accumulator.push({ usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } } as never);
+
+    expect(first.content).toEqual([{ type: "text", text: "hel" }]);
+    expect(accumulator.snapshot()).toMatchObject({
+      content: [{ type: "text", text: "hello" }],
+      usage: { totalTokens: 5 },
+    });
+  });
+
+  test("joins fragmented JSON without mixing concurrent tool calls", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({
+      toolCall: { index: 1, id: "b", name: "read_file", argumentsDelta: '{"path":"b' },
+    } as never);
+    accumulator.push({
+      toolCall: { index: 0, id: "a", name: "read_file", argumentsDelta: '{"path":"/tmp/' },
+    } as never);
+    accumulator.push({ toolCall: { index: 1, argumentsDelta: '.ts"}' } } as never);
+    accumulator.push({ toolCall: { index: 0, argumentsDelta: 'demo","line":1}' } } as never);
+
+    expect(accumulator.snapshot().content).toEqual([
+      {
+        type: "tool_use",
+        id: "a",
+        name: "read_file",
+        input: { path: "/tmp/demo", line: 1 },
+      },
+      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+    ]);
+  });
+
+  test("does not expose mutable accumulator state", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ textDelta: "safe" } as never);
+    const snapshot = accumulator.snapshot();
+    snapshot.content.splice(0);
+
+    expect(accumulator.snapshot().content).toEqual([{ type: "text", text: "safe" }]);
+  });
+});
 ```
 
-最终 snapshot 的 input 应为 `{ path: "/tmp/demo", line: 1 }`。同时测试两个并行 Tool call 的 fragment 不会互相串线。
+目标文件：`src/community/anthropic/__tests__/stream-accumulator.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { StreamAccumulator } from "../stream-accumulator";
+
+describe("Anthropic StreamAccumulator", () => {
+  test("keeps block index order while accumulating deltas", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ index: 1, type: "text_delta", text: "answer" } as never);
+    accumulator.push({ index: 0, type: "thinking_delta", thinking: "plan" } as never);
+    accumulator.push({
+      index: 2,
+      type: "tool_start",
+      id: "call-1",
+      name: "read_file",
+    } as never);
+    accumulator.push({ index: 2, type: "input_json_delta", partialJson: '{"path"' } as never);
+    accumulator.push({ index: 2, type: "input_json_delta", partialJson: ':"a.ts"}' } as never);
+
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "answer" },
+      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+    ]);
+  });
+
+  test("combines input and output token usage", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ type: "message_start", inputTokens: 12 } as never);
+    accumulator.push({ type: "message_end", outputTokens: 4 } as never);
+
+    expect(accumulator.snapshot().usage).toEqual({
+      promptTokens: 12,
+      completionTokens: 4,
+      totalTokens: 16,
+    });
+  });
+});
+```
+
+这里的 chunk 是教程规定的 provider-local normalized chunk；参数规则是：`index` 在一次
+响应内稳定、`argumentsDelta`/`partialJson` 必须按同一 index 拼接、usage 只在 provider
+明确报告时出现。若你直接消费 SDK event，可先在 `model-provider.ts` 做一次窄转换。
 
 ### 7.5 Provider class
+
+目标文件：`src/community/openai/model-provider.ts`
 
 ```ts
 export class OpenAIModelProvider implements ModelProvider {
   private readonly _client: OpenAI;
 
-  constructor({ baseURL, apiKey }: { baseURL?: string; apiKey?: string } = {}) {
-    this._client = new OpenAI({ baseURL, apiKey });
+  constructor(options: { baseURL?: string; apiKey?: string; client?: OpenAI } = {}) {
+    // 标准实现示例：允许测试注入 fake client；production 才创建真实 SDK client。
+    this._client = options.client ?? new OpenAI({
+      baseURL: options.baseURL,
+      apiKey: options.apiKey,
+    });
   }
 
   async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
-    // TODO: convert → SDK → parse
+    // TODO 1：构造 request → client.chat.completions.create → parse；透传 signal。
   }
 
   async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
-    // TODO: SDK stream → accumulator.push → snapshot
+    // TODO 2：设置 stream=true；每个 SDK chunk 依次 push，再 yield 累计 snapshot。
+    // TODO 3：结束前确认最后 snapshot 是完整消息，且不带临时 streaming 标记。
   }
 }
 ```
@@ -165,6 +505,60 @@ return {
 ```
 
 不要在日志、trace 或测试 snapshot 中记录 API key。
+
+目标文件：`src/community/openai/__tests__/model-provider.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { OpenAIModelProvider } from "../model-provider";
+
+describe("OpenAIModelProvider", () => {
+  test("passes signal, tools and caller overrides to the SDK", async () => {
+    let request: Record<string, unknown> | undefined;
+    let sdkSignal: AbortSignal | undefined;
+    const client = {
+      chat: {
+        completions: {
+          create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
+            request = body;
+            sdkSignal = options.signal;
+            return {
+              choices: [{ message: { role: "assistant", content: "ok" } }],
+              usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+            };
+          },
+        },
+      },
+    };
+    const controller = new AbortController();
+    const provider = new OpenAIModelProvider({ client: client as never });
+
+    const result = await provider.invoke({
+      model: "test-model",
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      tools: [],
+      options: { temperature: 0.25 },
+      signal: controller.signal,
+    });
+
+    expect(request).toMatchObject({
+      model: "test-model",
+      temperature: 0.25,
+      top_p: 0,
+    });
+    expect(sdkSignal).toBe(controller.signal);
+    expect(result).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      usage: { totalTokens: 4 },
+    });
+  });
+});
+```
+
+SDK `create` 的第二个参数承载 `signal`；不要把 signal 混进 JSON request body。Anthropic
+provider 使用相同注入方式和断言结构，其 wire 转换差异已由 7.3 的完整测试固定。
 
 ### 运行与观察
 
@@ -194,10 +588,10 @@ ANTHROPIC_API_KEY=... bun run examples/stage-07-real-model.ts anthropic
 
 - `src/community/openai/model-provider.ts`
 - `src/community/openai/utils.ts`
-- `src/community/openai/stream-utils.ts`
+- `src/community/openai/stream-accumulator.ts`
 - `src/community/anthropic/model-provider.ts`
 - `src/community/anthropic/utils.ts`
-- `src/community/anthropic/stream-utils.ts`
+- `src/community/anthropic/stream-accumulator.ts`
 
 ### 验收
 
@@ -223,6 +617,21 @@ Coding Agent 的能力不来自“更长的 prompt”，而来自高质量的环
 
 不要一开始实现一个万能 `filesystem` Tool。窄 Tool 更容易描述、审批、测试、统计和限制权限。
 
+一键创建全部 Tool 与测试文件：
+
+```bash
+mkdir -p src/coding/tools/__tests__ examples
+for name in tool-utils tool-result file-info list-files glob-search grep-search read-file mkdir write-file str-replace apply-patch move-path bash; do
+  touch "src/coding/tools/${name}.ts"
+done
+touch src/coding/tools/__tests__/tool-utils.test.ts
+touch src/coding/tools/__tests__/coding-tools.test.ts
+touch src/coding/tools/index.ts examples/stage-08-coding-tools.ts
+```
+
+这个循环只创建空文件，不覆盖内容。所有 Tool 的公开行为集中在一个完整 contract test，
+路径安全单独测试；迭代时可用 `bun test -t "read_file"` 只运行相关用例。
+
 ### 8.1 Workspace boundary
 
 创建 `src/coding/tools/tool-utils.ts`：
@@ -232,15 +641,17 @@ export type PathValidationResult =
   | { ok: true; path: string }
   | { ok: false; code: "INVALID_PATH" | "PATH_OUTSIDE_WORKSPACE"; error: string };
 
-export function resolveWorkspacePath(options: {
+export async function resolveWorkspacePath(options: {
   cwd: string;
   inputPath: string;
-}): PathValidationResult {
-  // TODO:
-  // 1. resolve 成绝对路径
-  // 2. realpath 已存在的祖先，处理符号链接
-  // 3. 确认结果在 cwd 内
-  // 4. 不使用简单 startsWith(cwd)，避免 /repo-other 绕过 /repo
+}): Promise<PathValidationResult> {
+  // 标准实现示例：第一步只做词法规范化，不能据此判定安全。
+  const absolutePath = resolve(options.cwd, options.inputPath);
+
+  // TODO 1：realpath cwd；cwd 不存在时返回 INVALID_PATH。
+  // TODO 2：向上找到 absolutePath 最近的已存在祖先并 realpath，处理 symlink。
+  // TODO 3：用 relative(realCwd, realAncestor) 判断是否越界；拒绝 ".." 和绝对结果。
+  // TODO 4：将尚不存在的尾部路径重新接到真实祖先，并返回最终 path。
 }
 ```
 
@@ -266,24 +677,32 @@ export function resolveWorkspacePath(options: {
 7. 写 happy path、error code 和 boundary tests；
 8. 注册到 `src/coding/tools/index.ts`。
 
-以 `read_file` 为例：
+以 `read_file` 为例，目标文件是 `src/coding/tools/read-file.ts`。Tool 必须通过 factory
+绑定 workspace；`cwd` 是已初始化的可信边界，不允许模型通过 Tool input 修改：
 
 ```ts
-export const readFileTool = defineTool({
-  name: "read_file",
-  description: "Read a UTF-8 text file or a bounded line range",
-  parameters: z.object({
-    description: z.string(),
-    path: z.string(),
-    startLine: z.number().int().positive().optional(),
-    endLine: z.number().int().positive().optional(),
-  }),
-  invoke: async (input, signal) => {
-    // TODO:
-    // validate path → check abort → check existence/type
-    // → validate line range → return numbered content
-  },
-});
+export function defineReadFileTool(options: { cwd: string; maxCharacters?: number }) {
+  return defineTool({
+    name: "read_file",
+    description: "Read a UTF-8 text file or a bounded line range",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+      startLine: z.number().int().positive().optional(),
+      endLine: z.number().int().positive().optional(),
+    }),
+    invoke: async (input, signal) => {
+      signal?.throwIfAborted();
+      // 标准实现示例：中止检查必须发生在文件系统访问之前。
+
+      // TODO 1：resolveWorkspacePath；失败时原样返回稳定 code。
+      // TODO 2：检查存在且为普通文件；分别返回 FILE_NOT_FOUND / NOT_A_FILE。
+      // TODO 3：startLine/endLine 必须成对满足 1 <= start <= end <= lineCount。
+      // TODO 4：全文件读取返回原文；范围读取返回带 1-based 行号的文本。
+      // TODO 5：应用字符上限并在截断时添加明确 marker。
+    },
+  });
+}
 ```
 
 建议稳定 error codes：
@@ -330,28 +749,166 @@ ABORTED
 
 不要把 command 插入另一层未转义的 shell string。若契约接收完整 shell command，应明确这是 intentional shell execution，并把原始 command 展示在审批界面。
 
-### 8.5 测试隔离
+### 8.5 完整测试
 
-每个 filesystem Tool 使用临时 workspace：
+目标文件：`src/coding/tools/__tests__/tool-utils.test.ts`
+
+每个 filesystem Tool 都依赖这里固定的 workspace boundary。下面是完整测试文件：
 
 ```ts
-import { afterEach, beforeEach } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+import { resolveWorkspacePath } from "../tool-utils";
+
+let workspace: string;
+let outside: string;
+
+beforeEach(async () => {
+  workspace = await mkdtemp(join(tmpdir(), "harness-lab-tool-"));
+  outside = await mkdtemp(join(tmpdir(), "harness-lab-outside-"));
+});
+
+afterEach(async () => {
+  await rm(workspace, { recursive: true, force: true });
+  await rm(outside, { recursive: true, force: true });
+});
+
+describe("resolveWorkspacePath", () => {
+  test("accepts relative, absolute and not-yet-created paths inside cwd", async () => {
+    await mkdir(join(workspace, "src"));
+
+    expect(await resolveWorkspacePath({ cwd: workspace, inputPath: "src/new.ts" }))
+      .toMatchObject({ ok: true, path: join(workspace, "src/new.ts") });
+    expect(await resolveWorkspacePath({ cwd: workspace, inputPath: join(workspace, "src") }))
+      .toMatchObject({ ok: true, path: join(workspace, "src") });
+  });
+
+  test("rejects traversal and a directory with a similar prefix", async () => {
+    expect(await resolveWorkspacePath({ cwd: workspace, inputPath: "../secret.txt" }))
+      .toMatchObject({ ok: false, code: "PATH_OUTSIDE_WORKSPACE" });
+    expect(await resolveWorkspacePath({ cwd: workspace, inputPath: `${workspace}-other/file.ts` }))
+      .toMatchObject({ ok: false, code: "PATH_OUTSIDE_WORKSPACE" });
+  });
+
+  test("rejects a symlink whose real target is outside cwd", async () => {
+    await symlink(outside, join(workspace, "escape"));
+
+    expect(await resolveWorkspacePath({ cwd: workspace, inputPath: "escape/new.ts" }))
+      .toMatchObject({ ok: false, code: "PATH_OUTSIDE_WORKSPACE" });
+  });
+});
+```
+
+目标文件：`src/coding/tools/__tests__/coding-tools.test.ts`
+
+`defineCodingTools({ cwd })` 在 `src/coding/tools/index.ts` 返回全部 Tool。测试通过 Tool 的
+公开 `invoke` 契约操作临时目录，因此不会修改课程仓库：
+
+```ts
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { defineCodingTools } from "../index";
 
 let workspace: string;
 
 beforeEach(async () => {
-  workspace = await mkdtemp(join(tmpdir(), "harness-lab-tool-"));
+  workspace = await mkdtemp(join(tmpdir(), "harness-lab-tools-"));
+  await writeFile(join(workspace, "input.ts"), "const value = 1;\n", "utf8");
 });
 
 afterEach(async () => {
   await rm(workspace, { recursive: true, force: true });
 });
+
+async function invoke(name: string, input: Record<string, unknown>, signal?: AbortSignal) {
+  const tool = defineCodingTools({ cwd: workspace, bashTimeoutMs: 50 })
+    .find((candidate) => candidate.name === name);
+  if (!tool) throw new Error(`Missing test Tool: ${name}`);
+  return tool.invoke({ description: `test ${name}`, ...input } as never, signal);
+}
+
+describe("read-only coding tools", () => {
+  test("file_info, list_files, glob_search and grep_search expose bounded data", async () => {
+    expect(await invoke("file_info", { path: "input.ts" })).toMatchObject({ ok: true });
+    expect(await invoke("list_files", { path: "." })).toMatchObject({ ok: true });
+    expect(await invoke("glob_search", { path: ".", pattern: "**/*.ts" }))
+      .toMatchObject({ ok: true });
+    expect(await invoke("grep_search", { path: ".", pattern: "value" }))
+      .toMatchObject({ ok: true });
+  });
+
+  test("read_file validates ranges and rejects traversal", async () => {
+    expect(await invoke("read_file", { path: "input.ts", startLine: 1, endLine: 1 }))
+      .toMatchObject({ ok: true });
+    expect(await invoke("read_file", { path: "input.ts", startLine: 2, endLine: 1 }))
+      .toMatchObject({ ok: false, code: "INVALID_LINE_RANGE" });
+    expect(await invoke("read_file", { path: "../outside.ts" }))
+      .toMatchObject({ ok: false, code: "PATH_OUTSIDE_WORKSPACE" });
+  });
+});
+
+describe("mutating coding tools", () => {
+  test("mkdir, write_file and move_path produce observable side effects", async () => {
+    expect(await invoke("mkdir", { path: "src" })).toMatchObject({ ok: true });
+    expect(await invoke("write_file", { path: "src/a.ts", content: "export {};\n" }))
+      .toMatchObject({ ok: true });
+    expect(await invoke("move_path", { from: "src/a.ts", to: "src/b.ts" }))
+      .toMatchObject({ ok: true });
+    expect(await readFile(join(workspace, "src/b.ts"), "utf8")).toBe("export {};\n");
+  });
+
+  test("str_replace refuses zero and ambiguous matches", async () => {
+    await writeFile(join(workspace, "input.ts"), "same\nsame\n", "utf8");
+
+    expect(await invoke("str_replace", { path: "input.ts", oldText: "missing", newText: "x" }))
+      .toMatchObject({ ok: false, code: "PATTERN_NOT_FOUND" });
+    expect(await invoke("str_replace", { path: "input.ts", oldText: "same", newText: "x" }))
+      .toMatchObject({ ok: false, code: "AMBIGUOUS_REPLACEMENT" });
+  });
+
+  test("apply_patch applies a valid patch and diagnoses an invalid one", async () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: input.ts",
+      "@@",
+      "-const value = 1;",
+      "+const value = 2;",
+      "*** End Patch",
+    ].join("\n");
+
+    expect(await invoke("apply_patch", { patch })).toMatchObject({ ok: true });
+    expect(await invoke("apply_patch", { patch: "not a patch" }))
+      .toMatchObject({ ok: false, code: "PATCH_APPLY_FAILED" });
+  });
+});
+
+describe("bash", () => {
+  test("captures success and non-zero exit", async () => {
+    expect(await invoke("bash", { command: "printf ok" })).toMatchObject({ ok: true });
+    expect(await invoke("bash", { command: "exit 7" }))
+      .toMatchObject({ ok: false, code: "COMMAND_FAILED" });
+  });
+
+  test("reports timeout and observes a pre-aborted signal", async () => {
+    expect(await invoke("bash", { command: "sleep 1" }))
+      .toMatchObject({ ok: false, code: "COMMAND_TIMED_OUT" });
+
+    const controller = new AbortController();
+    controller.abort();
+    expect(await invoke("bash", { command: "printf unexpected" }, controller.signal))
+      .toMatchObject({ ok: false, code: "ABORTED" });
+  });
+});
 ```
 
-测试绝不能修改课程仓库本身。
+参数规则：所有 Tool input 的首字段都是 `description`；文件路径相对固定 `cwd`；
+`startLine/endLine` 为 1-based 且必须成对出现；bash timeout 来自 composition 配置而非模型。
 
 ### 运行与观察
 
@@ -383,6 +940,19 @@ bun run examples/stage-08-coding-tools.ts reject-path
 
 ## 阶段 9：组装 Coding Agent、Skills、Todo 与项目指令
 
+创建新增文件：
+
+```bash
+mkdir -p src/coding/agents/__tests__ src/agent/skills/__tests__ src/agent/todos/__tests__
+touch src/coding/agents/coding-agent.ts src/coding/agents/index.ts
+touch src/coding/agents/__tests__/coding-agent.test.ts
+touch src/agent/skills/skill-reader.ts src/agent/skills/skills-middleware.ts src/agent/skills/index.ts
+touch src/agent/skills/__tests__/skill-reader.test.ts
+touch src/agent/todos/todo-system.ts src/agent/todos/index.ts src/agent/todos/__tests__/todo-system.test.ts
+touch src/coding/tools/ask-user-question.ts src/coding/tools/__tests__/ask-user-question.test.ts
+touch examples/stage-09-coding-agent.ts
+```
+
 ### 9.1 Coding Agent composition root
 
 不要把 Coding 逻辑放回通用 `Agent`。创建：
@@ -394,13 +964,17 @@ export async function defineCodingAgent(options: {
   skillsDirs?: string[];
   askUserQuestion?: AskUserQuestionHandler;
   policyMiddleware?: AgentMiddleware;
+  maxGuidanceCharacters?: number;
+  onWarning?: (message: string) => void;
 }): Promise<Agent> {
-  // TODO:
-  // 1. 读取项目 guidance
-  // 2. 定义 coding prompt
-  // 3. 构造 tools
-  // 4. 构造 skills/todo/policy middlewares
-  // 5. 返回通用 Agent
+  // 标准实现示例：先固定 cwd；后续所有 path Tool 必须共享这一个边界。
+  const cwd = options.cwd ?? process.cwd();
+
+  // TODO 1：读取 `${cwd}/AGENTS.md`；不存在时返回空 guidance，超限时 warning。
+  // TODO 2：组合 coding prompt，但不要把 guidance 写入 canonical transcript。
+  // TODO 3：构造绑定 cwd 的 coding tools。
+  // TODO 4：构造 skills/todo/policy middlewares，顺序写入测试。
+  // TODO 5：返回通用 Agent；本文件不实现 loop 或 filesystem 细节。
 }
 ```
 
@@ -433,6 +1007,28 @@ Instructions...
 ```
 
 Skill discovery 只读取 `name`、`description`、`path`，把列表注入 model prompt。只有模型选择 Skill 或用户显式指定 Skill 后，才调用 `read_file` 加载完整 `SKILL.md`。
+
+目标文件：`src/agent/skills/skill-reader.ts`
+
+本阶段固定以下公开契约，避免测试和调用方猜函数名：
+
+```ts
+export interface SkillDescriptor {
+  name: string;
+  description: string;
+  path: string;
+}
+
+export async function discoverSkills(options: {
+  directories: string[];
+  maxFrontmatterCharacters?: number;
+}): Promise<{ skills: SkillDescriptor[]; warnings: string[] }>;
+
+export async function readSkill(options: {
+  descriptor: SkillDescriptor;
+  maxCharacters?: number;
+}): Promise<{ content: string; truncated: boolean }>;
+```
 
 必须测试：
 
@@ -467,6 +1063,233 @@ export type AskUserQuestionHandler = (params: {
 ```
 
 测试 handler 被并发 Tool 调度调用时不会丢失 call id。
+
+### 9.6 完整测试
+
+目标文件：`src/agent/skills/__tests__/skill-reader.test.ts`
+
+```ts
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { discoverSkills, readSkill } from "../skill-reader";
+
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+async function fixture(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "harness-skills-"));
+  roots.push(root);
+  await mkdir(join(root, "valid"));
+  await mkdir(join(root, "broken"));
+  await writeFile(join(root, "valid", "SKILL.md"), [
+    "---",
+    "name: test-writer",
+    "description: Use when writing tests.",
+    "---",
+    "",
+    "# Test Writer",
+    "Full instructions",
+  ].join("\n"));
+  await writeFile(join(root, "broken", "SKILL.md"), "---\nname: broken\n");
+  return root;
+}
+
+describe("Skill reader", () => {
+  test("returns no skills for a missing directory", async () => {
+    const result = await discoverSkills({ directories: ["/definitely/missing"] });
+    expect(result.skills).toEqual([]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  test("discovers metadata but loads full content only when selected", async () => {
+    const root = await fixture();
+    const result = await discoverSkills({ directories: [root] });
+
+    expect(result.skills).toHaveLength(1);
+    expect(result.skills[0]).toMatchObject({
+      name: "test-writer",
+      description: "Use when writing tests.",
+    });
+    expect(JSON.stringify(result.skills)).not.toContain("Full instructions");
+    expect((await readSkill({ descriptor: result.skills[0]! })).content)
+      .toContain("Full instructions");
+    expect(result.warnings.join("\n")).toContain("broken");
+  });
+
+  test("deduplicates the same real path without hiding same-name skills", async () => {
+    const root = await fixture();
+    const result = await discoverSkills({ directories: [root, root] });
+    expect(result.skills.filter((skill) => skill.name === "test-writer")).toHaveLength(1);
+  });
+});
+```
+
+目标文件：`src/agent/todos/__tests__/todo-system.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { TodoSystem } from "../todo-system";
+
+describe("TodoSystem", () => {
+  test("replaces all items when merge is false", () => {
+    const todos = new TodoSystem({ reminderAfterSteps: 2 });
+    todos.write({
+      merge: false,
+      items: [
+        { id: "a", text: "inspect", status: "completed" },
+        { id: "b", text: "edit", status: "in_progress" },
+      ],
+    });
+
+    expect(todos.snapshot()).toHaveLength(2);
+  });
+
+  test("merges by id and rejects two in-progress items", () => {
+    const todos = new TodoSystem({ reminderAfterSteps: 2 });
+    todos.write({
+      merge: false,
+      items: [{ id: "a", text: "inspect", status: "in_progress" }],
+    });
+    todos.write({
+      merge: true,
+      items: [{ id: "a", text: "inspect", status: "completed" }],
+    });
+    expect(todos.snapshot()[0]?.status).toBe("completed");
+
+    expect(() => todos.write({
+      merge: false,
+      items: [
+        { id: "a", text: "one", status: "in_progress" },
+        { id: "b", text: "two", status: "in_progress" },
+      ],
+    })).toThrow("in_progress");
+  });
+
+  test("reminds only after the configured number of untouched steps", () => {
+    const todos = new TodoSystem({ reminderAfterSteps: 2 });
+    todos.write({
+      merge: false,
+      items: [{ id: "a", text: "inspect", status: "pending" }],
+    });
+    expect(todos.reminderForStep(1)).toBeUndefined();
+    expect(todos.reminderForStep(2)).toContain("inspect");
+  });
+});
+```
+
+目标文件：`src/coding/tools/__tests__/ask-user-question.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { defineAskUserQuestionTool } from "../ask-user-question";
+
+describe("ask_user_question", () => {
+  test("keeps concurrent answers associated with their invocation", async () => {
+    const tool = defineAskUserQuestionTool({
+      handler: async ({ question }) => {
+        await Bun.sleep(question === "slow" ? 20 : 1);
+        return { answer: `answer:${question}` };
+      },
+    });
+
+    const [slow, fast] = await Promise.all([
+      tool.invoke({ description: "ask slow", question: "slow" }),
+      tool.invoke({ description: "ask fast", question: "fast" }),
+    ]);
+
+    expect(slow).toEqual({ answer: "answer:slow" });
+    expect(fast).toEqual({ answer: "answer:fast" });
+  });
+});
+```
+
+目标文件：`src/coding/agents/__tests__/coding-agent.test.ts`
+
+```ts
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
+
+import { defineCodingAgent } from "../coding-agent";
+
+const FINAL: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "done" }],
+};
+const USER: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "inspect" }],
+};
+
+class RecordingProvider implements ModelProvider {
+  params?: ModelProviderInvokeParams;
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    this.params = params;
+    return FINAL;
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    this.params = params;
+    yield FINAL;
+  }
+}
+
+let workspace: string | undefined;
+
+afterEach(async () => {
+  if (workspace) await rm(workspace, { recursive: true, force: true });
+  workspace = undefined;
+});
+
+async function runFixture(options: { guidance?: string; max?: number }) {
+  workspace = await mkdtemp(join(tmpdir(), "harness-agent-"));
+  if (options.guidance !== undefined) {
+    await writeFile(join(workspace, "AGENTS.md"), options.guidance, "utf8");
+  }
+  const provider = new RecordingProvider();
+  const warnings: string[] = [];
+  const agent = await defineCodingAgent({
+    model: new Model({ name: "recording", provider }),
+    cwd: workspace,
+    maxGuidanceCharacters: options.max,
+    onWarning: (warning) => warnings.push(warning),
+  });
+  for await (const _event of agent.stream(USER)) {
+    // consume
+  }
+  return { provider, warnings };
+}
+
+describe("defineCodingAgent", () => {
+  test("loads project guidance and composes the coding toolset", async () => {
+    const { provider } = await runFixture({ guidance: "Always run tests." });
+    expect(JSON.stringify(provider.params?.messages[0])).toContain("Always run tests.");
+    expect(provider.params?.tools?.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["read_file", "todo_write", "ask_user_question"]),
+    );
+  });
+
+  test("runs without AGENTS.md and warns when guidance exceeds its limit", async () => {
+    expect((await runFixture({})).warnings).toEqual([]);
+    expect((await runFixture({ guidance: "123456", max: 4 })).warnings.join("\n"))
+      .toContain("AGENTS.md");
+  });
+});
+```
 
 ### 运行与观察
 
@@ -509,6 +1332,19 @@ bun run examples/stage-09-coding-agent.ts fixture
 
 把 runtime 变成真正可用的终端产品，同时建立人工审批边界。完成后打 `v0.1.0` tag，表示基础复刻结束。
 
+创建新增目录和主要文件：
+
+```bash
+mkdir -p src/cli/config/__tests__ src/cli/tui/components src/cli/tui/hooks src/cli/tui/__tests__
+mkdir -p src/coding/permissions/__tests__ docs
+touch src/cli/config/schema.ts src/cli/config/model-factory.ts src/cli/config/index.ts
+touch src/cli/config/__tests__/schema.test.ts
+touch src/cli/tui/app.tsx src/cli/tui/state.ts src/cli/tui/token-usage.ts
+touch src/cli/tui/__tests__/state.test.ts src/cli/tui/__tests__/token-usage.test.ts
+touch src/coding/permissions/approval-middleware.ts src/coding/permissions/index.ts
+touch src/coding/permissions/__tests__/approval-middleware.test.ts docs/manual-test.md
+```
+
 ### 10.1 安装交互依赖
 
 ```bash
@@ -519,6 +1355,8 @@ bun add -d @types/react eslint typescript-eslint
 把 ESLint 加入 `bun run check`。不要在这一阶段做全仓库风格重构，只约束新增项目。
 
 ### 10.2 配置模型
+
+目标文件：`src/cli/config/schema.ts`
 
 定义可校验的 YAML：
 
@@ -551,6 +1389,8 @@ harness-lab config model set-default <name>
 ```
 
 ### 10.3 最小 TUI 状态
+
+目标文件：`src/cli/tui/state.ts`
 
 先实现状态，再做视觉：
 
@@ -591,6 +1431,8 @@ UI 通过消费 `AgentEvent` 更新状态。不要让 UI 读取 `Agent` 私有�
 
 基础版本按 Tool 风险分类：
 
+目标文件：`src/coding/permissions/approval-middleware.ts`
+
 ```ts
 const TOOLS_REQUIRING_APPROVAL = [
   "bash",
@@ -626,12 +1468,24 @@ export type ApprovalDecision =
 
 ### 10.5 Token usage
 
+目标文件：`src/cli/tui/token-usage.ts`
+
 只从 assistant message 的 provider-reported usage 聚合：
 
 ```ts
 export function calculateTokenUsage(messages: NonSystemMessage[]) {
-  // latestInputTokens = 最后一条有 usage 的 assistant.promptTokens
-  // sessionTotalTokens = 所有 assistant.totalTokens 之和
+  const assistantWithUsage = messages.filter(
+    (message) => message.role === "assistant" && message.usage,
+  );
+
+  // 标准实现示例：session total 是所有已报告 totalTokens 的和。
+  const sessionTotalTokens = assistantWithUsage.reduce(
+    (sum, message) => sum + (message.usage?.totalTokens ?? 0),
+    0,
+  );
+
+  // TODO：latestInputTokens 读取最后一条有 usage 的 promptTokens；没有时为 0。
+  return { latestInputTokens: 0, sessionTotalTokens };
 }
 ```
 
@@ -655,20 +1509,229 @@ bun run dev
 
 把这套步骤写成 `docs/manual-test.md`，阶段 15 录制演示时直接复用。
 
-### 必写自动化测试
+### 10.6 完整自动化测试
 
-- model config schema；
-- default model resolution；
-- token usage aggregation；
-- slash command parsing；
-- approval queue FIFO；
-- queue overflow fail closed；
-- deny 跳过真实 Tool；
-- project allowlist persistence；
-- abort 后可开始下一轮 run；
-- TUI state reducer 对 event 的更新。
+UI 像素和颜色不用过度测试，固定配置、审批与状态转换即可。以下文件均为完整内容，
+复制后读者只运行测试，不修改断言。
 
-UI 像素和颜色不用过度测试，优先测试状态转换。
+目标文件：`src/cli/config/__tests__/schema.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { parseHarnessConfig, resolveDefaultModel } from "../schema";
+
+describe("model config", () => {
+  test("parses a valid model without resolving the secret value", () => {
+    const config = parseHarnessConfig({
+      defaultModel: "local",
+      models: {
+        local: {
+          provider: "openai",
+          model: "test-model",
+          apiKeyEnv: "OPENAI_API_KEY",
+          options: { temperature: 0 },
+        },
+      },
+    });
+
+    expect(resolveDefaultModel(config)).toMatchObject({
+      provider: "openai",
+      model: "test-model",
+      apiKeyEnv: "OPENAI_API_KEY",
+    });
+    expect(JSON.stringify(config)).not.toContain(process.env.OPENAI_API_KEY ?? "never-a-secret");
+  });
+
+  test("reports the full path for invalid fields", () => {
+    expect(() => parseHarnessConfig({
+      defaultModel: "local",
+      models: { local: { provider: "unknown" } },
+    })).toThrow("models.local");
+  });
+
+  test("rejects a missing default model", () => {
+    expect(() => parseHarnessConfig({
+      defaultModel: "missing",
+      models: {
+        local: { provider: "openai", model: "test-model", apiKeyEnv: "OPENAI_API_KEY" },
+      },
+    })).toThrow("defaultModel");
+  });
+});
+```
+
+目标文件：`src/cli/tui/__tests__/token-usage.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { NonSystemMessage } from "@/foundation/messages";
+
+import { calculateTokenUsage } from "../token-usage";
+
+describe("calculateTokenUsage", () => {
+  test("uses the latest reported prompt tokens and sums session totals", () => {
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: "one" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "first" }],
+        usage: { promptTokens: 10, completionTokens: 2, totalTokens: 12 },
+      },
+      { role: "assistant", content: [{ type: "text", text: "no usage" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "latest" }],
+        usage: { promptTokens: 20, completionTokens: 3, totalTokens: 23 },
+      },
+    ];
+
+    expect(calculateTokenUsage(messages)).toEqual({
+      latestInputTokens: 20,
+      sessionTotalTokens: 35,
+    });
+  });
+
+  test("returns zero values without provider usage", () => {
+    expect(calculateTokenUsage([])).toEqual({ latestInputTokens: 0, sessionTotalTokens: 0 });
+  });
+});
+```
+
+目标文件：`src/coding/permissions/__tests__/approval-middleware.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { defineApprovalMiddleware } from "../approval-middleware";
+
+function toolUse(id: string, name = "write_file") {
+  return { type: "tool_use" as const, id, name, input: { path: "a.ts", content: "x" } };
+}
+
+describe("approval middleware", () => {
+  test("lets read-only tools pass without requesting approval", async () => {
+    let requests = 0;
+    const middleware = defineApprovalMiddleware({
+      projectId: "fixture",
+      maxQueueLength: 2,
+      requestDecision: async () => {
+        requests += 1;
+        return "deny";
+      },
+    });
+
+    expect(await middleware.beforeToolUse?.({ toolUse: toolUse("read", "read_file") } as never))
+      .toBeUndefined();
+    expect(requests).toBe(0);
+  });
+
+  test("serves concurrent approval requests in FIFO order", async () => {
+    const requested: string[] = [];
+    const middleware = defineApprovalMiddleware({
+      projectId: "fixture",
+      maxQueueLength: 3,
+      requestDecision: async ({ toolUse }) => {
+        requested.push(toolUse.id);
+        await Bun.sleep(1);
+        return "allow_once";
+      },
+    });
+
+    await Promise.all([
+      middleware.beforeToolUse?.({ toolUse: toolUse("a") } as never),
+      middleware.beforeToolUse?.({ toolUse: toolUse("b") } as never),
+      middleware.beforeToolUse?.({ toolUse: toolUse("c") } as never),
+    ]);
+    expect(requested).toEqual(["a", "b", "c"]);
+  });
+
+  test("fails closed on overflow and turns deny into a skip result", async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    const middleware = defineApprovalMiddleware({
+      projectId: "fixture",
+      maxQueueLength: 1,
+      requestDecision: async () => {
+        await blocked;
+        return "deny";
+      },
+    });
+
+    const first = middleware.beforeToolUse?.({ toolUse: toolUse("a") } as never);
+    const overflow = await middleware.beforeToolUse?.({ toolUse: toolUse("b") } as never);
+    expect(overflow).toMatchObject({ __skip: true, result: { code: "APPROVAL_QUEUE_FULL" } });
+    release();
+    expect(await first).toMatchObject({ __skip: true, result: { code: "USER_DENIED" } });
+  });
+
+  test("persists and reuses allow_always_project", async () => {
+    const saved: string[] = [];
+    let requests = 0;
+    const middleware = defineApprovalMiddleware({
+      projectId: "fixture",
+      maxQueueLength: 2,
+      persistence: {
+        has: async (_projectId, toolName) => saved.includes(toolName),
+        add: async (_projectId, toolName) => void saved.push(toolName),
+      },
+      requestDecision: async () => {
+        requests += 1;
+        return "allow_always_project";
+      },
+    });
+
+    await middleware.beforeToolUse?.({ toolUse: toolUse("a") } as never);
+    await middleware.beforeToolUse?.({ toolUse: toolUse("b") } as never);
+    expect(saved).toEqual(["write_file"]);
+    expect(requests).toBe(1);
+  });
+});
+```
+
+目标文件：`src/cli/tui/__tests__/state.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { initialAgentLoopViewState, parseSlashCommand, reduceAgentEvent } from "../state";
+
+describe("TUI state", () => {
+  test("parses only supported slash commands", () => {
+    expect(parseSlashCommand("/clear")).toEqual({ name: "clear", args: [] });
+    expect(parseSlashCommand("/help topic")).toEqual({ name: "help", args: ["topic"] });
+    expect(parseSlashCommand("hello")).toBeUndefined();
+    expect(() => parseSlashCommand("/unknown")).toThrow("unknown");
+  });
+
+  test("reduces messages, streaming and approval events", () => {
+    const started = reduceAgentEvent(initialAgentLoopViewState(), { type: "run_start" } as never);
+    const messaged = reduceAgentEvent(started, {
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+    } as never);
+    const approval = reduceAgentEvent(messaged, {
+      type: "approval_requested",
+      request: { id: "approval-1", toolName: "write_file" },
+    } as never);
+    const ended = reduceAgentEvent(approval, { type: "run_end" } as never);
+
+    expect(started.streaming).toBe(true);
+    expect(messaged.messages).toHaveLength(1);
+    expect(approval.pendingApproval).toMatchObject({ id: "approval-1" });
+    expect(ended.streaming).toBe(false);
+  });
+
+  test("can start a new run after abort", () => {
+    const aborted = reduceAgentEvent(
+      reduceAgentEvent(initialAgentLoopViewState(), { type: "run_start" } as never),
+      { type: "run_end", status: "aborted" } as never,
+    );
+    expect(reduceAgentEvent(aborted, { type: "run_start" } as never).streaming).toBe(true);
+  });
+});
+```
 
 ### 阶段后对照
 

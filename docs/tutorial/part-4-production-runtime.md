@@ -23,7 +23,22 @@
 - 为什么 run 最终停止？
 - 哪一次 context 变换影响了实际发送给模型的内容？
 
+创建文件：
+
+```bash
+mkdir -p src/runtime/trace/__tests__ src/cli/commands examples
+touch src/runtime/trace/events.ts src/runtime/trace/runtime-clock.ts
+touch src/runtime/trace/redactor.ts src/runtime/trace/jsonl-trace-store.ts
+touch src/runtime/trace/metrics.ts src/runtime/trace/index.ts
+touch src/runtime/trace/__tests__/jsonl-trace-store.test.ts
+touch src/runtime/trace/__tests__/metrics.test.ts src/runtime/trace/__tests__/runtime-trace.test.ts
+touch src/cli/commands/trace.ts
+touch examples/stage-11-trace.ts
+```
+
 ### 11.1 Trace event schema
+
+目标文件：`src/runtime/trace/events.ts`
 
 事件 envelope：
 
@@ -105,6 +120,8 @@ export type RuntimeTraceEvent =
 
 为了让测试 deterministic：
 
+目标文件：`src/runtime/trace/runtime-clock.ts`
+
 ```ts
 export interface RuntimeClock {
   now(): Date;
@@ -122,6 +139,17 @@ export interface TraceSink {
 
 Production 使用真实 clock 和 `crypto.randomUUID()`；测试使用递增 fake。不要在测试里断言真实时间或随机 UUID。
 
+把三项依赖作为 `Agent` 构造参数中的 `runtime` 传入；production composition root 提供默认
+实现，单元测试显式传 fake：
+
+```ts
+runtime?: {
+  clock: RuntimeClock;
+  idGenerator: IdGenerator;
+  traceSink: TraceSink;
+}
+```
+
 ### 11.3 为什么不能只靠 Middleware
 
 Middleware 很适合扩展普通生命周期，但 tracing 还需要观察：
@@ -136,6 +164,8 @@ Middleware 很适合扩展普通生命周期，但 tracing 还需要观察：
 
 ### 11.4 JSONL TraceStore
 
+目标文件：`src/runtime/trace/jsonl-trace-store.ts`
+
 ```ts
 export class JsonlTraceStore implements TraceSink {
   constructor(options: {
@@ -144,11 +174,17 @@ export class JsonlTraceStore implements TraceSink {
   }) {}
 
   async append(event: RuntimeTraceEvent): Promise<void> {
-    // TODO:
-    // 1. validate event
-    // 2. redact payload
-    // 3. 一行一个 JSON，结尾换行
-    // 4. 保证同一 run 的 sequence 有序
+    // 标准实现示例：先做纯 redaction，再序列化；原 event 不能被修改。
+    const redacted = this._redactor.redact(structuredClone(event));
+
+    // TODO 1：校验 envelope 与 payload；失败错误必须包含 event.type。
+    // TODO 2：按 runId 选择 `.harness/runs/<run-id>/trace.jsonl` 并创建父目录。
+    // TODO 3：同一 run 通过单写队列串行 append；每行 JSON 以 "\n" 结束。
+    // TODO 4：拒绝 sequence 倒退或重复，并报告 expected/actual。
+  }
+
+  async read(runId: string): Promise<RuntimeTraceEvent[]> {
+    // TODO 5：逐行解析；空尾行忽略，错误必须报告 runId 和 1-based 行号。
   }
 }
 ```
@@ -175,6 +211,8 @@ export class JsonlTraceStore implements TraceSink {
 
 从 trace 纯函数派生指标：
 
+目标文件：`src/runtime/trace/metrics.ts`
+
 ```ts
 export interface RunMetrics {
   steps: number;
@@ -192,7 +230,26 @@ export interface RunMetrics {
 }
 
 export function reduceRunMetrics(events: RuntimeTraceEvent[]): RunMetrics {
-  // TODO: 不读取 Agent 实例或全局状态
+  // 标准实现示例：初始化零值，确保空 trace 也返回完整 shape。
+  const metrics: RunMetrics = {
+    steps: 0,
+    modelCalls: 0,
+    toolCalls: 0,
+    failedToolCalls: 0,
+    deniedToolCalls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    modelTimeMs: 0,
+    toolTimeMs: 0,
+    approvalWaitMs: 0,
+    wallTimeMs: 0,
+  };
+
+  // TODO 1：逐事件累加；同一个 model_end 的 usage 只能计一次。
+  // TODO 2：toolTimeMs 是所有 tool_end.durationMs 之和，不与 wallTime 取 max。
+  // TODO 3：run_end.durationMs 覆盖 wallTimeMs；没有 run_end 时保持 0。
+  return metrics;
 }
 ```
 
@@ -200,7 +257,7 @@ export function reduceRunMetrics(events: RuntimeTraceEvent[]): RunMetrics {
 
 ### 11.6 Trace CLI
 
-实现：
+目标命令及示例调用：
 
 ```bash
 harness-lab trace list
@@ -220,17 +277,309 @@ RUN 8cf... model=... status=completed wall=1832ms
 TOTAL tokens=2032 model=1786ms tools=12ms approval=0ms
 ```
 
-### 必写测试
+### 11.7 完整测试
 
-- sequence 从 1 单调递增；
-- 同一 run 的 JSONL 可以逐行解析；
-- redactor 删除常见 secret keys；
-- 大 input/output 被截断并有 marker；
-- success、failure、abort、maxSteps 都产生 `run_end`；
-- transcript 每次变更产生一个顺序正确的 `message_appended`；
-- 并发 Tool event correlation 不串 id；
-- metrics reducer 正确处理并发 spans；
-- malformed/truncated JSONL 给出可定位行号。
+目标文件：`src/runtime/trace/__tests__/jsonl-trace-store.test.ts`
+
+下面的测试使用临时目录并直接读取 JSONL，因此同时验证持久化格式。`createTraceRedactor`
+必须返回纯 redactor，不修改传入事件。
+
+```ts
+import { afterEach, describe, expect, test } from "bun:test";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { JsonlTraceStore } from "../jsonl-trace-store";
+import { createTraceRedactor } from "../redactor";
+
+let root: string | undefined;
+
+afterEach(async () => {
+  if (root) await rm(root, { recursive: true, force: true });
+  root = undefined;
+});
+
+async function fixture() {
+  root = await mkdtemp(join(tmpdir(), "harness-trace-"));
+  return new JsonlTraceStore({
+    rootDir: root,
+    redactor: createTraceRedactor({ maxStringCharacters: 16 }),
+  });
+}
+
+function event(sequence: number, payload: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: 1 as const,
+    runId: "run-1",
+    sequence,
+    timestamp: "2026-01-01T00:00:00.000Z",
+    type: "tool_end" as const,
+    payload: {
+      step: 1,
+      toolUseId: "call-1",
+      toolName: "read_file",
+      durationMs: 2,
+      status: "succeeded" as const,
+      resultSummary: "ok",
+      ...payload,
+    },
+  };
+}
+
+describe("JsonlTraceStore", () => {
+  test("writes one parseable line per event in sequence order", async () => {
+    const store = await fixture();
+    await Promise.all([store.append(event(1)), store.append(event(2)), store.append(event(3))]);
+
+    const path = join(root!, ".harness", "runs", "run-1", "trace.jsonl");
+    const lines = (await readFile(path, "utf8")).trimEnd().split("\n");
+    expect(lines.map((line) => JSON.parse(line).sequence)).toEqual([1, 2, 3]);
+    expect(await store.read("run-1")).toHaveLength(3);
+  });
+
+  test("redacts secret keys, truncates large strings and keeps the source immutable", async () => {
+    const store = await fixture();
+    const source = event(1, {
+      authorization: "Bearer secret",
+      resultSummary: "abcdefghijklmnopqrstuvwxyz",
+    });
+    await store.append(source as never);
+
+    const [saved] = await store.read("run-1");
+    expect(JSON.stringify(saved)).not.toContain("Bearer secret");
+    expect(JSON.stringify(saved)).toContain("truncated");
+    expect(JSON.stringify(source)).toContain("Bearer secret");
+  });
+
+  test("rejects duplicate or decreasing sequence numbers", async () => {
+    const store = await fixture();
+    await store.append(event(1));
+    await expect(store.append(event(1))).rejects.toThrow("expected 2");
+  });
+
+  test("reports the one-based line number of malformed JSONL", async () => {
+    const store = await fixture();
+    await store.append(event(1));
+    const path = join(root!, ".harness", "runs", "run-1", "trace.jsonl");
+    await appendFile(path, "{broken\n", "utf8");
+
+    await expect(store.read("run-1")).rejects.toThrow("line 2");
+  });
+});
+```
+
+目标文件：`src/runtime/trace/__tests__/metrics.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { reduceRunMetrics } from "../metrics";
+
+function trace(type: string, payload: Record<string, unknown>, sequence: number) {
+  return {
+    schemaVersion: 1,
+    runId: "run-1",
+    sequence,
+    timestamp: `2026-01-01T00:00:00.00${sequence}Z`,
+    type,
+    payload,
+  } as never;
+}
+
+describe("reduceRunMetrics", () => {
+  test("returns a stable zero shape for an empty trace", () => {
+    expect(reduceRunMetrics([])).toEqual({
+      steps: 0,
+      modelCalls: 0,
+      toolCalls: 0,
+      failedToolCalls: 0,
+      deniedToolCalls: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      modelTimeMs: 0,
+      toolTimeMs: 0,
+      approvalWaitMs: 0,
+      wallTimeMs: 0,
+    });
+  });
+
+  test("sums concurrent spans while keeping wall time independent", () => {
+    const metrics = reduceRunMetrics([
+      trace("step_end", { step: 1, durationMs: 80 }, 1),
+      trace("model_end", {
+        step: 1,
+        durationMs: 40,
+        usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+        toolCallCount: 2,
+      }, 2),
+      trace("tool_end", {
+        step: 1, toolUseId: "a", toolName: "read_file", durationMs: 50,
+        status: "succeeded", resultSummary: "A",
+      }, 3),
+      trace("tool_end", {
+        step: 1, toolUseId: "b", toolName: "write_file", durationMs: 60,
+        status: "denied", resultSummary: "B",
+      }, 4),
+      trace("approval_wait_end", { toolUseId: "b", decision: "deny", durationMs: 12 }, 5),
+      trace("run_end", { status: "completed", durationMs: 100 }, 6),
+    ]);
+
+    expect(metrics).toMatchObject({
+      steps: 1,
+      modelCalls: 1,
+      toolCalls: 2,
+      deniedToolCalls: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      modelTimeMs: 40,
+      toolTimeMs: 110,
+      approvalWaitMs: 12,
+      wallTimeMs: 100,
+    });
+  });
+});
+```
+
+目标文件：`src/runtime/trace/__tests__/runtime-trace.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model, ScriptedModelProvider } from "@/foundation/models";
+import { Agent } from "@/agent/agent";
+
+import type { RuntimeTraceEvent } from "../events";
+
+const USER: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "run" }],
+};
+const FINAL: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "done" }],
+};
+
+function runtime(events: RuntimeTraceEvent[]) {
+  let id = 0;
+  let ms = 0;
+  return {
+    clock: {
+      now: () => new Date(`2026-01-01T00:00:00.${String(ms).padStart(3, "0")}Z`),
+      monotonicMs: () => ms++,
+    },
+    idGenerator: { next: () => `run-${++id}` },
+    traceSink: { append: async (event: RuntimeTraceEvent) => void events.push(event) },
+  };
+}
+
+async function drain(agent: Agent) {
+  for await (const _event of agent.stream(USER)) {
+    // consume
+  }
+}
+
+describe("Agent runtime trace", () => {
+  test("emits ordered transcript facts and a completed run_end", async () => {
+    const events: RuntimeTraceEvent[] = [];
+    const provider = new ScriptedModelProvider({
+      responses: [
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call-1", name: "missing", input: {} }],
+        },
+        FINAL,
+      ],
+    });
+    const agent = new Agent({
+      model: new Model({ name: "scripted", provider }),
+      prompt: "",
+      tools: [],
+      runtime: runtime(events),
+    });
+
+    await drain(agent);
+    expect(events.map((event) => event.sequence)).toEqual(
+      events.map((_, index) => index + 1),
+    );
+    expect(events.filter((event) => event.type === "message_appended")).toHaveLength(4);
+    expect(events.find((event) =>
+      event.type === "tool_end" && event.payload.toolUseId === "call-1",
+    )).toBeDefined();
+    expect(events.at(-1)).toMatchObject({ type: "run_end", payload: { status: "completed" } });
+  });
+
+  test("emits max_steps when the loop exhausts its budget", async () => {
+    const events: RuntimeTraceEvent[] = [];
+    const agent = new Agent({
+      model: new Model({
+        name: "scripted",
+        provider: new ScriptedModelProvider({
+          responses: [{
+            role: "assistant",
+            content: [{ type: "tool_use", id: "call-1", name: "missing", input: {} }],
+          }],
+        }),
+      }),
+      prompt: "",
+      tools: [],
+      maxSteps: 1,
+      runtime: runtime(events),
+    });
+
+    await expect(drain(agent)).rejects.toBeDefined();
+    expect(events.at(-1)).toMatchObject({ type: "run_end", payload: { status: "max_steps" } });
+  });
+
+  test("emits failed when the provider throws", async () => {
+    const events: RuntimeTraceEvent[] = [];
+    const provider = {
+      invoke: async () => { throw new Error("provider failed"); },
+      stream: async function* () { throw new Error("provider failed"); },
+    };
+    const agent = new Agent({
+      model: new Model({ name: "broken", provider }),
+      prompt: "",
+      tools: [],
+      runtime: runtime(events),
+    });
+
+    await expect(drain(agent)).rejects.toThrow("provider failed");
+    expect(events.at(-1)).toMatchObject({ type: "run_end", payload: { status: "failed" } });
+  });
+
+  test("emits aborted when the active model request is cancelled", async () => {
+    const events: RuntimeTraceEvent[] = [];
+    let started!: () => void;
+    const modelStarted = new Promise<void>((resolve) => (started = resolve));
+    const provider = {
+      invoke: async () => FINAL,
+      stream: async function* ({ signal }: { signal?: AbortSignal }) {
+        started();
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        yield FINAL;
+      },
+    };
+    const agent = new Agent({
+      model: new Model({ name: "blocking", provider }),
+      prompt: "",
+      tools: [],
+      runtime: runtime(events),
+    });
+
+    const run = drain(agent);
+    await modelStarted;
+    agent.abort();
+    await expect(run).rejects.toBeDefined();
+    expect(events.at(-1)).toMatchObject({ type: "run_end", payload: { status: "aborted" } });
+  });
+});
+```
 
 ### 故障注入
 
@@ -265,7 +614,22 @@ TOTAL tokens=2032 model=1786ms tools=12ms approval=0ms
 - 对结果未知的修改动作停止并请求人工决策；
 - 明确记录运行状态，而不是假装一定能自动恢复。
 
+创建文件：
+
+```bash
+mkdir -p src/runtime/checkpoint/__tests__ src/runtime/replay/__tests__
+touch src/runtime/checkpoint/run-state.ts src/runtime/checkpoint/checkpoint-store.ts
+touch src/runtime/checkpoint/file-checkpoint-store.ts src/runtime/checkpoint/resume-run.ts
+touch src/runtime/checkpoint/fault-injector.ts src/runtime/checkpoint/index.ts
+touch src/runtime/checkpoint/__tests__/file-checkpoint-store.test.ts
+touch src/runtime/checkpoint/__tests__/resume-run.test.ts
+touch src/runtime/replay/replay.ts src/runtime/replay/index.ts
+touch src/runtime/replay/__tests__/replay.test.ts examples/stage-12-recovery.ts
+```
+
 ### 12.1 RunState schema
+
+目标文件：`src/runtime/checkpoint/run-state.ts`
 
 ```ts
 export interface RunState {
@@ -304,6 +668,8 @@ export interface ToolExecutionRecord {
 `middlewareState` 只保存显式声明可序列化的 state，例如 Todo。不要直接序列化函数、SDK client、AbortController 或整个 Middleware object。
 
 ### 12.2 CheckpointStore
+
+目标文件：`src/runtime/checkpoint/checkpoint-store.ts` 和 `file-checkpoint-store.ts`
 
 ```ts
 export interface CheckpointStore {
@@ -348,19 +714,31 @@ Tool 执行按以下协议：
 
 ### 12.4 Resume algorithm
 
+目标文件：`src/runtime/checkpoint/resume-run.ts`
+
 ```ts
 export async function resumeRun(options: {
   runId: string;
   checkpointStore: CheckpointStore;
   defineAgentFromState: (state: RunState) => Promise<Agent>;
   resolveUnknownTool: UnknownToolResolver;
+  expected?: {
+    cwd: string;
+    projectFingerprint: string;
+    modelOptionsFingerprint: string;
+  };
 }): Promise<void> {
-  // TODO:
-  // 1. load + schema migrate
-  // 2. 校验 cwd/project/model/tool registry fingerprint
-  // 3. 恢复 transcript 和 middleware state
-  // 4. 处理 planned/running/unknown Tool records
-  // 5. 从 nextStep 继续
+  const state = await checkpointStore.load(runId);
+  // 标准实现示例：completed run 是稳定终态，必须在创建 Agent 前拒绝。
+  if (state.status === "completed") {
+    throw new Error(`Run ${runId} is already completed`);
+  }
+
+  // TODO 1：按 schemaVersion migrate；未知新版拒绝读取，不能猜字段。
+  // TODO 2：校验 cwd/project/model/tool registry fingerprint，列出每项差异。
+  // TODO 3：恢复 transcript 和显式可序列化的 middleware state。
+  // TODO 4：planned 可取消；running 在 crash 后先转 unknown，再调用 resolver。
+  // TODO 5：只自动重试 resolver 判定 safe 的动作，然后从 nextStep 继续。
 }
 ```
 
@@ -394,7 +772,20 @@ Replay 禁止：
 
 Replay 按 sequence 消费 `message_appended` 和 lifecycle events。它展示的是经过 redaction 的历史视图，不承诺恢复被隐藏的 secret 或超长 Tool 输出；精确继续运行属于 checkpoint/resume 的职责。
 
-为测试这一点，注入会在调用时直接 throw 的 ModelProvider 和 ToolRegistry；replay 仍应成功。
+目标文件：`src/runtime/replay/replay.ts`
+
+```ts
+export async function replayTrace(options: {
+  events: RuntimeTraceEvent[];
+  onEvent: (event: RuntimeTraceEvent) => void | Promise<void>;
+  speed?: number;
+  noDelay?: boolean;
+  signal?: AbortSignal;
+}): Promise<void>;
+```
+
+这个公开契约故意不接收 ModelProvider、ToolRegistry 或 CheckpointStore，因此 replay 从类型
+层面就是只读的；实现只按 sequence 排序、依据相邻 timestamp 计算延迟并调用 `onEvent`。
 
 ### 12.6 CLI
 
@@ -408,26 +799,250 @@ harness-lab replay <run-id>
 
 `inspect` 展示当前 phase、next step、最后一条 message、pending/unknown Tools、project fingerprint 差异。
 
-### 故障注入测试
+### 12.7 完整恢复测试
 
 实现 `FaultInjector`：
 
 ```ts
 export interface FaultInjector {
-  hit(point: "after_model" | "before_tool" | "after_tool" | "before_checkpoint"): void;
+  hit(point:
+    | "after_model"
+    | "before_tool"
+    | "after_tool"
+    | "before_checkpoint"
+    | "after_temp_write"
+  ): void;
 }
 ```
 
-在第 N 次 hit 抛出 `InjectedCrashError`。至少验证：
+在第 N 次 hit 抛出 `InjectedCrashError`。目标文件：
+`src/runtime/checkpoint/__tests__/file-checkpoint-store.test.ts`
 
-- model 返回后、Tool 执行前崩溃；
-- read Tool 执行中崩溃；
-- write Tool 已产生副作用、结果未保存时崩溃；
-- 多个并发 Tool 中一个完成后崩溃；
-- checkpoint 临时文件写到一半崩溃；
-- resume 后不会重复已确认成功的 Tool；
-- unsafe unknown Tool 触发人工决策；
-- completed run 不可再次 resume。
+```ts
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import type { RunState } from "../run-state";
+import { FileCheckpointStore } from "../file-checkpoint-store";
+
+let root: string | undefined;
+
+afterEach(async () => {
+  if (root) await rm(root, { recursive: true, force: true });
+  root = undefined;
+});
+
+function state(nextStep: number): RunState {
+  return {
+    schemaVersion: 1,
+    runId: "run-1",
+    status: "running",
+    phase: "idle",
+    nextStep,
+    prompt: "test",
+    messages: [],
+    model: { name: "test", provider: "scripted", optionsFingerprint: "model-v1" },
+    cwd: "/fixture",
+    projectFingerprint: "project-v1",
+    toolExecutions: [],
+    middlewareState: {},
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+async function store(options: { crashAfterTempWrite?: boolean } = {}) {
+  root = await mkdtemp(join(tmpdir(), "harness-checkpoint-"));
+  return new FileCheckpointStore({
+    rootDir: root,
+    faultInjector: options.crashAfterTempWrite
+      ? { hit: (point) => {
+          if (point === "after_temp_write") throw new Error("injected crash");
+        } }
+      : undefined,
+  });
+}
+
+describe("FileCheckpointStore", () => {
+  test("round-trips a validated checkpoint and lists its summary", async () => {
+    const checkpoints = await store();
+    await checkpoints.save(state(2));
+
+    expect(await checkpoints.load("run-1")).toEqual(state(2));
+    expect(await checkpoints.list()).toMatchObject([{ runId: "run-1", nextStep: 2 }]);
+  });
+
+  test("keeps the previous checkpoint when a crash occurs before rename", async () => {
+    const stable = await store();
+    await stable.save(state(1));
+    const crashing = new FileCheckpointStore({
+      rootDir: root!,
+      faultInjector: { hit: (point) => {
+        if (point === "after_temp_write") throw new Error("injected crash");
+      } },
+    });
+
+    await expect(crashing.save(state(2))).rejects.toThrow("injected crash");
+    expect((await stable.load("run-1")).nextStep).toBe(1);
+  });
+
+  test("rejects unsupported future schema versions", async () => {
+    const checkpoints = await store();
+    await expect(checkpoints.save({ ...state(1), schemaVersion: 99 } as never))
+      .rejects.toThrow("schemaVersion");
+  });
+});
+```
+
+目标文件：`src/runtime/checkpoint/__tests__/resume-run.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { RunState, ToolExecutionRecord } from "../run-state";
+import { resumeRun } from "../resume-run";
+
+function tool(status: ToolExecutionRecord["status"], effect: ToolExecutionRecord["effect"])
+  : ToolExecutionRecord {
+  return {
+    toolUseId: `call-${status}-${effect}`,
+    toolName: effect === "read" ? "read_file" : "write_file",
+    input: {},
+    effect,
+    idempotency: effect === "read" ? "safe" : "unsafe",
+    status,
+  };
+}
+
+function state(overrides: Partial<RunState> = {}): RunState {
+  return {
+    schemaVersion: 1,
+    runId: "run-1",
+    status: "running",
+    phase: "acting",
+    nextStep: 2,
+    prompt: "test",
+    messages: [],
+    model: { name: "test", provider: "scripted", optionsFingerprint: "model-v1" },
+    cwd: "/fixture",
+    projectFingerprint: "project-v1",
+    toolExecutions: [],
+    middlewareState: { todos: [] },
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function dependencies(saved: RunState) {
+  const resolved: string[] = [];
+  let definedWith: RunState | undefined;
+  return {
+    resolved,
+    definedWith: () => definedWith,
+    options: {
+      runId: saved.runId,
+      checkpointStore: {
+        load: async () => structuredClone(saved),
+        save: async () => undefined,
+        list: async () => [],
+      },
+      defineAgentFromState: async (value: RunState) => {
+        definedWith = structuredClone(value);
+        return { continueFromStep: async () => undefined } as never;
+      },
+      resolveUnknownTool: async (record: ToolExecutionRecord) => {
+        resolved.push(record.toolUseId);
+        return record.idempotency === "safe" ? "retry" : "ask_user";
+      },
+    },
+  };
+}
+
+describe("resumeRun", () => {
+  test("rejects a completed run before constructing an Agent", async () => {
+    const fixture = dependencies(state({ status: "completed" }));
+    await expect(resumeRun(fixture.options)).rejects.toThrow("already completed");
+    expect(fixture.definedWith()).toBeUndefined();
+  });
+
+  test("does not revisit succeeded tools and resolves crash-time running tools", async () => {
+    const fixture = dependencies(state({
+      toolExecutions: [tool("succeeded", "write"), tool("running", "read"), tool("running", "write")],
+    }));
+    await resumeRun(fixture.options);
+
+    expect(fixture.resolved).toEqual(["call-running-read", "call-running-write"]);
+    expect(fixture.definedWith()?.toolExecutions[0]?.status).toBe("succeeded");
+  });
+
+  test("reports every fingerprint mismatch together", async () => {
+    const fixture = dependencies(state());
+    await expect(resumeRun({
+      ...fixture.options,
+      expected: {
+        cwd: "/other",
+        projectFingerprint: "project-v2",
+        modelOptionsFingerprint: "model-v2",
+      },
+    })).rejects.toThrow(/cwd.*projectFingerprint.*modelOptionsFingerprint/s);
+  });
+});
+```
+
+目标文件：`src/runtime/replay/__tests__/replay.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { replayTrace } from "../replay";
+
+function event(sequence: number, text: string) {
+  return {
+    schemaVersion: 1,
+    runId: "run-1",
+    sequence,
+    timestamp: `2026-01-01T00:00:00.00${sequence}Z`,
+    type: "message_appended",
+    payload: {
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    },
+  } as never;
+}
+
+describe("replayTrace", () => {
+  test("replays in sequence order without mutating the input", async () => {
+    const source = [event(2, "second"), event(1, "first")];
+    const original = structuredClone(source);
+    const seen: number[] = [];
+
+    await replayTrace({
+      events: source,
+      noDelay: true,
+      onEvent: (item) => void seen.push(item.sequence),
+    });
+
+    expect(seen).toEqual([1, 2]);
+    expect(source).toEqual(original);
+  });
+
+  test("stops promptly when aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(replayTrace({
+      events: [event(1, "first")],
+      onEvent: () => undefined,
+      signal: controller.signal,
+    })).rejects.toBeDefined();
+  });
+});
+```
+
+示例故障演练还应手工覆盖 model 后/Tool 前、read/write Tool 中途和并发批次崩溃；上面
+三个完整文件固定了最容易被实现错误破坏的自动化不变量：原子保存、unknown 分类、成功
+动作不重访、完成态拒绝和 replay 只读。
 
 ### 验收
 
@@ -441,6 +1056,20 @@ export interface FaultInjector {
 
 ## 阶段 13：Context Budget、Compaction 与可靠性策略
 
+创建文件：
+
+```bash
+mkdir -p src/runtime/context/__tests__ src/runtime/reliability/__tests__ src/runtime/policy/__tests__
+touch src/runtime/context/token-estimator.ts src/runtime/context/message-groups.ts
+touch src/runtime/context/context-manager.ts src/runtime/context/index.ts
+touch src/runtime/context/__tests__/context-manager.test.ts
+touch src/runtime/reliability/resilient-model-provider.ts src/runtime/reliability/tool-timeout.ts
+touch src/runtime/reliability/__tests__/resilient-model-provider.test.ts
+touch src/runtime/reliability/__tests__/tool-timeout.test.ts
+touch src/runtime/policy/policy-engine.ts src/runtime/policy/__tests__/policy-engine.test.ts
+touch examples/stage-13-context.ts examples/stage-13-retry.ts
+```
+
 ### 13.1 Canonical transcript 与 Model view
 
 恢复需要完整 canonical transcript，但模型不应永远接收全量历史。保持两个概念：
@@ -453,6 +1082,8 @@ ModelContext.messages  = 本次调用的预算内视图
 Context manager 只在 `beforeModel` 阶段生成 view，不原地删除 canonical messages。
 
 ### 13.2 TokenEstimator 与预算
+
+目标文件：`src/runtime/context/token-estimator.ts`
 
 ```ts
 export interface TokenEstimator {
@@ -501,6 +1132,8 @@ export interface MessageGroup {
 
 写一个 validator：
 
+目标文件：`src/runtime/context/message-groups.ts`
+
 ```ts
 export function validateToolCallPairs(messages: NonSystemMessage[]): {
   ok: boolean;
@@ -512,6 +1145,8 @@ export function validateToolCallPairs(messages: NonSystemMessage[]): {
 每次 compaction 后都执行。
 
 ### 13.4 ContextManager
+
+目标文件：`src/runtime/context/context-manager.ts`
 
 ```ts
 export interface PreparedContext {
@@ -530,6 +1165,11 @@ export interface ConversationSummarizer {
 }
 
 export class ContextManager {
+  constructor(options: {
+    estimator: TokenEstimator;
+    summarizer: ConversationSummarizer;
+  }) {}
+
   async prepare(options: {
     messages: NonSystemMessage[];
     prompt: string;
@@ -537,13 +1177,15 @@ export class ContextManager {
     budget: ContextBudget;
     signal?: AbortSignal;
   }): Promise<PreparedContext> {
-    // TODO:
-    // 1. 计算固定成本
-    // 2. 从最新 group 向前保留
-    // 3. 对较旧 groups 生成 summary
-    // 4. summary + recent groups 仍超限时按 group 删除
-    // 5. 校验 tool call pairs
-    // 6. 返回 stats，不修改原数组
+    // 标准实现示例：复制输入，后续任何 compaction 都只操作副本。
+    const canonicalMessages = structuredClone(options.messages);
+
+    // TODO 1：计算 system prompt、Tool schema 和三项 budget 的固定成本。
+    // TODO 2：先 group，再从最新 group 向前保留；不得逐 message 拆 tool exchange。
+    // TODO 3：只把较旧 groups 交给 summarizer，并用明确 summary 边界包装。
+    // TODO 4：仍超限时按最旧 group 删除；最新 user message 不得删除。
+    // TODO 5：validateToolCallPairs；失败属于 runtime invariant error。
+    // TODO 6：返回新 messages、完整 stats，并确认 options.messages 深度不变。
   }
 }
 ```
@@ -562,20 +1204,125 @@ Summary 使用明确边界：
 
 Summary 不应伪装成新的用户指令。保留最新用户消息、尚未解决的约束和最近 Tool exchange 原文。
 
-### 13.5 Compaction 测试
+### 13.5 完整 Context 测试
 
-- 输入未超预算时 messages 引用或内容不变；
-- 超预算时 prepared tokens 在预算内；
-- canonical transcript 未改变；
-- 最近用户消息始终保留；
-- Tool call/result 永不孤立；
-- 多 Tool 单 assistant message 作为同一原子组；
-- summarizer 失败时有 deterministic fallback；
-- summary 自身超预算时安全截断；
-- abort summarizer 后 run 正确结束；
-- trace 记录 compression stats。
+目标文件：`src/runtime/context/__tests__/context-manager.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { NonSystemMessage } from "@/foundation/messages";
+
+import { ContextManager } from "../context-manager";
+import { validateToolCallPairs } from "../message-groups";
+
+const estimator = {
+  estimateText: (text: string) => text.length,
+  estimateMessages: (messages: unknown[]) => JSON.stringify(messages).length,
+  estimateTools: (tools: unknown[]) => JSON.stringify(tools).length,
+};
+const budget = {
+  maxInputTokens: 260,
+  reservedOutputTokens: 20,
+  safetyMarginTokens: 20,
+};
+
+function transcript(): NonSystemMessage[] {
+  return [
+    { role: "user", content: [{ type: "text", text: "old request ".repeat(8) }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+        { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        { type: "tool_result", tool_use_id: "a", content: "A" },
+        { type: "tool_result", tool_use_id: "b", content: "B" },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "latest constraint" }] },
+  ];
+}
+
+describe("ContextManager", () => {
+  test("returns equivalent content without mutating input when already in budget", async () => {
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: "small" }] },
+    ];
+    const source = structuredClone(messages);
+    const manager = new ContextManager({
+      estimator,
+      summarizer: { summarize: async () => "unused" },
+    });
+
+    const prepared = await manager.prepare({ messages, prompt: "p", tools: [], budget });
+    expect(prepared.messages).toEqual(source);
+    expect(messages).toEqual(source);
+    expect(prepared.stats.summarizedGroups).toBe(0);
+  });
+
+  test("compacts atomic tool exchanges and keeps the latest user constraint", async () => {
+    const messages = transcript();
+    const source = structuredClone(messages);
+    const manager = new ContextManager({
+      estimator,
+      summarizer: { summarize: async () => "older work summarized" },
+    });
+
+    const prepared = await manager.prepare({ messages, prompt: "p", tools: [], budget });
+    expect(prepared.stats.preparedTokens).toBeLessThanOrEqual(220);
+    expect(JSON.stringify(prepared.messages)).toContain("latest constraint");
+    expect(validateToolCallPairs(prepared.messages)).toEqual({
+      ok: true,
+      orphanToolUseIds: [],
+      orphanToolResultIds: [],
+    });
+    expect(messages).toEqual(source);
+  });
+
+  test("uses deterministic fallback when summarization fails", async () => {
+    const manager = new ContextManager({
+      estimator,
+      summarizer: { summarize: async () => { throw new Error("summary failed"); } },
+    });
+
+    const first = await manager.prepare({ messages: transcript(), prompt: "p", tools: [], budget });
+    const second = await manager.prepare({ messages: transcript(), prompt: "p", tools: [], budget });
+    expect(first).toEqual(second);
+    expect(first.stats.preparedTokens).toBeLessThanOrEqual(220);
+  });
+
+  test("propagates abort while the summarizer is running", async () => {
+    const controller = new AbortController();
+    const manager = new ContextManager({
+      estimator,
+      summarizer: {
+        summarize: async (_groups, signal) => {
+          controller.abort();
+          signal?.throwIfAborted();
+          return "unreachable";
+        },
+      },
+    });
+
+    await expect(manager.prepare({
+      messages: transcript(), prompt: "p", tools: [], budget, signal: controller.signal,
+    })).rejects.toBeDefined();
+  });
+});
+```
+
+示例输入是 `transcript()`；参数规则中的有效消息预算为 `260 - 20 - 20 = 220`，还要再
+扣除 prompt 和 Tool schema 固定成本。示例断言不依赖某个 provider tokenizer，只依赖注入
+的 deterministic estimator。
 
 ### 13.6 Model retry
+
+目标文件：`src/runtime/reliability/resilient-model-provider.ts`
 
 实现 `ResilientModelProvider` decorator：
 
@@ -586,6 +1333,17 @@ export interface RetryPolicy {
   maxDelayMs: number;
   classify(error: unknown): "transient" | "permanent" | "aborted";
 }
+```
+
+构造契约固定为：
+
+```ts
+new ResilientModelProvider({
+  provider,
+  policy,
+  sleeper: (delayMs, signal) => Promise<void>,
+  jitter: () => number,
+});
 ```
 
 只对 transient error 自动 retry，例如 rate limit、部分 5xx 和瞬时 network error。以下情况不 retry：
@@ -620,9 +1378,26 @@ interface ToolRuntimeMetadata {
 - timeout 后如果无法确认副作用是否发生，状态为 `unknown`；
 - timeout 和 abort 不能都归类为普通 execution failure。
 
+目标文件：`src/runtime/reliability/tool-timeout.ts`
+
+```ts
+export async function invokeToolWithTimeout<T>(options: {
+  invoke: (signal: AbortSignal) => Promise<T>;
+  metadata: ToolRuntimeMetadata;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}): Promise<
+  | { status: "succeeded"; value: T }
+  | { status: "aborted"; error: unknown }
+  | { status: "timed_out" | "unknown"; error: unknown }
+>;
+```
+
 ### 13.8 PolicyEngine
 
 把阶段 10 的 Tool-name allowlist 升级为：
+
+目标文件：`src/runtime/policy/policy-engine.ts`
 
 ```ts
 export type PolicyDecision =
@@ -651,6 +1426,197 @@ export interface PolicyEngine {
 
 不要尝试用几条正则“证明任意 shell command 安全”。复杂 shell 的静态分析不可靠；无法分类时请求审批。
 
+### 13.9 完整可靠性与 Policy 测试
+
+目标文件：`src/runtime/reliability/__tests__/resilient-model-provider.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { AssistantMessage } from "@/foundation/messages";
+
+import { ResilientModelProvider } from "../resilient-model-provider";
+
+const FINAL: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "done" }],
+};
+const params = { model: "test", messages: [] };
+
+function provider(failures: unknown[]) {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    invoke: async () => {
+      const failure = failures[calls++];
+      if (failure) throw failure;
+      return FINAL;
+    },
+    stream: async function* () {
+      const failure = failures[calls++];
+      if (failure) throw failure;
+      yield FINAL;
+    },
+  };
+}
+
+const policy = {
+  maxAttempts: 3,
+  baseDelayMs: 10,
+  maxDelayMs: 100,
+  classify: (error: unknown) => {
+    if (error instanceof DOMException && error.name === "AbortError") return "aborted" as const;
+    return error instanceof Error && error.message === "transient"
+      ? "transient" as const
+      : "permanent" as const;
+  },
+};
+
+describe("ResilientModelProvider", () => {
+  test("retries only transient errors with deterministic backoff", async () => {
+    const inner = provider([new Error("transient"), new Error("transient")]);
+    const delays: number[] = [];
+    const resilient = new ResilientModelProvider({
+      provider: inner,
+      policy,
+      sleeper: async (delayMs) => void delays.push(delayMs),
+      jitter: () => 0,
+    });
+
+    expect(await resilient.invoke(params)).toEqual(FINAL);
+    expect(inner.calls()).toBe(3);
+    expect(delays).toEqual([10, 20]);
+  });
+
+  test("does not retry permanent errors", async () => {
+    const inner = provider([new Error("permanent")]);
+    const resilient = new ResilientModelProvider({
+      provider: inner,
+      policy,
+      sleeper: async () => undefined,
+      jitter: () => 0,
+    });
+
+    await expect(resilient.invoke(params)).rejects.toThrow("permanent");
+    expect(inner.calls()).toBe(1);
+  });
+
+  test("aborts during backoff without starting another attempt", async () => {
+    const inner = provider([new Error("transient")]);
+    const controller = new AbortController();
+    const resilient = new ResilientModelProvider({
+      provider: inner,
+      policy,
+      sleeper: async (_delayMs, signal) => {
+        controller.abort();
+        signal?.throwIfAborted();
+      },
+      jitter: () => 0,
+    });
+
+    await expect(resilient.invoke({ ...params, signal: controller.signal })).rejects.toBeDefined();
+    expect(inner.calls()).toBe(1);
+  });
+});
+```
+
+目标文件：`src/runtime/policy/__tests__/policy-engine.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { DefaultPolicyEngine } from "../policy-engine";
+
+const workspace = "/workspace/project";
+const engine = new DefaultPolicyEngine({
+  workspace,
+  commandPrefixRules: [["bun", "test"], ["git", "status"]],
+});
+
+function input(name: string, toolInput: Record<string, unknown>, effect: string) {
+  return {
+    cwd: workspace,
+    toolUse: { type: "tool_use", id: "call-1", name, input: toolInput },
+    metadata: { effect, idempotency: effect === "read" ? "safe" : "unknown", defaultTimeoutMs: 1000 },
+  } as never;
+}
+
+describe("DefaultPolicyEngine", () => {
+  test("allows workspace-local reads", async () => {
+    expect(await engine.evaluate(input("read_file", { path: "src/a.ts" }, "read")))
+      .toMatchObject({ action: "allow" });
+  });
+
+  test("denies paths outside the workspace", async () => {
+    expect(await engine.evaluate(input("read_file", { path: "../secret" }, "read")))
+      .toMatchObject({ action: "deny" });
+  });
+
+  test("allows an exact command prefix and asks for unclassified shell", async () => {
+    expect(await engine.evaluate(input("bash", { command: "bun test src/a.test.ts" }, "process")))
+      .toMatchObject({ action: "allow" });
+    expect(await engine.evaluate(input("bash", { command: "curl https://example.test" }, "network")))
+      .toMatchObject({ action: "ask" });
+  });
+
+  test("returns a non-empty reason for every decision", async () => {
+    const decision = await engine.evaluate(input("write_file", { path: "a.ts" }, "write"));
+    expect(decision.reason.length).toBeGreaterThan(0);
+  });
+});
+```
+
+目标文件：`src/runtime/reliability/__tests__/tool-timeout.test.ts`
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { invokeToolWithTimeout } from "../tool-timeout";
+
+function metadata(effect: "read" | "write" | "process" | "network") {
+  return {
+    effect,
+    idempotency: effect === "read" ? "safe" as const : "unknown" as const,
+    defaultTimeoutMs: 5,
+  };
+}
+
+describe("invokeToolWithTimeout", () => {
+  test("returns a successful value", async () => {
+    expect(await invokeToolWithTimeout({
+      invoke: async () => "ok",
+      metadata: metadata("read"),
+    })).toEqual({ status: "succeeded", value: "ok" });
+  });
+
+  test("distinguishes a safe read timeout from an unknown write effect", async () => {
+    const never = (signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+
+    expect(await invokeToolWithTimeout({ invoke: never, metadata: metadata("read") }))
+      .toMatchObject({ status: "timed_out" });
+    expect(await invokeToolWithTimeout({ invoke: never, metadata: metadata("write") }))
+      .toMatchObject({ status: "unknown" });
+  });
+
+  test("keeps a caller abort distinct from timeout", async () => {
+    const controller = new AbortController();
+    controller.abort(new DOMException("user abort", "AbortError"));
+    expect(await invokeToolWithTimeout({
+      invoke: async (signal) => {
+        signal.throwIfAborted();
+        return "unreachable";
+      },
+      metadata: metadata("process"),
+      signal: controller.signal,
+    })).toMatchObject({ status: "aborted" });
+  });
+});
+```
+
+Model retry 与 Tool timeout 使用不同测试文件，避免混淆网络请求重试和外部副作用恢复。
+
 ### 运行与观察
 
 准备一个 30+ messages 的长 session fixture：
@@ -659,7 +1625,7 @@ export interface PolicyEngine {
 bun run examples/stage-13-context.ts
 ```
 
-输出：
+示例输出（数值取决于 fixture 与 estimator）：
 
 ```text
 original: 42 messages, estimated 18,420 tokens
