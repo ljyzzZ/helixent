@@ -102,21 +102,32 @@ export function parseOpenAIAssistantMessage(
 
 目标文件：`src/community/anthropic/utils.ts`
 
-Anthropic adapter 至少拆成；每个声明都必须补成带函数体的纯函数：
+Anthropic adapter 的 public 函数名和签名同样由教程固定。下面先给出可编译的空函数体；
+读者只替换临时 `throw`，不要把这些函数改名：
 
 ```ts
-export function extractSystemPrompt(messages: Message[]): string | undefined;
-export function convertToAnthropicMessages(messages: Message[]): Anthropic.MessageParam[];
-export function convertToAnthropicTools(tools: Tool[]): Anthropic.Tool[];
-export function parseAnthropicAssistantMessage(message: Anthropic.Message): AssistantMessage;
+export function extractSystemPrompt(messages: Message[]): string | undefined {
+  // TODO 1：只收集 system text，并用两个换行连接；没有 system 时返回 undefined。
+  // 参数规则：不得修改 messages，也不得把非 system 内容混入 prompt。
+  throw new Error("TODO: implement extractSystemPrompt");
+}
+
+export function convertToAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
+  // TODO 2：排除 system message，并把 Tool result 转成 user-role content。
+  // 参数规则：保持原始消息及 content block 顺序，不修改 canonical messages。
+  throw new Error("TODO: implement convertToAnthropicMessages");
+}
+
+export function convertToAnthropicTools(tools: Tool[]): Anthropic.Tool[] {
+  // TODO 3：使用 input_schema，不要复用 OpenAI wire type。
+  throw new Error("TODO: implement convertToAnthropicTools");
+}
+
+export function parseAnthropicAssistantMessage(message: Anthropic.Message): AssistantMessage {
+  // TODO 4：解析 text、thinking、tool_use，并原样保存 Tool id 和 provider usage。
+  throw new Error("TODO: implement parseAnthropicAssistantMessage");
+}
 ```
-
-实现提示：
-
-- TODO 1：`extractSystemPrompt` 只收集 system text，并用两个换行连接；没有 system 时返回 `undefined`；
-- TODO 2：`convertToAnthropicMessages` 排除 system，并把 tool result 放入 user role content；
-- TODO 3：Tool schema 使用 `input_schema`，不要复用 OpenAI wire type；
-- TODO 4：解析 `text`、`thinking`、`tool_use` 三种 block，并原样保存 Tool id。
 
 这些函数必须是纯函数。先用固定 fixture 测完，再调用 SDK。
 
@@ -330,12 +341,24 @@ thinking、缺少 usage 和 malformed arguments。Malformed arguments 在最终�
 
 ### 7.4 StreamAccumulator
 
-目标文件：两个 provider 各自的 `stream-accumulator.ts`
+目标文件：`src/community/openai/stream-accumulator.ts`
 
 定义 provider-local accumulator。文本 delta 分支是标准实现示例；thinking、Tool fragment
 和 usage 分别保留为独立 TODO，不能共享可变字符串。
 
 ```ts
+export interface ProviderChunk {
+  textDelta?: string;
+  thinkingDelta?: string;
+  toolCall?: {
+    index: number;
+    id?: string;
+    name?: string;
+    argumentsDelta?: string;
+  };
+  usage?: TokenUsage;
+}
+
 export class StreamAccumulator {
   private _text = "";
   private _thinking = "";
@@ -359,6 +382,36 @@ export class StreamAccumulator {
   snapshot(): AssistantMessage {
     // TODO 4：按稳定顺序构造完整 content 数组；argumentsText 不完整时暂用 {}。
     // TODO 5：返回新对象和新数组，调用方修改 snapshot 不能污染 accumulator。
+  }
+}
+```
+
+目标文件：`src/community/anthropic/stream-accumulator.ts`
+
+Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
+event type 泄漏到 Agent：
+
+```ts
+export type ProviderChunk =
+  | { type: "text_delta"; index: number; text: string }
+  | { type: "thinking_delta"; index: number; thinking: string }
+  | { type: "tool_start"; index: number; id: string; name: string }
+  | { type: "input_json_delta"; index: number; partialJson: string }
+  | { type: "message_start"; inputTokens: number }
+  | { type: "message_end"; outputTokens: number };
+
+export class StreamAccumulator {
+  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态。
+  // TODO 2：分别保存 input/output usage，message_end 后产生完整 TokenUsage。
+
+  push(chunk: ProviderChunk): void {
+    // TODO 3：按 chunk.type 分派；同一 index 的 partialJson 只能追加到同一 Tool。
+    throw new Error("TODO: implement Anthropic StreamAccumulator.push");
+  }
+
+  snapshot(): AssistantMessage {
+    // TODO 4：按 index 排序输出新 content 数组；不完整 Tool input 暂时使用 {}。
+    throw new Error("TODO: implement Anthropic StreamAccumulator.snapshot");
   }
 }
 ```
@@ -632,6 +685,23 @@ touch src/coding/tools/index.ts examples/stage-08-coding-tools.ts
 这个循环只创建空文件，不覆盖内容。所有 Tool 的公开行为集中在一个完整 contract test，
 路径安全单独测试；迭代时可用 `bun test -t "read_file"` 只运行相关用例。
 
+每个 Tool factory 的 export 名称固定如下；文件内部实现可以拆 helper，但不要改动这些
+composition root 会引用的名称：
+
+| 文件 | 固定 public export |
+|---|---|
+| `file-info.ts` | `defineFileInfoTool` |
+| `list-files.ts` | `defineListFilesTool` |
+| `glob-search.ts` | `defineGlobSearchTool` |
+| `grep-search.ts` | `defineGrepSearchTool` |
+| `read-file.ts` | `defineReadFileTool` |
+| `mkdir.ts` | `defineMkdirTool` |
+| `write-file.ts` | `defineWriteFileTool` |
+| `str-replace.ts` | `defineStrReplaceTool` |
+| `apply-patch.ts` | `defineApplyPatchTool` |
+| `move-path.ts` | `defineMovePathTool` |
+| `bash.ts` | `defineBashTool` |
+
 ### 8.1 Workspace boundary
 
 创建 `src/coding/tools/tool-utils.ts`：
@@ -750,6 +820,28 @@ ABORTED
 不要把 command 插入另一层未转义的 shell string。若契约接收完整 shell command，应明确这是 intentional shell execution，并把原始 command 展示在审批界面。
 
 ### 8.5 完整测试
+
+目标文件：`src/coding/tools/index.ts`
+
+测试和 Coding Agent composition root 都只依赖一个固定入口，避免各自猜测 Tool 的导出名：
+
+```ts
+export interface DefineCodingToolsOptions {
+  cwd: string;
+  bashTimeoutMs?: number;
+  maxOutputCharacters?: number;
+}
+
+export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
+  // TODO：构造并返回阶段 8 的全部 Tool；每个 filesystem Tool 共享 options.cwd。
+  // 提示：只读 Tool 放前、修改型 Tool 放后，并保持数组顺序稳定供测试与 UI 使用。
+  // bashTimeoutMs/maxOutputCharacters 只传给需要它们的 Tool，不能接受模型侧覆盖。
+  throw new Error("TODO: implement defineCodingTools");
+}
+```
+
+`DefineCodingToolsOptions`、`defineCodingTools` 和 `Tool[]` 返回类型是后续阶段的固定公共
+契约；读者可以自行拆分内部 factory，但不能改变这个 composition 入口。
 
 目标文件：`src/coding/tools/__tests__/tool-utils.test.ts`
 
@@ -1022,12 +1114,20 @@ export interface SkillDescriptor {
 export async function discoverSkills(options: {
   directories: string[];
   maxFrontmatterCharacters?: number;
-}): Promise<{ skills: SkillDescriptor[]; warnings: string[] }>;
+}): Promise<{ skills: SkillDescriptor[]; warnings: string[] }> {
+  // TODO 1：遍历每个目录的一层子目录，只读取 SKILL.md frontmatter。
+  // TODO 2：按 realpath 去重；malformed 文件写入 warnings，不中止其他目录。
+  throw new Error("TODO: implement discoverSkills");
+}
 
 export async function readSkill(options: {
   descriptor: SkillDescriptor;
   maxCharacters?: number;
-}): Promise<{ content: string; truncated: boolean }>;
+}): Promise<{ content: string; truncated: boolean }> {
+  // TODO 3：只读取 descriptor.path，应用字符上限，并准确返回 truncated。
+  // 提示：不得按 name 重新搜索，否则同名不同 path 会加载错误内容。
+  throw new Error("TODO: implement readSkill");
+}
 ```
 
 必须测试：
@@ -1051,6 +1151,47 @@ Todo 由一个 Tool 和一个 Middleware 组成：
 
 这是一项很好的 Middleware 练习：状态属于 Todo system，通用 Agent 只负责调用 hooks。
 
+目标文件：`src/agent/todos/todo-system.ts`
+
+先固定测试、Middleware 和 TUI 共同使用的数据名称；方法体保留给读者：
+
+```ts
+export type TodoStatus = "pending" | "in_progress" | "completed";
+
+export interface TodoItem {
+  id: string;
+  text: string;
+  status: TodoStatus;
+}
+
+export interface TodoWriteInput {
+  merge: boolean;
+  items: TodoItem[];
+}
+
+export class TodoSystem {
+  constructor(options: { reminderAfterSteps: number }) {
+    // TODO 1：保存 reminderAfterSteps，并初始化私有 Todo store/lastUpdatedStep。
+  }
+
+  write(input: TodoWriteInput): void {
+    // TODO 2：merge=false 全量替换；merge=true 按 id 更新或追加。
+    // TODO 3：提交前校验最多一个 in_progress，失败时不能部分修改 store。
+    throw new Error("TODO: implement TodoSystem.write");
+  }
+
+  snapshot(): TodoItem[] {
+    // TODO 4：返回深度独立的数组，调用方不得修改内部状态。
+    throw new Error("TODO: implement TodoSystem.snapshot");
+  }
+
+  reminderForStep(step: number): string | undefined {
+    // TODO 5：达到 reminderAfterSteps 且仍有未完成项时返回 reminder，否则 undefined。
+    throw new Error("TODO: implement TodoSystem.reminderForStep");
+  }
+}
+```
+
 ### 9.5 Ask user Tool
 
 Tool call 不只用于机器 API。定义 `ask_user_question`，把需要人类补充的信息表示为可等待的 Tool：
@@ -1060,6 +1201,14 @@ export type AskUserQuestionHandler = (params: {
   question: string;
   choices?: string[];
 }) => Promise<{ answer: string }>;
+
+export function defineAskUserQuestionTool(options: {
+  handler: AskUserQuestionHandler;
+}): FunctionTool {
+  // TODO：定义 wire name="ask_user_question" 的 Tool，并把 question/choices 交给 handler。
+  // 提示：先检查 signal；handler 的 answer 原样返回，异常由 Tool runtime 统一规范化。
+  throw new Error("TODO: implement defineAskUserQuestionTool");
+}
 ```
 
 测试 handler 被并发 Tool 调度调用时不会丢失 call id。
@@ -1372,6 +1521,36 @@ models:
       temperature: 0
 ```
 
+在读取 YAML 之前先固定解析后的内部类型和两个 public 函数；测试不会自行发明命名：
+
+```ts
+export type ModelProviderName = "openai" | "anthropic";
+
+export interface ModelConfig {
+  provider: ModelProviderName;
+  model: string;
+  baseURL?: string;
+  apiKeyEnv: string;
+  options?: Record<string, unknown>;
+}
+
+export interface HarnessConfig {
+  defaultModel: string;
+  models: Record<string, ModelConfig>;
+}
+
+export function parseHarnessConfig(input: unknown): HarnessConfig {
+  // TODO 1：用 Zod 校验完整 shape，并把 issue path 保留在错误信息中。
+  // TODO 2：校验 defaultModel 是 models 的真实 key；不要在这里读取环境变量值。
+  throw new Error("TODO: implement parseHarnessConfig");
+}
+
+export function resolveDefaultModel(config: HarnessConfig): ModelConfig {
+  // TODO 3：返回 config.models[config.defaultModel]；缺失时抛出包含名称的配置错误。
+  throw new Error("TODO: implement resolveDefaultModel");
+}
+```
+
 原则：
 
 - 配置只保存环境变量名，不保存 secret value；
@@ -1395,7 +1574,7 @@ harness-lab config model set-default <name>
 先实现状态，再做视觉：
 
 ```ts
-interface AgentLoopViewState {
+export interface AgentLoopViewState {
   messages: NonSystemMessage[];
   streaming: boolean;
   tokenUsage: {
@@ -1404,6 +1583,42 @@ interface AgentLoopViewState {
   };
   pendingApproval?: ApprovalRequest;
   todos: TodoItem[];
+}
+
+export interface SlashCommand {
+  name: "clear" | "help" | "exit";
+  args: string[];
+}
+
+export type AgentLoopEvent =
+  | AgentEvent
+  | { type: "run_start" }
+  | { type: "run_end"; status?: "completed" | "failed" | "aborted" }
+  | { type: "approval_requested"; request: ApprovalRequest };
+
+export function initialAgentLoopViewState(): AgentLoopViewState {
+  // 标准实现示例：每次返回新对象，测试之间不共享数组引用。
+  return {
+    messages: [],
+    streaming: false,
+    tokenUsage: { latestInputTokens: 0, sessionTotalTokens: 0 },
+    todos: [],
+  };
+}
+
+export function parseSlashCommand(input: string): SlashCommand | undefined {
+  // TODO 1：非 slash input 返回 undefined；只接受 clear/help/exit。
+  // TODO 2：按空白拆分 args；未知 slash command 抛出包含原名称的错误。
+  throw new Error("TODO: implement parseSlashCommand");
+}
+
+export function reduceAgentEvent(
+  state: AgentLoopViewState,
+  event: AgentLoopEvent,
+): AgentLoopViewState {
+  // TODO 3：以 immutable reducer 更新 messages/streaming/approval/tokenUsage/todos。
+  // 提示：run_end（包括 aborted）必须复位 streaming，不能修改传入 state。
+  throw new Error("TODO: implement reduceAgentEvent");
 }
 ```
 
@@ -1451,6 +1666,30 @@ export type ApprovalDecision =
   | "allow_once"
   | "allow_always_project"
   | "deny";
+
+export interface ApprovalRequest {
+  id: string;
+  toolName: string;
+  toolUse: ToolUseContent;
+}
+
+export interface ApprovalPersistence {
+  has(projectId: string, toolName: string): Promise<boolean>;
+  add(projectId: string, toolName: string): Promise<void>;
+}
+
+export function defineApprovalMiddleware(options: {
+  projectId: string;
+  maxQueueLength: number;
+  requestDecision(request: ApprovalRequest): Promise<ApprovalDecision>;
+  persistence?: ApprovalPersistence;
+  onWarning?: (message: string) => void;
+}): AgentMiddleware {
+  // TODO 1：构造有限长 FIFO queue；同一时间最多展示一个 request。
+  // TODO 2：实现只读直通、project allowlist、deny skip 和 fail-closed overflow。
+  // TODO 3：持久化失败调用 onWarning，但不撤销本次已批准动作。
+  throw new Error("TODO: implement defineApprovalMiddleware");
+}
 ```
 
 `beforeToolUse` 行为：

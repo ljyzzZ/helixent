@@ -29,9 +29,7 @@ touch src/cli/index.ts src/cli/__tests__/index.test.ts
 
 `bun init` 生成的根目录 `index.ts` 是临时示例入口。本教程统一使用
 `src/cli/index.ts`，因此删除它，并同时删除 `package.json` 中指向它的
-`"module": "index.ts"`。如果 `bun init` 将 TypeScript 放在
-`peerDependencies`，请将它移动到 `devDependencies`；练习项目只在开发时使用编译器，
-不要求下游使用者提供 TypeScript。
+`"module": "index.ts"`。
 
 将 `tsconfig.json` 调整为：
 
@@ -72,6 +70,11 @@ touch src/cli/index.ts src/cli/__tests__/index.test.ts
   }
 }
 ```
+
+
+同时，在 `package.json` 中，如果 `bun init` 将 TypeScript 放在
+`peerDependencies`，请将它移动到 `devDependencies`；练习项目只在开发时使用编译器，
+不要求下游使用者提供 TypeScript。
 
 完成后确认 `typescript` 和 `@types/bun` 都位于 `devDependencies`，并且不存在
 指向已删除入口的 `"module": "index.ts"`。依赖版本由前面的 `bun add` 命令写入，
@@ -147,7 +150,7 @@ Agent 不是“反复拼字符串”。它维护一个有角色、有内容类�
 
 ### 1.1 文件结构
 
-在练习仓库根目录执行：
+在项目仓库根目录执行：
 
 ```bash
 mkdir -p src/foundation/messages/types src/foundation/messages/__tests__ examples
@@ -179,7 +182,8 @@ src/foundation/messages/
 目标文件：`src/foundation/messages/types/content.ts`
 
 下面先完整实现 `SystemMessageContent` 作为标准示例。它只允许文本，原因是本课程把
-system prompt 视为纯文本运行时配置；剩余三个 union 请根据各自注释完成。
+system prompt 视为纯文本运行时配置。其余三个 public type 名称已经固定；`never[]` 是
+临时空实现，请根据各自注释替换数组元素类型，不要重命名这些 type。
 
 ```ts
 export interface TextContent {
@@ -218,14 +222,15 @@ export type SystemMessageContent = TextContent[];
 
 // TODO 1：用户可以发送文本或图片。
 // 提示：写成由 TextContent 和 ImageURLContent 组成的数组元素 union。
-export type UserMessageContent = TODO;
+export type UserMessageContent = never[];
 
 // TODO 2：assistant 可以输出文本、thinking 或发起 Tool call。
 // 提示：不要加入 ToolResultContent；Tool result 只属于 role="tool"。
-export type AssistantMessageContent = TODO;
+export type AssistantMessageContent = never[];
 
 // TODO 3：Tool message 只承载 ToolResultContent 数组。
-export type ToolMessageContent = TODO;
+// 提示：直接把 never 替换为 ToolResultContent。
+export type ToolMessageContent = never[];
 
 // formatter 等跨角色工具使用的穷尽 union；这里给出完整实现。
 export type MessageContent =
@@ -239,7 +244,8 @@ export type MessageContent =
 目标文件：`src/foundation/messages/types/message.ts`
 
 `UserMessage` 是本文件的标准实现示例。注意 `role` 必须是 string literal，不能放宽为
-`string`；其余 TODO 分别对应 assistant、tool 和两个顶层 union。
+`string`。`AssistantMessage` 和 `ToolMessage` 的固定类型名及空 interface 已经给出，读者
+只填写字段；两个顶层 union 使用 `never` 暂时占位。
 
 ```ts
 import type {
@@ -266,17 +272,29 @@ export interface UserMessage {
   content: UserMessageContent;
 }
 
-// TODO 1：定义 role="assistant"，content 使用 AssistantMessageContent；
-// 再增加可选 usage?: TokenUsage，供 provider 回传 token 统计。
+export interface AssistantMessage {
+  // TODO 1：添加 role 字段，类型必须是 string literal "assistant"。
+  // TODO 2：添加 content 字段，类型使用 AssistantMessageContent。
+  // TODO 3：添加可选 usage 字段，类型使用 TokenUsage，供 provider 回传统计。
+}
 
-// TODO 2：定义 role="tool"，content 使用 ToolMessageContent。
+export interface ToolMessage {
+  // TODO 4：添加 role 字段，类型必须是 string literal "tool"。
+  // TODO 5：添加 content 字段，类型使用 ToolMessageContent。
+}
 
-// TODO 3：这里只包含 user、assistant、tool，不包含 system。
-export type NonSystemMessage = TODO;
+// TODO 6：用 UserMessage、AssistantMessage、ToolMessage 的 union 替换 never；
+// 这里只表示“一条非 system 消息”，不要在 union 外再加 []。
+export type NonSystemMessage = never;
 
-// TODO 4：Message 是 SystemMessage 与 NonSystemMessage 的 union。
-export type Message = TODO;
+// TODO 7：用 SystemMessage 与 NonSystemMessage 的 union 替换 never；
+// Message 同样表示单条消息，Message[] 才表示 transcript。
+export type Message = never;
 ```
+
+这里刻意不让读者自行命名 `AssistantMessage` 或 `ToolMessage`。后续 formatter、Model、
+Agent 和测试都从 barrel import 这些 canonical 名称；练习目标是填写协议字段和 union，
+不是重新设计公共 API。
 
 目标文件：`src/foundation/messages/types/index.ts`
 
@@ -829,14 +847,26 @@ export type StructuredToolResult<T = unknown> =
       details?: Record<string, unknown>;
     };
 
-// TODO 1：实现 okToolResult(summary, data?)。
-// 提示：data 为 undefined 时可以省略字段，但 ok 必须是 literal true。
+export function okToolResult<T>(summary: string, data?: T): StructuredToolResult<T> {
+  // TODO 1：返回 ok: true、summary 和可选 data。
+  // 提示：data 为 undefined 时可以省略字段，但 ok 必须保持 literal true。
+  throw new Error("TODO: implement okToolResult");
+}
 
-// TODO 2：实现 errorToolResult(summary, error, code?, details?)。
-// 提示：这是预期业务失败，不要在 factory 中 throw。
+export function errorToolResult(
+  summary: string,
+  error: string,
+  code?: string,
+  details?: Record<string, unknown>,
+): StructuredToolResult<never> {
+  // TODO 2：返回 ok: false、summary、error，以及存在时的 code/details。
+  // 提示：这是预期业务失败，不要在最终实现中 throw。
+  throw new Error("TODO: implement errorToolResult");
+}
 ```
 
-再实现 `okToolResult()` 和 `errorToolResult()` factory。
+两个 factory 的 public 名称、参数顺序和返回类型已经固定；读者只替换函数体中的临时
+`throw`，后续 Tool 和测试不需要猜测 factory 命名。
 
 完成 Tool 类型后，回到以下两个文件加入 `tools?: Tool[]`：
 

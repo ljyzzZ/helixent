@@ -164,6 +164,25 @@ Middleware 很适合扩展普通生命周期，但 tracing 还需要观察：
 
 ### 11.4 JSONL TraceStore
 
+目标文件：`src/runtime/trace/redactor.ts`
+
+```ts
+export interface TraceRedactor {
+  redact<T>(value: T): T;
+}
+
+export function createTraceRedactor(options: {
+  maxStringCharacters: number;
+  secretKeys?: string[];
+}): TraceRedactor {
+  // TODO 1：递归复制 object/array，匹配 secret key 时替换值，不修改输入。
+  // TODO 2：超过 maxStringCharacters 的字符串截断，并追加明确的 truncated marker。
+  throw new Error("TODO: implement createTraceRedactor");
+}
+```
+
+`TraceRedactor` 和 `createTraceRedactor` 是 TraceStore 与测试共享的固定 public 契约。
+
 目标文件：`src/runtime/trace/jsonl-trace-store.ts`
 
 ```ts
@@ -677,6 +696,42 @@ export interface CheckpointStore {
   load(runId: string): Promise<RunState>;
   list(): Promise<RunStateSummary[]>;
 }
+
+export interface RunStateSummary {
+  runId: string;
+  status: RunState["status"];
+  phase: RunState["phase"];
+  nextStep: number;
+  updatedAt: string;
+}
+```
+
+目标文件：`src/runtime/checkpoint/file-checkpoint-store.ts`
+
+```ts
+export class FileCheckpointStore implements CheckpointStore {
+  constructor(options: {
+    rootDir: string;
+    faultInjector?: FaultInjector;
+  }) {
+    // TODO 1：保存 rootDir/faultInjector；构造阶段不访问文件系统。
+  }
+
+  async save(state: RunState): Promise<void> {
+    // TODO 2：校验 → 同目录临时文件 → flush/close → rename；同一 run 串行写入。
+    throw new Error("TODO: implement FileCheckpointStore.save");
+  }
+
+  async load(runId: string): Promise<RunState> {
+    // TODO 3：读取并校验 schema；错误包含 runId，不返回半个 checkpoint。
+    throw new Error("TODO: implement FileCheckpointStore.load");
+  }
+
+  async list(): Promise<RunStateSummary[]> {
+    // TODO 4：只返回 summary，按 updatedAt 稳定排序；跳过临时文件。
+    throw new Error("TODO: implement FileCheckpointStore.list");
+  }
+}
 ```
 
 本地文件实现必须原子保存：
@@ -717,6 +772,12 @@ Tool 执行按以下协议：
 目标文件：`src/runtime/checkpoint/resume-run.ts`
 
 ```ts
+export type UnknownToolResolution = "retry" | "skip" | "ask_user";
+
+export type UnknownToolResolver = (
+  record: ToolExecutionRecord,
+) => Promise<UnknownToolResolution>;
+
 export async function resumeRun(options: {
   runId: string;
   checkpointStore: CheckpointStore;
@@ -1333,17 +1394,30 @@ export interface RetryPolicy {
   maxDelayMs: number;
   classify(error: unknown): "transient" | "permanent" | "aborted";
 }
-```
 
-构造契约固定为：
+export type RetrySleeper = (delayMs: number, signal?: AbortSignal) => Promise<void>;
 
-```ts
-new ResilientModelProvider({
-  provider,
-  policy,
-  sleeper: (delayMs, signal) => Promise<void>,
-  jitter: () => number,
-});
+export class ResilientModelProvider implements ModelProvider {
+  constructor(options: {
+    provider: ModelProvider;
+    policy: RetryPolicy;
+    sleeper: RetrySleeper;
+    jitter: () => number;
+  }) {
+    // TODO 1：保存依赖；构造阶段不调用 provider，也不启动 timer。
+  }
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    // TODO 2：按 policy 调用 provider.invoke；只重试 transient error。
+    // TODO 3：每次等待使用 sleeper，并把 params.signal 原样传入。
+    throw new Error("TODO: implement ResilientModelProvider.invoke");
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    // TODO 4：只在收到第一个 snapshot 前允许 retry；开始产出后不能静默重放响应。
+    throw new Error("TODO: implement ResilientModelProvider.stream");
+  }
+}
 ```
 
 只对 transient error 自动 retry，例如 rate limit、部分 5xx 和瞬时 network error。以下情况不 retry：
@@ -1366,7 +1440,7 @@ delay = min(maxDelay, baseDelay * 2^(attempt-1)) + jitter
 给 Tool metadata 增加：
 
 ```ts
-interface ToolRuntimeMetadata {
+export interface ToolRuntimeMetadata {
   effect: "read" | "write" | "process" | "network";
   idempotency: "safe" | "unsafe" | "unknown";
   defaultTimeoutMs: number;
@@ -1390,7 +1464,11 @@ export async function invokeToolWithTimeout<T>(options: {
   | { status: "succeeded"; value: T }
   | { status: "aborted"; error: unknown }
   | { status: "timed_out" | "unknown"; error: unknown }
->;
+> {
+  // TODO 1：组合 caller signal 与 timeout controller，并在 finally 清理 timer/listener。
+  // TODO 2：caller abort → aborted；safe read timeout → timed_out；其他 effect → unknown。
+  throw new Error("TODO: implement invokeToolWithTimeout");
+}
 ```
 
 ### 13.8 PolicyEngine
@@ -1411,6 +1489,26 @@ export interface PolicyEngine {
     toolUse: ToolUseContent;
     metadata: ToolRuntimeMetadata;
   }): Promise<PolicyDecision>;
+}
+
+export class DefaultPolicyEngine implements PolicyEngine {
+  constructor(options: {
+    workspace: string;
+    commandPrefixRules: string[][];
+  }) {
+    // TODO 1：保存规范化 workspace 和 prefix rules；不要执行 command。
+  }
+
+  async evaluate(input: {
+    cwd: string;
+    toolUse: ToolUseContent;
+    metadata: ToolRuntimeMetadata;
+  }): Promise<PolicyDecision> {
+    // TODO 2：workspace 外 path 返回 deny；明确只读操作可 allow。
+    // TODO 3：逐 token 匹配 command prefix；network/unknown shell 默认 ask。
+    // TODO 4：所有分支返回非空 reason，供 trace 和审批 UI 使用。
+    throw new Error("TODO: implement DefaultPolicyEngine.evaluate");
+  }
 }
 ```
 

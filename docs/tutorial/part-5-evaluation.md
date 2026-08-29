@@ -135,6 +135,50 @@ tasks:
 
 Runner 只把 `fixture/` 复制到 trial workspace，并把 Agent 的 `cwd` 限制在该目录。Grader 从 task root 运行，通过只读环境变量 `HARNESS_EVAL_WORKSPACE` 获取 trial workspace 路径；`graders/` 不复制进 Agent workspace，因此模型不能直接读取隐藏断言。
 
+目标文件：`src/eval/types.ts`
+
+```ts
+export interface EvalTask {
+  id: string;
+  version: number;
+  prompt: string;
+  fixturePath: string;
+  timeoutMs: number;
+  maxSteps: number;
+  allowedTools: string[];
+  grader: { command: string; timeoutMs: number };
+}
+
+export interface EvalSuite {
+  name: string;
+  version: number;
+  tasks: EvalTask[];
+}
+```
+
+目标文件：`src/eval/task-loader.ts`
+
+测试会直接构造 `TaskLoader`，因此类名、构造参数和方法签名必须先固定：
+
+```ts
+export class TaskLoader {
+  constructor(options: { evalRoot: string }) {
+    // TODO 1：保存 realpath 后的 evalRoot；构造阶段不加载任何 task。
+  }
+
+  async loadTask(taskDirectory: string): Promise<EvalTask> {
+    // TODO 2：读取 task.yaml/prompt.md 并校验 manifest；返回规范化绝对路径。
+    // TODO 3：拒绝 evalRoot 外路径，错误包含具体字段或路径。
+    throw new Error("TODO: implement TaskLoader.loadTask");
+  }
+
+  async loadSuite(suitePath: string): Promise<EvalSuite> {
+    // TODO 4：先校验 suite，再按声明顺序 loadTask；重复 task id 必须拒绝。
+    throw new Error("TODO: implement TaskLoader.loadSuite");
+  }
+}
+```
+
 ### 14.3 从小型任务集开始
 
 第一版准备 10 个任务，覆盖不同失败模式：
@@ -164,6 +208,8 @@ Runner 只把 `fixture/` 复制到 trial workspace，并把 Agent 的 `cwd` 限�
 6. 停止 Agent 后运行 grader；
 7. 保存 patch、trace、checkpoint、grader output；
 8. 删除临时 workspace，或失败时按配置保留以便调试。
+
+目标文件：`src/eval/types.ts`
 
 ```ts
 export interface EvalTrialResult {
@@ -196,10 +242,77 @@ LLM judge 适合评价解释质量或开放式结果，但会引入额外模型�
 
 ### 14.6 EvalRunner 骨架
 
+目标文件：`src/eval/types.ts`
+
+先固定 Runner、依赖 fake 和测试共同使用的名称。字段可以后续扩展，但不能在各实现中
+分别发明另一套 method name：
+
+```ts
+export type EvalConfig = Record<string, unknown>;
+
+export interface EvalWorkspace {
+  path: string;
+  initialFixtureHash: string;
+  cleanup(): Promise<void>;
+}
+
+export interface EvalTaskLoader {
+  loadSuite(suitePath: string): Promise<EvalSuite>;
+}
+
+export interface EvalWorkspaceFactory {
+  create(options: { task: EvalTask; trial: number }): Promise<EvalWorkspace>;
+}
+
+export interface EvalAgentFactory {
+  runTrial(options: {
+    task: EvalTask;
+    workspacePath: string;
+    config: EvalConfig;
+    index: number;
+    signal?: AbortSignal;
+  }): Promise<{ runId: string; metrics: RunMetrics }>;
+}
+
+export interface GraderRunner {
+  grade(options: {
+    task: EvalTask;
+    workspacePath: string;
+    signal?: AbortSignal;
+  }): Promise<{ passed: boolean; score: number; output: string }>;
+}
+
+export interface EvalArtifactStore {
+  saveTrial(artifact: unknown): Promise<{ patchPath: string; tracePath: string }>;
+}
+
+export interface EvalIdentityProvider {
+  create(options: { suite: EvalSuite; config: EvalConfig }): Promise<EvalRunIdentity>;
+}
+
+export interface EvalSuiteResult {
+  identity: EvalRunIdentity;
+  trials: EvalTrialResult[];
+  aggregate: {
+    validTrials: number;
+    infraErrors: number;
+    successRate: number;
+  };
+}
+```
+
 目标文件：`src/eval/eval-runner.ts`
 
 ```ts
 export class EvalRunner {
+  private readonly _taskLoader: EvalTaskLoader;
+  private readonly _workspaceFactory: EvalWorkspaceFactory;
+  private readonly _agentFactory: EvalAgentFactory;
+  private readonly _graderRunner: GraderRunner;
+  private readonly _artifactStore: EvalArtifactStore;
+  private readonly _identityProvider: EvalIdentityProvider;
+  private readonly _concurrency: number;
+
   constructor(options: {
     taskLoader: EvalTaskLoader;
     workspaceFactory: EvalWorkspaceFactory;
@@ -208,7 +321,19 @@ export class EvalRunner {
     artifactStore: EvalArtifactStore;
     identityProvider: EvalIdentityProvider;
     concurrency: number;
-  }) {}
+  }) {
+    // 标准实现示例：构造阶段只固定依赖，并立即拒绝非正整数 concurrency。
+    if (!Number.isInteger(options.concurrency) || options.concurrency < 1) {
+      throw new Error("EvalRunner concurrency must be a positive integer");
+    }
+    this._taskLoader = options.taskLoader;
+    this._workspaceFactory = options.workspaceFactory;
+    this._agentFactory = options.agentFactory;
+    this._graderRunner = options.graderRunner;
+    this._artifactStore = options.artifactStore;
+    this._identityProvider = options.identityProvider;
+    this._concurrency = options.concurrency;
+  }
 
   async runSuite(options: {
     suitePath: string;

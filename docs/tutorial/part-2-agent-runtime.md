@@ -53,6 +53,22 @@ export type AgentEvent =
 
 ### 4.2 Agent 骨架
 
+目标文件：`src/agent/errors.ts`
+
+后续测试会按名称 import `MaximumStepsError`，因此先固定完整 public error 契约：
+
+```ts
+export class MaximumStepsError extends Error {
+  readonly maxSteps: number;
+
+  constructor({ maxSteps }: { maxSteps: number }) {
+    super(`Agent exceeded maximum steps: ${maxSteps}`);
+    this.name = "MaximumStepsError";
+    this.maxSteps = maxSteps;
+  }
+}
+```
+
 目标文件：`src/agent/agent.ts`
 
 构造函数和 getter 是标准实现示例。getter 返回数组副本，防止调用方绕过 Agent
