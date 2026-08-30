@@ -578,7 +578,9 @@ export class Model {
   readonly provider: ModelProvider;
   readonly options?: Record<string, unknown>;
 
-  constructor(options: {
+  // 调用方仍传入一个 options object；这里在参数位置直接解构出三个属性。
+  // 冒号左侧是 JavaScript 解构，右侧是 TypeScript 参数类型。
+  constructor({ name, provider, modelOptions }: {
     name: string;
     provider: ModelProvider;
     modelOptions?: Record<string, unknown>;
