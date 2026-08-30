@@ -183,6 +183,16 @@ src/foundation/messages/
 
 目标文件：`src/foundation/messages/types/content.ts`
 
+阅读代码时先区分两种写法：
+
+- `interface TextContent { ... }` 声明“一条文本内容必须有哪些字段”；
+- `export type MessageContent = ...` 把多个已有类型组合成 union；
+- interface 内的 `type: "text"` 中，`type` 是实际对象的字段名，`"text"` 是该字段唯一
+  允许的值。这个字段会保留到 JavaScript 运行时，用于判断当前 content 的种类。
+
+普通对象既可以用 `interface` 也可以用 `type` 描述；本教程使用 `interface` 描述字段，
+使用 `type` 表达数组和 union。详细对比见[第零部分：TypeScript 必备基础](./part-0-typescript-basics.md)。
+
 下面先完整实现 `SystemMessageContent` 作为标准示例。它只允许文本，原因是本课程把
 system prompt 视为纯文本运行时配置。其余三个内容类型暂时使用 `never[]`，请根据各自
 注释替换数组元素类型。

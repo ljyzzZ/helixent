@@ -36,6 +36,9 @@ bunx tsc --noEmit --strict
 
 ### 1.2 一个基本的 `.ts` 文件如何构成
 
+先记住一个核心关系：`.ts` 文件中的 JavaScript 逻辑负责运行，额外写入的 TypeScript
+类型负责在运行前检查代码。下一节会用转译前后的代码详细对比两者。
+
 一个 `.ts` 文件通常从依赖声明开始，接着定义类型和可复用逻辑，最后按需提供程序入口。下面的顺序是便于阅读的常用组织方式，不是 TypeScript 强制规定的语法顺序。
 
 目标文件：`index.ts`（由前面的 `bun init -y` 创建）
@@ -44,7 +47,7 @@ bunx tsc --noEmit --strict
 // 1. import：引入其他 module 在运行时提供的值。
 import { basename } from "node:path";
 
-// 2. type/interface：描述数据形状，只参与类型检查。
+// 2. interface：为对象的字段结构命名，只参与类型检查。
 interface ProgramOptions {
   inputPath: string;
   uppercase?: boolean;
@@ -105,6 +108,11 @@ bunx tsc --noEmit --strict
 file: README.md
 ```
 
+这里的 `interface ProgramOptions` 可以理解为一张“参数填写规则”：它要求传给 `main()` 的
+对象必须包含 `inputPath`，并允许包含 `uppercase`。它不会创建对象，也不会在运行时执行。
+`type` 是另一种类型声明方式，二者的适用范围和 Message 示例中的具体区别会在 3.1 节
+展开。
+
 这份文件可以分成两类内容：
 
 - `interface ProgramOptions` 等类型声明帮助编译器检查代码，运行时会被移除；
@@ -113,9 +121,79 @@ file: README.md
 并非每个 `.ts` 文件都需要包含以上全部部分。例如纯类型文件可以只有 `interface` 和
 `type`，工具文件可以只导出函数，程序入口才需要 `main()` 与 `import.meta.main`。
 
+### 1.3 TypeScript 与 JavaScript 的关系
+
+JavaScript 是实际运行的语言，Bun、Node.js 和浏览器都是 JavaScript runtime。TypeScript
+则是在 JavaScript 语法之上增加类型标注和类型检查。可以把两者的关系理解为：
+
+```text
+TypeScript 源码（开发时）
+  = JavaScript 逻辑 + 类型信息
+                 │
+                 ├── tsc 检查类型
+                 │
+                 └── 移除类型语法
+                          │
+                          ▼
+                 JavaScript（运行时）
+                          │
+                          ▼
+                   Bun / Node.js / 浏览器
+```
+
+例如下面是 TypeScript：
+
+```ts
+function add(left: number, right: number): number {
+  return left + right;
+}
+
+console.log(add(2, 3));
+
+// 类型检查失败：第一个参数应该是 number。
+// add("2", 3);
+```
+
+其中的 `: number` 只提供给 TypeScript 检查。移除类型信息后，相当于运行下面的
+JavaScript：
+
+```js
+function add(left, right) {
+  return left + right;
+}
+
+console.log(add(2, 3));
+```
+
+JavaScript runtime 不知道 `left` 原本被标注为 `number`。如果跳过类型检查并真的传入
+字符串，JavaScript 会按照自己的规则执行：
+
+```js
+console.log(add("2", 3)); // "23"
+```
+
+因此，TypeScript 不会改变 JavaScript 的加法规则，也不会在运行时自动拦截错误参数；它
+是在代码运行之前发现“不符合预期的调用”。这也是为什么要同时区分：
+
+```bash
+# 快速转译并执行 .ts 文件，观察 JavaScript 运行结果
+bun run index.ts
+
+# 分析整个项目的类型关系，不执行代码
+bunx tsc --noEmit --strict
+```
+
+Bun 能直接接收 `.ts` 文件，是因为它会先移除 TypeScript 类型语法再执行代码。这一步
+追求快速运行，不等于对整个项目执行完整的 `tsc` 类型检查。
+
+类型也不能验证运行时才进入程序的外部数据。例如 HTTP response、JSON 文件和环境变量
+到达程序时只是 JavaScript value。即使你把变量标注为某个 interface，外部数据也不会
+自动变成合法对象；后续教程会使用 Zod 在运行时校验这些边界数据。
+
 ## 2. 变量、类型与类型推断
 
-JavaScript 决定代码如何运行，TypeScript 在它之上增加静态类型检查。类型只在开发和检查阶段存在，运行时不会保留 `string`、`interface` 或 generic 等声明。
+TypeScript 类型只在开发和检查阶段存在，运行时不会保留 `string`、`interface` 或
+generic 等声明。
 
 ### 2.1 基础类型
 
@@ -211,7 +289,10 @@ const usage: {
 };
 ```
 
-重复使用的对象结构通常定义为 `interface`：
+冒号右侧的 `{ promptTokens: number; completionTokens: number }` 是一个匿名 object type。
+它描述 `usage` 必须有哪些字段，但没有为这个结构命名。
+
+重复使用的对象结构可以定义为 `interface`：
 
 ```ts
 interface TokenUsage {
@@ -227,15 +308,109 @@ const usage: TokenUsage = {
 };
 ```
 
-`type` 既能描述对象，也能为 union、tuple 等任意类型起别名：
+`interface TokenUsage` 只声明对象应当具有什么形状，不会创建对象。真正存在于运行时的是
+后面的 `usage` value。下面用 `type` 可以表达相同的对象结构：
+
+```ts
+type TokenUsageAlias = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+};
+
+const anotherUsage: TokenUsageAlias = {
+  promptTokens: 4,
+  completionTokens: 6,
+  totalTokens: 10,
+};
+```
+
+对于这种普通对象，`interface` 和 `type` 都可以使用。二者的主要差异是 `type` 能为更广泛
+的类型表达式起别名，例如 union、tuple、数组或函数：
 
 ```ts
 type ModelProviderName = "openai" | "anthropic";
 type Coordinate = [number, number];
 type ProviderOptions = Record<string, unknown>;
+type MessageHandler = (message: string) => void;
 ```
 
-本教程通常使用 `interface` 描述对象形状，使用 `type` 定义 union 或组合类型。
+`interface` 则专门描述对象或 class 的结构，并且可以使用 `extends` 扩展另一个 interface：
+
+```ts
+interface Message {
+  id: string;
+}
+
+interface AssistantMessage extends Message {
+  role: "assistant";
+  content: string;
+}
+```
+
+同样的组合也可以使用 type intersection 表达：
+
+```ts
+type AssistantMessageAlias = Message & {
+  role: "assistant";
+  content: string;
+};
+```
+
+与本教程相关的差异可以归纳为：
+
+| 需求 | `interface` | `type` |
+|---|---|---|
+| 描述普通对象字段 | 可以 | 可以 |
+| 使用 `extends` 扩展对象结构 | 可以 | 使用 `&` 组合 |
+| 定义 string literal union | 不可以 | 可以 |
+| 定义多个对象组成的 union | 不可以 | 可以 |
+| 为数组、tuple 或函数类型起别名 | 不适合 | 可以 |
+| 被 class `implements` | 可以 | 对象类型也可以 |
+| 运行时是否存在 | 不存在 | 不存在 |
+
+因此，本教程采用一个便于阅读的约定：
+
+```ts
+// 一条数据对象需要哪些字段：使用 interface。
+interface TextContent {
+  type: "text";
+  text: string;
+}
+
+interface ImageURLContent {
+  type: "image_url";
+  url: string;
+}
+
+// 现有类型的数组、union 或其他组合：使用 type。
+type UserMessageContent = (TextContent | ImageURLContent)[];
+type MessageRole = "system" | "user" | "assistant" | "tool";
+```
+
+这里还有一个容易混淆的细节：
+
+```ts
+interface TextContent {
+  type: "text";
+}
+```
+
+- 第一行没有使用 `type` 关键字，而是用 `interface` 声明一个 TypeScript 类型；
+- 第二行的 `type` 是对象字段名，和 `id`、`name` 一样；
+- `"text"` 是这个字段允许的唯一值；
+- TypeScript 类型声明会在运行时消失，但实际对象中的 `type` 字段会保留。
+
+例如下面的对象在 JavaScript 运行时仍然拥有 `type`：
+
+```ts
+const content: TextContent = { type: "text" };
+console.log(content.type); // "text"
+```
+
+简单对象使用 `interface` 或 `type` 通常都能工作，选择不同不会改变运行结果。真正需要使用
+`type` 的地方，是 `UserMessageContent = (TextContent | ImageURLContent)[]` 这种 union，
+因为 `interface` 无法表示“二者之一”。
 
 ### 3.2 可选字段与只读字段
 
