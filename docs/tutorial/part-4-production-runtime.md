@@ -55,6 +55,9 @@ export interface TraceEvent<TType extends string, TPayload> {
 
 定义 discriminated union：
 
+<details>
+<summary>展开完整代码：<code>events.ts</code></summary>
+
 ```ts
 export type RuntimeTraceEvent =
   | TraceEvent<"run_start", {
@@ -113,6 +116,8 @@ export type RuntimeTraceEvent =
       compacted: boolean;
     }>;
 ```
+
+</details>
 
 可以后续新增事件，但不能修改旧事件含义。`schemaVersion` 为未来 migration 留出空间。
 
@@ -230,6 +235,9 @@ export class JsonlTraceStore implements TraceSink {
 
 目标文件：`src/runtime/trace/metrics.ts`
 
+<details>
+<summary>展开完整代码：<code>metrics.ts</code></summary>
+
 ```ts
 export interface RunMetrics {
   steps: number;
@@ -270,6 +278,8 @@ export function reduceRunMetrics(events: RuntimeTraceEvent[]): RunMetrics {
 }
 ```
 
+</details>
+
 注意并发 Tool 的 `toolTimeMs` 总和可能大于 `wallTimeMs`。前者是所有 Tool span 之和，后者是用户等待的墙钟时间，两者不能混用。
 
 ### 11.6 Trace CLI
@@ -300,6 +310,9 @@ TOTAL tokens=2032 model=1786ms tools=12ms approval=0ms
 
 下面的测试使用临时目录并直接读取 JSONL，因此同时验证持久化格式。`createTraceRedactor`
 必须返回纯 redactor，不修改传入事件。
+
+<details>
+<summary>展开完整代码：<code>jsonl-trace-store.test.ts</code></summary>
 
 ```ts
 import { afterEach, describe, expect, test } from "bun:test";
@@ -386,7 +399,12 @@ describe("JsonlTraceStore", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/runtime/trace/__tests__/metrics.test.ts`
+
+<details>
+<summary>展开完整代码：<code>metrics.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -460,7 +478,12 @@ describe("reduceRunMetrics", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/runtime/trace/__tests__/runtime-trace.test.ts`
+
+<details>
+<summary>展开完整代码：<code>runtime-trace.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -598,6 +621,8 @@ describe("Agent runtime trace", () => {
 });
 ```
 
+</details>
+
 ### 故障注入
 
 让 TraceSink 在第 N 次 append 时抛错，并明确你的策略：
@@ -648,6 +673,9 @@ touch src/runtime/replay/__tests__/replay.test.ts examples/stage-12-recovery.ts
 
 目标文件：`src/runtime/checkpoint/run-state.ts`
 
+<details>
+<summary>展开完整代码：<code>run-state.ts</code></summary>
+
 ```ts
 export interface RunState {
   schemaVersion: 1;
@@ -681,6 +709,8 @@ export interface ToolExecutionRecord {
   errorCode?: string;
 }
 ```
+
+</details>
 
 `middlewareState` 只保存显式声明可序列化的 state，例如 Todo。不要直接序列化函数、SDK client、AbortController 或整个 Middleware object。
 
@@ -877,6 +907,9 @@ export interface FaultInjector {
 在第 N 次 hit 抛出 `InjectedCrashError`。目标文件：
 `src/runtime/checkpoint/__tests__/file-checkpoint-store.test.ts`
 
+<details>
+<summary>展开完整代码：<code>file-checkpoint-store.test.ts</code></summary>
+
 ```ts
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -955,7 +988,12 @@ describe("FileCheckpointStore", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/runtime/checkpoint/__tests__/resume-run.test.ts`
+
+<details>
+<summary>展开完整代码：<code>resume-run.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1051,7 +1089,12 @@ describe("resumeRun", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/runtime/replay/__tests__/replay.test.ts`
+
+<details>
+<summary>展开完整代码：<code>replay.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1098,6 +1141,8 @@ describe("replayTrace", () => {
   });
 });
 ```
+
+</details>
 
 示例故障演练还应手工覆盖 model 后/Tool 前、read/write Tool 中途和并发批次崩溃；上面
 三个完整文件固定了最容易被实现错误破坏的自动化不变量：原子保存、unknown 分类、成功
@@ -1207,6 +1252,9 @@ export function validateToolCallPairs(messages: NonSystemMessage[]): {
 
 目标文件：`src/runtime/context/context-manager.ts`
 
+<details>
+<summary>展开完整代码：<code>context-manager.ts</code></summary>
+
 ```ts
 export interface PreparedContext {
   messages: NonSystemMessage[];
@@ -1249,6 +1297,8 @@ export class ContextManager {
 }
 ```
 
+</details>
+
 Summary 使用明确边界：
 
 ```text
@@ -1266,6 +1316,9 @@ Summary 不应伪装成新的用户指令。保留最新用户消息、尚未解
 ### 13.5 完整 Context 测试
 
 目标文件：`src/runtime/context/__tests__/context-manager.test.ts`
+
+<details>
+<summary>展开完整代码：<code>context-manager.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1375,6 +1428,8 @@ describe("ContextManager", () => {
 });
 ```
 
+</details>
+
 示例输入是 `transcript()`；参数规则中的有效消息预算为 `260 - 20 - 20 = 220`，还要再
 扣除 prompt 和 Tool schema 固定成本。示例断言不依赖某个 provider tokenizer，只依赖注入
 的 deterministic estimator。
@@ -1384,6 +1439,9 @@ describe("ContextManager", () => {
 目标文件：`src/runtime/reliability/resilient-model-provider.ts`
 
 实现 `ResilientModelProvider` decorator：
+
+<details>
+<summary>展开完整代码：<code>resilient-model-provider.ts</code></summary>
 
 ```ts
 export interface RetryPolicy {
@@ -1417,6 +1475,8 @@ export class ResilientModelProvider implements ModelProvider {
   }
 }
 ```
+
+</details>
 
 只对 transient error 自动 retry，例如 rate limit、部分 5xx 和瞬时 network error。以下情况不 retry：
 
@@ -1475,6 +1535,9 @@ export async function invokeToolWithTimeout<T>(options: {
 
 目标文件：`src/runtime/policy/policy-engine.ts`
 
+<details>
+<summary>展开完整代码：<code>policy-engine.ts</code></summary>
+
 ```ts
 export type PolicyDecision =
   | { action: "allow"; reason: string }
@@ -1510,6 +1573,8 @@ export class DefaultPolicyEngine implements PolicyEngine {
 }
 ```
 
+</details>
+
 至少考虑：
 
 - Tool effect；
@@ -1525,6 +1590,9 @@ export class DefaultPolicyEngine implements PolicyEngine {
 ### 13.9 完整可靠性与 Policy 测试
 
 目标文件：`src/runtime/reliability/__tests__/resilient-model-provider.test.ts`
+
+<details>
+<summary>展开完整代码：<code>resilient-model-provider.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1616,7 +1684,12 @@ describe("ResilientModelProvider", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/runtime/policy/__tests__/policy-engine.test.ts`
+
+<details>
+<summary>展开完整代码：<code>policy-engine.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1662,7 +1735,12 @@ describe("DefaultPolicyEngine", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/runtime/reliability/__tests__/tool-timeout.test.ts`
+
+<details>
+<summary>展开完整代码：<code>tool-timeout.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1710,6 +1788,8 @@ describe("invokeToolWithTimeout", () => {
   });
 });
 ```
+
+</details>
 
 Model retry 与 Tool timeout 使用不同测试文件，避免混淆网络请求重试和外部副作用恢复。
 

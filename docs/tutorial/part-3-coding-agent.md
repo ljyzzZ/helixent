@@ -67,6 +67,9 @@ src/community/
 OpenAI adapter 至少拆成以下函数。`convertToOpenAITools()` 是标准实现示例；其余 TODO
 按 content variant 分支完成，未知 variant 必须走 `assertNever`。
 
+<details>
+<summary>展开完整代码：<code>utils.ts</code></summary>
+
 ```ts
 export function convertToOpenAIMessages(
   messages: Message[],
@@ -99,6 +102,8 @@ export function parseOpenAIAssistantMessage(
   // TODO 6：usage 缺省时不要伪造 0，保持 AssistantMessage.usage 为 undefined。
 }
 ```
+
+</details>
 
 目标文件：`src/community/anthropic/utils.ts`
 
@@ -136,6 +141,9 @@ export function parseAnthropicAssistantMessage(message: Anthropic.Message): Assi
 
 下面是可直接复制的完整 OpenAI 转换测试。测试中的 `as never` 只把精简 fixture
 适配成 SDK 的庞大 wire type；生产代码不得借此跳过 canonical type 检查。
+
+<details>
+<summary>展开完整代码：<code>utils.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -244,7 +252,12 @@ describe("OpenAI protocol conversion", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/community/anthropic/__tests__/utils.test.ts`
+
+<details>
+<summary>展开完整代码：<code>utils.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -334,6 +347,8 @@ describe("Anthropic protocol conversion", () => {
 });
 ```
 
+</details>
+
 这两个文件已经覆盖 user/system/assistant、混合内容、多 Tool call、call id、空文本、
 thinking、缺少 usage 和 malformed arguments。Malformed arguments 在最终非流式响应中必须
 抛出带 call id 的诊断错误；流式 fragment 的规则由下一节的完整 accumulator 测试固定。
@@ -344,6 +359,9 @@ thinking、缺少 usage 和 malformed arguments。Malformed arguments 在最终�
 
 定义 provider-local accumulator。文本 delta 分支是标准实现示例；thinking、Tool fragment
 和 usage 分别保留为独立 TODO，不能共享可变字符串。
+
+<details>
+<summary>展开完整代码：<code>stream-accumulator.ts</code></summary>
 
 ```ts
 export interface ProviderChunk {
@@ -385,6 +403,8 @@ export class StreamAccumulator {
 }
 ```
 
+</details>
+
 目标文件：`src/community/anthropic/stream-accumulator.ts`
 
 Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
@@ -416,6 +436,9 @@ export class StreamAccumulator {
 ```
 
 目标文件：`src/community/openai/__tests__/stream-accumulator.test.ts`
+
+<details>
+<summary>展开完整代码：<code>stream-accumulator.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -470,7 +493,12 @@ describe("OpenAI StreamAccumulator", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/community/anthropic/__tests__/stream-accumulator.test.ts`
+
+<details>
+<summary>展开完整代码：<code>stream-accumulator.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -511,6 +539,8 @@ describe("Anthropic StreamAccumulator", () => {
   });
 });
 ```
+
+</details>
 
 这里的 chunk 是教程规定的 provider-local normalized chunk；参数规则是：`index` 在一次
 响应内稳定、`argumentsDelta`/`partialJson` 必须按同一 index 拼接、usage 只在 provider
@@ -560,6 +590,9 @@ return {
 
 目标文件：`src/community/openai/__tests__/model-provider.test.ts`
 
+<details>
+<summary>展开完整代码：<code>model-provider.test.ts</code></summary>
+
 ```ts
 import { describe, expect, test } from "bun:test";
 
@@ -608,6 +641,8 @@ describe("OpenAIModelProvider", () => {
   });
 });
 ```
+
+</details>
 
 SDK `create` 的第二个参数承载 `signal`；不要把 signal 混进 JSON request body。Anthropic
 provider 使用相同注入方式和断言结构，其 wire 转换差异已由 7.3 的完整测试固定。
@@ -842,6 +877,9 @@ export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
 
 每个 filesystem Tool 都依赖这里固定的 workspace boundary。下面是完整测试文件：
 
+<details>
+<summary>展开完整代码：<code>tool-utils.test.ts</code></summary>
+
 ```ts
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
@@ -889,10 +927,15 @@ describe("resolveWorkspacePath", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/coding/tools/__tests__/coding-tools.test.ts`
 
 `defineCodingTools({ cwd })` 在 `src/coding/tools/index.ts` 返回全部 Tool。测试通过 Tool 的
 公开 `invoke` 契约操作临时目录，因此不会修改课程仓库：
+
+<details>
+<summary>展开完整代码：<code>coding-tools.test.ts</code></summary>
 
 ```ts
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -993,6 +1036,8 @@ describe("bash", () => {
   });
 });
 ```
+
+</details>
 
 参数规则：所有 Tool input 的首字段都是 `description`；文件路径相对固定 `cwd`；
 `startLine/endLine` 为 1-based 且必须成对出现；bash timeout 来自 composition 配置而非模型。
@@ -1150,6 +1195,9 @@ Todo 由一个 Tool 和一个 Middleware 组成：
 
 定义 Todo 数据类型和状态管理类：
 
+<details>
+<summary>展开完整代码：<code>todo-system.ts</code></summary>
+
 ```ts
 export type TodoStatus = "pending" | "in_progress" | "completed";
 
@@ -1187,6 +1235,8 @@ export class TodoSystem {
 }
 ```
 
+</details>
+
 ### 9.5 Ask user Tool
 
 Tool call 不只用于机器 API。定义 `ask_user_question`，把需要人类补充的信息表示为可等待的 Tool：
@@ -1211,6 +1261,9 @@ export function defineAskUserQuestionTool(options: {
 ### 9.6 完整测试
 
 目标文件：`src/agent/skills/__tests__/skill-reader.test.ts`
+
+<details>
+<summary>展开完整代码：<code>skill-reader.test.ts</code></summary>
 
 ```ts
 import { afterEach, describe, expect, test } from "bun:test";
@@ -1274,7 +1327,12 @@ describe("Skill reader", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/agent/todos/__tests__/todo-system.test.ts`
+
+<details>
+<summary>展开完整代码：<code>todo-system.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1328,6 +1386,8 @@ describe("TodoSystem", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/coding/tools/__tests__/ask-user-question.test.ts`
 
 ```ts
@@ -1356,6 +1416,9 @@ describe("ask_user_question", () => {
 ```
 
 目标文件：`src/coding/agents/__tests__/coding-agent.test.ts`
+
+<details>
+<summary>展开完整代码：<code>coding-agent.test.ts</code></summary>
 
 ```ts
 import { afterEach, describe, expect, test } from "bun:test";
@@ -1434,6 +1497,8 @@ describe("defineCodingAgent", () => {
   });
 });
 ```
+
+</details>
 
 ### 运行与观察
 
@@ -1568,6 +1633,9 @@ harness-lab config model set-default <name>
 
 先实现状态，再做视觉：
 
+<details>
+<summary>展开完整代码：<code>state.ts</code></summary>
+
 ```ts
 export interface AgentLoopViewState {
   messages: NonSystemMessage[];
@@ -1616,6 +1684,8 @@ export function reduceAgentEvent(
   throw new Error("TODO: implement reduceAgentEvent");
 }
 ```
+
+</details>
 
 UI 通过消费 `AgentEvent` 更新状态。不要让 UI 读取 `Agent` 私有字段或重新调用模型。
 
@@ -1750,6 +1820,9 @@ UI 像素和颜色不用过度测试，固定配置、审批与状态转换即�
 
 目标文件：`src/cli/config/__tests__/schema.test.ts`
 
+<details>
+<summary>展开完整代码：<code>schema.test.ts</code></summary>
+
 ```ts
 import { describe, expect, test } from "bun:test";
 
@@ -1795,7 +1868,12 @@ describe("model config", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/cli/tui/__tests__/token-usage.test.ts`
+
+<details>
+<summary>展开完整代码：<code>token-usage.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1833,7 +1911,12 @@ describe("calculateTokenUsage", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/coding/permissions/__tests__/approval-middleware.test.ts`
+
+<details>
+<summary>展开完整代码：<code>approval-middleware.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1924,7 +2007,12 @@ describe("approval middleware", () => {
 });
 ```
 
+</details>
+
 目标文件：`src/cli/tui/__tests__/state.test.ts`
+
+<details>
+<summary>展开完整代码：<code>state.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1966,6 +2054,8 @@ describe("TUI state", () => {
   });
 });
 ```
+
+</details>
 
 ### 阶段后对照
 

@@ -246,6 +246,9 @@ LLM judge 适合评价解释质量或开放式结果，但会引入额外模型�
 
 定义 `EvalRunner` 依赖的接口：
 
+<details>
+<summary>展开完整代码：<code>types.ts</code></summary>
+
 ```ts
 export type EvalConfig = Record<string, unknown>;
 
@@ -300,7 +303,12 @@ export interface EvalSuiteResult {
 }
 ```
 
+</details>
+
 目标文件：`src/eval/eval-runner.ts`
+
+<details>
+<summary>展开完整代码：<code>eval-runner.ts</code></summary>
 
 ```ts
 export class EvalRunner {
@@ -352,6 +360,8 @@ export class EvalRunner {
   }
 }
 ```
+
+</details>
 
 并发数必须有上限，否则会同时打满 provider rate limit、CPU 和临时磁盘。Agent 内 Tool 并发与 eval task 并发是两个不同层级的并发控制。
 
@@ -475,6 +485,9 @@ avgWallTime            42.1s          40.8s           -3.1%
 
 目标文件：`src/eval/__tests__/task-loader.test.ts`
 
+<details>
+<summary>展开完整代码：<code>task-loader.test.ts</code></summary>
+
 ```ts
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -557,9 +570,14 @@ describe("TaskLoader", () => {
 });
 ```
 
+</details>
+
 为使调度测试可读，先完整复制测试专用 harness。
 
 目标文件：`src/eval/__tests__/test-harness.ts`
+
+<details>
+<summary>展开完整代码：<code>test-harness.ts</code></summary>
 
 ```ts
 interface HarnessOptions {
@@ -687,7 +705,12 @@ export function defineEvalTestHarness(options: HarnessOptions = {}) {
 }
 ```
 
+</details>
+
 目标文件：`src/eval/__tests__/eval-runner.test.ts`
+
+<details>
+<summary>展开完整代码：<code>eval-runner.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -784,6 +807,8 @@ describe("EvalRunner", () => {
   });
 });
 ```
+
+</details>
 
 这些测试固定了 schema、path boundary、干净 workspace、timeout、错误分类、并发上限、
 abort、artifact、identity 和 aggregate；没有需要读者填写的测试 TODO。

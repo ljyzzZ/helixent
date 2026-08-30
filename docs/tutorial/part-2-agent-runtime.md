@@ -74,6 +74,9 @@ export class MaximumStepsError extends Error {
 构造函数和 getter 是标准实现示例。getter 返回数组副本，防止调用方绕过 Agent
 直接篡改 transcript；核心 loop 留给读者按分项提示完成。
 
+<details>
+<summary>展开完整代码：<code>agent.ts</code></summary>
+
 ```ts
 export class Agent {
   private readonly _context: AgentContext;
@@ -123,6 +126,8 @@ export class Agent {
   }
 }
 ```
+
+</details>
 
 ### 4.3 Tool result 序列化策略
 
@@ -194,6 +199,9 @@ bun run examples/stage-04-react-loop.ts
 ### 4.5 完整测试
 
 目标文件：`src/agent/__tests__/agent.test.ts`
+
+<details>
+<summary>展开完整代码：<code>agent.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -296,6 +304,8 @@ describe("Agent", () => {
   });
 });
 ```
+
+</details>
 
 未知 Tool 和普通 Tool failure 应反馈给模型，让模型有机会修正。只有 runtime invariant 被破坏、用户中止或达到上限时，Agent run 才整体失败。
 
@@ -471,6 +481,9 @@ bun run examples/stage-05-abort.ts
 ### 5.4 完整测试
 
 目标文件：`src/agent/__tests__/agent-streaming.test.ts`
+
+<details>
+<summary>展开完整代码：<code>agent-streaming.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -674,6 +687,8 @@ describe("Agent streaming runtime", () => {
 });
 ```
 
+</details>
+
 时间测试不要断言精确毫秒。用足够大的快慢差并设置宽松上限，减少 CI 抖动。
 
 ### 阶段后对照
@@ -710,6 +725,9 @@ touch src/agent/__tests__/middleware.test.ts examples/stage-06-middleware.ts
 目标文件：`src/agent/agent-middleware.ts`
 
 定义以下 hooks：
+
+<details>
+<summary>展开完整代码：<code>agent-middleware.ts</code></summary>
 
 ```ts
 export interface AgentMiddleware {
@@ -757,6 +775,8 @@ export interface AgentMiddleware {
   }): Promise<Partial<AgentContext> | void>;
 }
 ```
+
+</details>
 
 ### 6.2 两种 Context 不要混淆
 
@@ -870,6 +890,9 @@ afterAgentRun
 ### 6.5 完整测试
 
 目标文件：`src/agent/__tests__/middleware.test.ts`
+
+<details>
+<summary>展开完整代码：<code>middleware.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1044,6 +1067,8 @@ describe("Agent middleware", () => {
   });
 });
 ```
+
+</details>
 
 这里固定的标准语义是：Tool throw 先被规范化，再调用 `afterToolUse`；`afterAgentRun`
 在外层 `finally` 中调用一次。若你选择不同语义，必须同时修改说明和完整测试。

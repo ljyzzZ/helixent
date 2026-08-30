@@ -43,6 +43,9 @@ bunx tsc --noEmit --strict
 
 目标文件：`index.ts`（由前面的 `bun init -y` 创建）
 
+<details>
+<summary>展开完整代码：<code>index.ts</code></summary>
+
 ```ts
 // 1. import：引入其他 module 在运行时提供的值。
 import { basename } from "node:path";
@@ -91,6 +94,8 @@ if (import.meta.main) {
   await main();
 }
 ```
+
+</details>
 
 运行并检查：
 
@@ -1091,6 +1096,9 @@ type Role = (typeof roles)[number];
 
 将 `index.ts` 替换为以下完整内容：
 
+<details>
+<summary>展开完整代码：<code>index.ts</code></summary>
+
 ```ts
 interface TextContent {
   type: "text";
@@ -1167,6 +1175,8 @@ if (import.meta.main) {
   await main();
 }
 ```
+
+</details>
 
 运行并检查：
 

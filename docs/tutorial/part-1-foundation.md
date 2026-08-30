@@ -197,6 +197,9 @@ src/foundation/messages/
 system prompt 视为纯文本运行时配置。其余三个内容类型暂时使用 `never[]`，请根据各自
 注释替换数组元素类型。
 
+<details>
+<summary>展开完整代码：<code>content.ts</code></summary>
+
 ```ts
 export interface TextContent {
   type: "text";
@@ -253,11 +256,16 @@ export type MessageContent =
   | ToolResultContent;
 ```
 
+</details>
+
 目标文件：`src/foundation/messages/types/message.ts`
 
 `UserMessage` 是本文件的标准实现示例。注意 `role` 必须是 string literal，不能放宽为
 `string`。请根据注释填写 `AssistantMessage` 和 `ToolMessage` 的字段，并替换两个顶层
 union 中的 `never` 占位。
+
+<details>
+<summary>展开完整代码：<code>message.ts</code></summary>
 
 ```ts
 import type {
@@ -304,6 +312,8 @@ export type NonSystemMessage = never;
 export type Message = never;
 ```
 
+</details>
+
 目标文件：`src/foundation/messages/types/index.ts`
 
 ```ts
@@ -335,6 +345,9 @@ interface Message {
 
 先实现 `text` 分支作为标准示例。其余分支的注释给出了固定输出协议；完成后
 `assertNever(content)` 必须可以通过类型检查。
+
+<details>
+<summary>展开完整代码：<code>transcript.ts</code></summary>
 
 ```ts
 import type { Message, MessageContent } from "./types";
@@ -370,6 +383,8 @@ export function formatTranscript(messages: Message[]): string {
   // 不要排序，也不要丢弃空 content 数组对应的 message。
 }
 ```
+
+</details>
 
 示例输入（目标文件：`examples/stage-01-transcript.ts`）：
 
@@ -411,6 +426,9 @@ assistant: 北京今天晴，26°C。
 测试文件由教程完整提供，读者不需要补测试 TODO。
 
 目标文件：`src/foundation/messages/__tests__/transcript.test.ts`
+
+<details>
+<summary>展开完整代码：<code>transcript.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -471,6 +489,8 @@ describe("formatTranscript", () => {
   });
 });
 ```
+
+</details>
 
 ### 运行与观察
 
@@ -567,6 +587,9 @@ export interface ModelProvider {
 
 构造函数是标准实现示例；三个剩余 TODO 分别对应一次调用、流式调用和 system prompt 注入。
 
+<details>
+<summary>展开完整代码：<code>model.ts</code></summary>
+
 ```ts
 import type { Message } from "@/foundation/messages";
 
@@ -616,6 +639,8 @@ export class Model {
 }
 ```
 
+</details>
+
 这里使用单一 options object 构造函数。即使参考版本存在 positional constructor，也不要为逐字一致牺牲可扩展性。
 
 ### 2.2 离线 ScriptedModelProvider
@@ -624,6 +649,9 @@ export class Model {
 
 `invoke()` 给出标准实现示例。它规定了 abort、响应耗尽和 cursor 推进的语义；
 `stream()` 由读者根据分项提示实现。
+
+<details>
+<summary>展开完整代码：<code>scripted-model-provider.ts</code></summary>
 
 ```ts
 import type { AssistantMessage } from "@/foundation/messages";
@@ -665,6 +693,8 @@ export class ScriptedModelProvider implements ModelProvider {
 }
 ```
 
+</details>
+
 例如完整文本为 `hello`，累计快照应类似：
 
 ```text
@@ -698,6 +728,9 @@ hello
 
 下面是完整测试文件。它使用两个独立 scripted provider 比较 `invoke` 与 `stream`，
 避免 cursor 状态互相影响。
+
+<details>
+<summary>展开完整代码：<code>model.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -781,12 +814,17 @@ describe("Model", () => {
 });
 ```
 
+</details>
+
 ### 2.4 离线流式示例
 
 目标文件：`examples/stage-02-model-stream.ts`
 
 下面的示例通过 `Model.stream()` 消费累计快照。循环只读取 canonical
 `AssistantMessage`，不接触 `ScriptedModelProvider` 的内部状态。
+
+<details>
+<summary>展开完整代码：<code>stage-02-model-stream.ts</code></summary>
 
 ```ts
 import type { AssistantMessage } from "@/foundation/messages";
@@ -820,6 +858,8 @@ if (!finalMessage) {
 
 console.log(JSON.stringify(finalMessage, null, 2));
 ```
+
+</details>
 
 ### 运行测试与观察
 
@@ -952,6 +992,9 @@ export function errorToolResult(
 
 目标文件：`src/foundation/tools/tool-registry.ts`
 
+<details>
+<summary>展开完整代码：<code>tool-registry.ts</code></summary>
+
 ```ts
 export type ToolExecutionResult =
   | { ok: true; toolName: string; value: unknown }
@@ -989,6 +1032,8 @@ export class ToolRegistry {
 }
 ```
 
+</details>
+
 本课程在 runtime 增加本地 Zod validation。这比完全信任模型生成的 input 更安全，也是你与参考实现可以明确说明的一项有意差异。
 
 ### 3.3 第一个 Tool
@@ -1024,6 +1069,9 @@ export const addTool = defineTool({
 ### 3.4 完整测试
 
 目标文件：`src/foundation/tools/__tests__/tool-registry.test.ts`
+
+<details>
+<summary>展开完整代码：<code>tool-registry.test.ts</code></summary>
 
 ```ts
 import { describe, expect, test } from "bun:test";
@@ -1130,6 +1178,8 @@ describe("ToolRegistry", () => {
   });
 });
 ```
+
+</details>
 
 ### 运行与观察
 
