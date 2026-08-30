@@ -813,6 +813,12 @@ describe("EvalRunner", () => {
 这些测试固定了 schema、path boundary、干净 workspace、timeout、错误分类、并发上限、
 abort、artifact、identity 和 aggregate；没有需要读者填写的测试 TODO。
 
+最后执行本阶段的完整测试：
+
+```bash
+bun test src/eval
+```
+
 ### 验收
 
 - [ ] 10 个高质量任务；

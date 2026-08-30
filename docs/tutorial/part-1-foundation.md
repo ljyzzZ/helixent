@@ -421,6 +421,14 @@ tool.tool_result[call-1]: 晴，26°C
 assistant: 北京今天晴，26°C。
 ```
 
+### 运行与观察
+
+```bash
+bun run examples/stage-01-transcript.ts
+```
+
+把 formatter 输出保留下来。阶段 11 的 trace viewer 会复用同一套 canonical type，而不是重新解析 provider response。
+
 ### 1.4 完整测试
 
 测试文件由教程完整提供，读者不需要补测试 TODO。
@@ -492,17 +500,11 @@ describe("formatTranscript", () => {
 
 </details>
 
-### 运行与观察
+最后执行本阶段的完整测试：
 
 ```bash
-# 执行示例程序，在终端观察格式化后的 transcript
-bun run examples/stage-01-transcript.ts
-
-# 运行自动化测试，验证 formatter 的输出
 bun test src/foundation/messages
 ```
-
-把 formatter 输出保留下来。阶段 11 的 trace viewer 会复用同一套 canonical type，而不是重新解析 provider response。
 
 ### 阶段后对照
 
@@ -723,7 +725,60 @@ hello
 > 这里没有真实网络流，因此 `ScriptedModelProvider` 的 `async *stream()` 方法会主动拆分
 > 完整 response 的文本块来模拟这一过程。
 
-### 2.3 完整测试
+### 2.3 离线流式示例
+
+目标文件：`examples/stage-02-model-stream.ts`
+
+下面的示例通过 `Model.stream()` 消费累计快照。循环只读取 canonical
+`AssistantMessage`，不接触 `ScriptedModelProvider` 的内部状态。
+
+<details>
+<summary>展开完整代码：<code>stage-02-model-stream.ts</code></summary>
+
+```ts
+import type { AssistantMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+
+const response: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "hello" }],
+};
+
+const provider = new ScriptedModelProvider({ responses: [response] });
+const model = new Model({ name: "scripted", provider });
+let finalMessage: AssistantMessage | undefined;
+
+for await (const snapshot of model.stream({ prompt: "", messages: [] })) {
+  const text = snapshot.content
+    .map((item) => (item.type === "text" ? item.text : ""))
+    .join("");
+
+  process.stdout.write(`\r${text}`);
+  finalMessage = snapshot;
+  await Bun.sleep(50);
+}
+
+process.stdout.write("\n");
+
+if (!finalMessage) {
+  throw new Error("Model stream did not yield a response");
+}
+
+console.log(JSON.stringify(finalMessage, null, 2));
+```
+
+</details>
+
+### 运行与观察
+
+```bash
+bun run examples/stage-02-model-stream.ts
+```
+
+示例每 50ms 覆盖打印当前累计文本，并在结束时打印 canonical `AssistantMessage` JSON。观察 UI 只依赖 canonical snapshot，不依赖 fake provider 的内部表示。
+
+### 2.4 完整测试
 
 目标文件：`src/foundation/models/__tests__/model.test.ts`
 
@@ -839,62 +894,11 @@ describe("Model", () => {
 
 </details>
 
-### 2.4 离线流式示例
-
-目标文件：`examples/stage-02-model-stream.ts`
-
-下面的示例通过 `Model.stream()` 消费累计快照。循环只读取 canonical
-`AssistantMessage`，不接触 `ScriptedModelProvider` 的内部状态。
-
-<details>
-<summary>展开完整代码：<code>stage-02-model-stream.ts</code></summary>
-
-```ts
-import type { AssistantMessage } from "@/foundation/messages";
-import { Model } from "@/foundation/models/model";
-import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
-
-const response: AssistantMessage = {
-  role: "assistant",
-  content: [{ type: "text", text: "hello" }],
-};
-
-const provider = new ScriptedModelProvider({ responses: [response] });
-const model = new Model({ name: "scripted", provider });
-let finalMessage: AssistantMessage | undefined;
-
-for await (const snapshot of model.stream({ prompt: "", messages: [] })) {
-  const text = snapshot.content
-    .map((item) => (item.type === "text" ? item.text : ""))
-    .join("");
-
-  process.stdout.write(`\r${text}`);
-  finalMessage = snapshot;
-  await Bun.sleep(50);
-}
-
-process.stdout.write("\n");
-
-if (!finalMessage) {
-  throw new Error("Model stream did not yield a response");
-}
-
-console.log(JSON.stringify(finalMessage, null, 2));
-```
-
-</details>
-
-### 运行测试与观察
+最后执行本阶段的完整测试：
 
 ```bash
-# 先验证 Model 与 ScriptedModelProvider 的行为
 bun test src/foundation/models/__tests__/model.test.ts
-
-# 再观察累计流式快照
-bun run examples/stage-02-model-stream.ts
 ```
-
-示例每 50ms 覆盖打印当前累计文本，并在结束时打印 canonical `AssistantMessage` JSON。观察 UI 只依赖 canonical snapshot，不依赖 fake provider 的内部表示。
 
 ### 阶段后对照
 
@@ -1089,7 +1093,70 @@ export const addTool = defineTool({
 
 `description` 是模型解释这次调用意图的字段，不是 Tool 自身的 description。它能改善审批 UI 和 trace 可读性。
 
-### 3.4 完整测试
+### 3.4 Tool playground
+
+目标文件：`examples/stage-03-tool-playground.ts`
+
+这个 CLI 把命令行中的 Tool name 和 JSON input 交给 `ToolRegistry`。JSON 解析错误同样
+输出 structured error，不打印 stack trace。
+
+<details>
+<summary>展开完整代码：<code>stage-03-tool-playground.ts</code></summary>
+
+```ts
+import { addTool } from "@/foundation/tools/add-tool";
+import { ToolRegistry } from "@/foundation/tools/tool-registry";
+
+function print(value: unknown): void {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+async function main(): Promise<void> {
+  const [toolName, rawInput] = Bun.argv.slice(2);
+
+  if (!toolName || !rawInput) {
+    print({
+      ok: false,
+      code: "INVALID_ARGUMENTS",
+      error: "Usage: bun run examples/stage-03-tool-playground.ts <tool> <json-input>",
+    });
+    process.exitCode = 1;
+    return;
+  }
+
+  let input: unknown;
+  try {
+    input = JSON.parse(rawInput);
+  } catch (error) {
+    print({
+      ok: false,
+      toolName,
+      code: "INVALID_JSON_INPUT",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    process.exitCode = 1;
+    return;
+  }
+
+  const registry = new ToolRegistry({ tools: [addTool] });
+  print(await registry.invoke({ name: toolName, input }));
+}
+
+await main();
+```
+
+</details>
+
+### 运行与观察
+
+```bash
+bun run examples/stage-03-tool-playground.ts add '{"description":"demo","left":2,"right":3}'
+bun run examples/stage-03-tool-playground.ts add '{"left":2,"right":3}'
+```
+
+预期分别看到 success JSON 和带稳定 error code 的 error JSON。不要只输出 stack trace。
+
+### 3.5 完整测试
 
 目标文件：`src/foundation/tools/__tests__/tool-registry.test.ts`
 
@@ -1204,69 +1271,11 @@ describe("ToolRegistry", () => {
 
 </details>
 
-### 3.5 Tool playground
-
-目标文件：`examples/stage-03-tool-playground.ts`
-
-这个 CLI 把命令行中的 Tool name 和 JSON input 交给 `ToolRegistry`。JSON 解析错误同样
-输出 structured error，不打印 stack trace。
-
-<details>
-<summary>展开完整代码：<code>stage-03-tool-playground.ts</code></summary>
-
-```ts
-import { addTool } from "@/foundation/tools/add-tool";
-import { ToolRegistry } from "@/foundation/tools/tool-registry";
-
-function print(value: unknown): void {
-  console.log(JSON.stringify(value, null, 2));
-}
-
-async function main(): Promise<void> {
-  const [toolName, rawInput] = Bun.argv.slice(2);
-
-  if (!toolName || !rawInput) {
-    print({
-      ok: false,
-      code: "INVALID_ARGUMENTS",
-      error: "Usage: bun run examples/stage-03-tool-playground.ts <tool> <json-input>",
-    });
-    process.exitCode = 1;
-    return;
-  }
-
-  let input: unknown;
-  try {
-    input = JSON.parse(rawInput);
-  } catch (error) {
-    print({
-      ok: false,
-      toolName,
-      code: "INVALID_JSON_INPUT",
-      error: error instanceof Error ? error.message : String(error),
-    });
-    process.exitCode = 1;
-    return;
-  }
-
-  const registry = new ToolRegistry({ tools: [addTool] });
-  print(await registry.invoke({ name: toolName, input }));
-}
-
-await main();
-```
-
-</details>
-
-### 运行与观察
+最后执行本阶段的完整测试：
 
 ```bash
 bun test src/foundation/tools/__tests__/tool-registry.test.ts
-bun run examples/stage-03-tool-playground.ts add '{"description":"demo","left":2,"right":3}'
-bun run examples/stage-03-tool-playground.ts add '{"left":2,"right":3}'
 ```
-
-预期分别看到 success JSON 和带稳定 error code 的 error JSON。不要只输出 stack trace。
 
 ### 阶段后对照
 

@@ -135,7 +135,428 @@ export function parseAnthropicAssistantMessage(message: Anthropic.Message): Assi
 
 这些函数必须是纯函数。先用固定 fixture 测完，再调用 SDK。
 
-### 7.3 完整协议测试
+### 7.3 StreamAccumulator
+
+目标文件：`src/community/openai/stream-accumulator.ts`
+
+定义 provider-local accumulator。文本 delta 分支是标准实现示例；thinking、Tool fragment
+和 usage 分别保留为独立 TODO，不能共享可变字符串。
+
+<details>
+<summary>展开完整代码：<code>stream-accumulator.ts</code></summary>
+
+```ts
+export interface ProviderChunk {
+  textDelta?: string;
+  thinkingDelta?: string;
+  toolCall?: {
+    index: number;
+    id?: string;
+    name?: string;
+    argumentsDelta?: string;
+  };
+  usage?: TokenUsage;
+}
+
+export class StreamAccumulator {
+  private _text = "";
+  private _thinking = "";
+  private readonly _toolCalls = new Map<number, {
+    id: string;
+    name: string;
+    argumentsText: string;
+  }>();
+  private _usage?: TokenUsage;
+
+  push(chunk: ProviderChunk): void {
+    if (chunk.textDelta) {
+      // 标准实现示例：delta 只写 accumulator，不写 Agent transcript。
+      this._text += chunk.textDelta;
+    }
+    // TODO 1：thinking delta 追加到 _thinking。
+    // TODO 2：按 Tool call index 合并 id、name 和 argumentsText，不能按到达顺序串线。
+    // TODO 3：provider 给出 usage 时覆盖 _usage。
+  }
+
+  snapshot(): AssistantMessage {
+    // TODO 4：按稳定顺序构造完整 content 数组；argumentsText 不完整时暂用 {}。
+    // TODO 5：返回新对象和新数组，调用方修改 snapshot 不能污染 accumulator。
+  }
+}
+```
+
+</details>
+
+目标文件：`src/community/anthropic/stream-accumulator.ts`
+
+Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
+event type 泄漏到 Agent：
+
+```ts
+export type ProviderChunk =
+  | { type: "text_delta"; index: number; text: string }
+  | { type: "thinking_delta"; index: number; thinking: string }
+  | { type: "tool_start"; index: number; id: string; name: string }
+  | { type: "input_json_delta"; index: number; partialJson: string }
+  | { type: "message_start"; inputTokens: number }
+  | { type: "message_end"; outputTokens: number };
+
+export class StreamAccumulator {
+  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态。
+  // TODO 2：分别保存 input/output usage，message_end 后产生完整 TokenUsage。
+
+  push(chunk: ProviderChunk): void {
+    // TODO 3：按 chunk.type 分派；同一 index 的 partialJson 只能追加到同一 Tool。
+    throw new Error("TODO: implement Anthropic StreamAccumulator.push");
+  }
+
+  snapshot(): AssistantMessage {
+    // TODO 4：按 index 排序输出新 content 数组；不完整 Tool input 暂时使用 {}。
+    throw new Error("TODO: implement Anthropic StreamAccumulator.snapshot");
+  }
+}
+```
+
+目标文件：`src/community/openai/__tests__/stream-accumulator.test.ts`
+
+<details>
+<summary>展开完整代码：<code>stream-accumulator.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { StreamAccumulator } from "../stream-accumulator";
+
+describe("OpenAI StreamAccumulator", () => {
+  test("accumulates text and usage into independent snapshots", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ textDelta: "hel" } as never);
+    const first = accumulator.snapshot();
+    accumulator.push({ textDelta: "lo" } as never);
+    accumulator.push({ usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } } as never);
+
+    expect(first.content).toEqual([{ type: "text", text: "hel" }]);
+    expect(accumulator.snapshot()).toMatchObject({
+      content: [{ type: "text", text: "hello" }],
+      usage: { totalTokens: 5 },
+    });
+  });
+
+  test("joins fragmented JSON without mixing concurrent tool calls", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({
+      toolCall: { index: 1, id: "b", name: "read_file", argumentsDelta: '{"path":"b' },
+    } as never);
+    accumulator.push({
+      toolCall: { index: 0, id: "a", name: "read_file", argumentsDelta: '{"path":"/tmp/' },
+    } as never);
+    accumulator.push({ toolCall: { index: 1, argumentsDelta: '.ts"}' } } as never);
+    accumulator.push({ toolCall: { index: 0, argumentsDelta: 'demo","line":1}' } } as never);
+
+    expect(accumulator.snapshot().content).toEqual([
+      {
+        type: "tool_use",
+        id: "a",
+        name: "read_file",
+        input: { path: "/tmp/demo", line: 1 },
+      },
+      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+    ]);
+  });
+
+  test("does not expose mutable accumulator state", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ textDelta: "safe" } as never);
+    const snapshot = accumulator.snapshot();
+    snapshot.content.splice(0);
+
+    expect(accumulator.snapshot().content).toEqual([{ type: "text", text: "safe" }]);
+  });
+});
+```
+
+</details>
+
+目标文件：`src/community/anthropic/__tests__/stream-accumulator.test.ts`
+
+<details>
+<summary>展开完整代码：<code>stream-accumulator.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { StreamAccumulator } from "../stream-accumulator";
+
+describe("Anthropic StreamAccumulator", () => {
+  test("keeps block index order while accumulating deltas", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ index: 1, type: "text_delta", text: "answer" } as never);
+    accumulator.push({ index: 0, type: "thinking_delta", thinking: "plan" } as never);
+    accumulator.push({
+      index: 2,
+      type: "tool_start",
+      id: "call-1",
+      name: "read_file",
+    } as never);
+    accumulator.push({ index: 2, type: "input_json_delta", partialJson: '{"path"' } as never);
+    accumulator.push({ index: 2, type: "input_json_delta", partialJson: ':"a.ts"}' } as never);
+
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "answer" },
+      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+    ]);
+  });
+
+  test("combines input and output token usage", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ type: "message_start", inputTokens: 12 } as never);
+    accumulator.push({ type: "message_end", outputTokens: 4 } as never);
+
+    expect(accumulator.snapshot().usage).toEqual({
+      promptTokens: 12,
+      completionTokens: 4,
+      totalTokens: 16,
+    });
+  });
+});
+```
+
+</details>
+
+这里的 chunk 是教程规定的 provider-local normalized chunk；参数规则是：`index` 在一次
+响应内稳定、`argumentsDelta`/`partialJson` 必须按同一 index 拼接、usage 只在 provider
+明确报告时出现。若你直接消费 SDK event，可先在 `model-provider.ts` 做一次窄转换。
+
+### 7.4 Provider class
+
+目标文件：`src/community/openai/model-provider.ts`
+
+```ts
+export class OpenAIModelProvider implements ModelProvider {
+  private readonly _client: OpenAI;
+
+  constructor(options: { baseURL?: string; apiKey?: string; client?: OpenAI } = {}) {
+    // 标准实现示例：允许测试注入 fake client；production 才创建真实 SDK client。
+    this._client = options.client ?? new OpenAI({
+      baseURL: options.baseURL,
+      apiKey: options.apiKey,
+    });
+  }
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    // TODO 1：构造 request → client.chat.completions.create → parse；透传 signal。
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    // TODO 2：设置 stream=true；每个 SDK chunk 依次 push，再 yield 累计 snapshot。
+    // TODO 3：结束前确认最后 snapshot 是完整消息，且不带临时 streaming 标记。
+  }
+}
+```
+
+默认使用确定性更强的 provider options，并允许调用方最后覆盖：
+
+```ts
+return {
+  model,
+  messages: convertToOpenAIMessages(messages),
+  tools: tools ? convertToOpenAITools(tools) : undefined,
+  temperature: 0,
+  top_p: 0,
+  ...options,
+};
+```
+
+不要在日志、trace 或测试 snapshot 中记录 API key。
+
+目标文件：`src/community/openai/__tests__/model-provider.test.ts`
+
+<details>
+<summary>展开完整代码：<code>model-provider.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { OpenAIModelProvider } from "../model-provider";
+
+describe("OpenAIModelProvider", () => {
+  test("passes signal, tools and caller overrides to the SDK", async () => {
+    let request: Record<string, unknown> | undefined;
+    let sdkSignal: AbortSignal | undefined;
+    const client = {
+      chat: {
+        completions: {
+          create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
+            request = body;
+            sdkSignal = options.signal;
+            return {
+              choices: [{ message: { role: "assistant", content: "ok" } }],
+              usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+            };
+          },
+        },
+      },
+    };
+    const controller = new AbortController();
+    const provider = new OpenAIModelProvider({ client: client as never });
+
+    const result = await provider.invoke({
+      model: "test-model",
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      tools: [],
+      options: { temperature: 0.25 },
+      signal: controller.signal,
+    });
+
+    expect(request).toMatchObject({
+      model: "test-model",
+      temperature: 0.25,
+      top_p: 0,
+    });
+    expect(sdkSignal).toBe(controller.signal);
+    expect(result).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      usage: { totalTokens: 4 },
+    });
+  });
+});
+```
+
+</details>
+
+SDK `create` 的第二个参数承载 `signal`；不要把 signal 混进 JSON request body。Anthropic
+provider 使用相同注入方式和断言结构，其 wire 转换差异已由 7.5 的完整测试固定。
+
+目标文件：`examples/stage-07-real-model.ts`
+
+示例只把可见 text snapshot 写到终端；最终 JSON 中的 thinking 内容保留 canonical shape，
+但用 `[hidden]` 替换原文。模型名可通过对应环境变量覆盖。
+
+<details>
+<summary>展开完整代码：<code>stage-07-real-model.ts</code></summary>
+
+```ts
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import type { ModelProvider } from "@/foundation/models/model-provider";
+import { AnthropicModelProvider } from "@/community/anthropic/model-provider";
+import { OpenAIModelProvider } from "@/community/openai/model-provider";
+
+type Vendor = "openai" | "anthropic";
+
+function visibleText(message: AssistantMessage): string {
+  return message.content
+    .map((item) => (item.type === "text" ? item.text : ""))
+    .join("");
+}
+
+function redactThinking(message: AssistantMessage): AssistantMessage {
+  return {
+    ...message,
+    content: message.content.map((item) =>
+      item.type === "thinking" ? { ...item, thinking: "[hidden]" } : item,
+    ),
+  };
+}
+
+async function main(): Promise<void> {
+  const vendor = Bun.argv[2];
+  if (vendor !== "openai" && vendor !== "anthropic") {
+    console.log("Usage: bun run examples/stage-07-real-model.ts <openai|anthropic>");
+    return;
+  }
+
+  const config: Record<Vendor, {
+    apiKey: string | undefined;
+    modelName: string;
+    providerName: string;
+  }> = {
+    openai: {
+      apiKey: Bun.env.OPENAI_API_KEY,
+      modelName: Bun.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+      providerName: "OpenAI",
+    },
+    anthropic: {
+      apiKey: Bun.env.ANTHROPIC_API_KEY,
+      modelName: Bun.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514",
+      providerName: "Anthropic",
+    },
+  };
+  const selected = config[vendor];
+
+  if (!selected.apiKey) {
+    console.log(`Missing ${vendor === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"}.`);
+    console.log("Configure the key and run this optional integration example again.");
+    return;
+  }
+
+  const provider: ModelProvider = vendor === "openai"
+    ? new OpenAIModelProvider({
+        apiKey: selected.apiKey,
+        baseURL: Bun.env.OPENAI_BASE_URL,
+      })
+    : new AnthropicModelProvider({ apiKey: selected.apiKey });
+  const model = new Model({ name: selected.modelName, provider });
+  const userMessage: UserMessage = {
+    role: "user",
+    content: [{ type: "text", text: "用一句话解释 ReAct agent loop。" }],
+  };
+  const startedAt = performance.now();
+  let finalMessage: AssistantMessage | undefined;
+
+  console.log(`provider=${selected.providerName} model=${selected.modelName}`);
+  for await (const snapshot of model.stream({
+    prompt: "Answer concisely. Do not expose hidden reasoning.",
+    messages: [userMessage],
+  })) {
+    process.stdout.write(`\r${visibleText(snapshot)}`);
+    finalMessage = snapshot;
+  }
+  process.stdout.write("\n");
+
+  if (!finalMessage) throw new Error("Provider stream returned no snapshots");
+
+  console.log(JSON.stringify(redactThinking(finalMessage), null, 2));
+  console.log(
+    `tokens prompt=${finalMessage.usage?.promptTokens ?? "n/a"} ` +
+      `output=${finalMessage.usage?.completionTokens ?? "n/a"} ` +
+      `total=${finalMessage.usage?.totalTokens ?? "n/a"}`,
+  );
+  console.log(`elapsed=${Math.round(performance.now() - startedAt)}ms`);
+}
+
+await main();
+```
+
+</details>
+
+### 运行与观察
+
+OpenAI-compatible endpoint：
+
+```bash
+OPENAI_API_KEY=... bun run examples/stage-07-real-model.ts openai
+```
+
+Anthropic：
+
+```bash
+ANTHROPIC_API_KEY=... bun run examples/stage-07-real-model.ts anthropic
+```
+
+示例应打印：
+
+- provider name 和 model name；
+- streaming progress，不打印隐藏 reasoning 原文；
+- 最终 canonical `AssistantMessage`；
+- prompt/output/total tokens；
+- 总耗时。
+
+如果没有 key，示例给出配置提示后 exit 0；测试套件不能因此失败。
+
+### 7.5 完整协议测试
 
 目标文件：`src/community/openai/__tests__/utils.test.ts`
 
@@ -351,428 +772,13 @@ describe("Anthropic protocol conversion", () => {
 
 这两个文件已经覆盖 user/system/assistant、混合内容、多 Tool call、call id、空文本、
 thinking、缺少 usage 和 malformed arguments。Malformed arguments 在最终非流式响应中必须
-抛出带 call id 的诊断错误；流式 fragment 的规则由下一节的完整 accumulator 测试固定。
+抛出带 call id 的诊断错误；流式 fragment 的规则由前文 7.3 的 accumulator 测试固定。
 
-### 7.4 StreamAccumulator
-
-目标文件：`src/community/openai/stream-accumulator.ts`
-
-定义 provider-local accumulator。文本 delta 分支是标准实现示例；thinking、Tool fragment
-和 usage 分别保留为独立 TODO，不能共享可变字符串。
-
-<details>
-<summary>展开完整代码：<code>stream-accumulator.ts</code></summary>
-
-```ts
-export interface ProviderChunk {
-  textDelta?: string;
-  thinkingDelta?: string;
-  toolCall?: {
-    index: number;
-    id?: string;
-    name?: string;
-    argumentsDelta?: string;
-  };
-  usage?: TokenUsage;
-}
-
-export class StreamAccumulator {
-  private _text = "";
-  private _thinking = "";
-  private readonly _toolCalls = new Map<number, {
-    id: string;
-    name: string;
-    argumentsText: string;
-  }>();
-  private _usage?: TokenUsage;
-
-  push(chunk: ProviderChunk): void {
-    if (chunk.textDelta) {
-      // 标准实现示例：delta 只写 accumulator，不写 Agent transcript。
-      this._text += chunk.textDelta;
-    }
-    // TODO 1：thinking delta 追加到 _thinking。
-    // TODO 2：按 Tool call index 合并 id、name 和 argumentsText，不能按到达顺序串线。
-    // TODO 3：provider 给出 usage 时覆盖 _usage。
-  }
-
-  snapshot(): AssistantMessage {
-    // TODO 4：按稳定顺序构造完整 content 数组；argumentsText 不完整时暂用 {}。
-    // TODO 5：返回新对象和新数组，调用方修改 snapshot 不能污染 accumulator。
-  }
-}
-```
-
-</details>
-
-目标文件：`src/community/anthropic/stream-accumulator.ts`
-
-Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
-event type 泄漏到 Agent：
-
-```ts
-export type ProviderChunk =
-  | { type: "text_delta"; index: number; text: string }
-  | { type: "thinking_delta"; index: number; thinking: string }
-  | { type: "tool_start"; index: number; id: string; name: string }
-  | { type: "input_json_delta"; index: number; partialJson: string }
-  | { type: "message_start"; inputTokens: number }
-  | { type: "message_end"; outputTokens: number };
-
-export class StreamAccumulator {
-  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态。
-  // TODO 2：分别保存 input/output usage，message_end 后产生完整 TokenUsage。
-
-  push(chunk: ProviderChunk): void {
-    // TODO 3：按 chunk.type 分派；同一 index 的 partialJson 只能追加到同一 Tool。
-    throw new Error("TODO: implement Anthropic StreamAccumulator.push");
-  }
-
-  snapshot(): AssistantMessage {
-    // TODO 4：按 index 排序输出新 content 数组；不完整 Tool input 暂时使用 {}。
-    throw new Error("TODO: implement Anthropic StreamAccumulator.snapshot");
-  }
-}
-```
-
-目标文件：`src/community/openai/__tests__/stream-accumulator.test.ts`
-
-<details>
-<summary>展开完整代码：<code>stream-accumulator.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import { StreamAccumulator } from "../stream-accumulator";
-
-describe("OpenAI StreamAccumulator", () => {
-  test("accumulates text and usage into independent snapshots", () => {
-    const accumulator = new StreamAccumulator();
-    accumulator.push({ textDelta: "hel" } as never);
-    const first = accumulator.snapshot();
-    accumulator.push({ textDelta: "lo" } as never);
-    accumulator.push({ usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } } as never);
-
-    expect(first.content).toEqual([{ type: "text", text: "hel" }]);
-    expect(accumulator.snapshot()).toMatchObject({
-      content: [{ type: "text", text: "hello" }],
-      usage: { totalTokens: 5 },
-    });
-  });
-
-  test("joins fragmented JSON without mixing concurrent tool calls", () => {
-    const accumulator = new StreamAccumulator();
-    accumulator.push({
-      toolCall: { index: 1, id: "b", name: "read_file", argumentsDelta: '{"path":"b' },
-    } as never);
-    accumulator.push({
-      toolCall: { index: 0, id: "a", name: "read_file", argumentsDelta: '{"path":"/tmp/' },
-    } as never);
-    accumulator.push({ toolCall: { index: 1, argumentsDelta: '.ts"}' } } as never);
-    accumulator.push({ toolCall: { index: 0, argumentsDelta: 'demo","line":1}' } } as never);
-
-    expect(accumulator.snapshot().content).toEqual([
-      {
-        type: "tool_use",
-        id: "a",
-        name: "read_file",
-        input: { path: "/tmp/demo", line: 1 },
-      },
-      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
-    ]);
-  });
-
-  test("does not expose mutable accumulator state", () => {
-    const accumulator = new StreamAccumulator();
-    accumulator.push({ textDelta: "safe" } as never);
-    const snapshot = accumulator.snapshot();
-    snapshot.content.splice(0);
-
-    expect(accumulator.snapshot().content).toEqual([{ type: "text", text: "safe" }]);
-  });
-});
-```
-
-</details>
-
-目标文件：`src/community/anthropic/__tests__/stream-accumulator.test.ts`
-
-<details>
-<summary>展开完整代码：<code>stream-accumulator.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import { StreamAccumulator } from "../stream-accumulator";
-
-describe("Anthropic StreamAccumulator", () => {
-  test("keeps block index order while accumulating deltas", () => {
-    const accumulator = new StreamAccumulator();
-    accumulator.push({ index: 1, type: "text_delta", text: "answer" } as never);
-    accumulator.push({ index: 0, type: "thinking_delta", thinking: "plan" } as never);
-    accumulator.push({
-      index: 2,
-      type: "tool_start",
-      id: "call-1",
-      name: "read_file",
-    } as never);
-    accumulator.push({ index: 2, type: "input_json_delta", partialJson: '{"path"' } as never);
-    accumulator.push({ index: 2, type: "input_json_delta", partialJson: ':"a.ts"}' } as never);
-
-    expect(accumulator.snapshot().content).toEqual([
-      { type: "thinking", thinking: "plan" },
-      { type: "text", text: "answer" },
-      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
-    ]);
-  });
-
-  test("combines input and output token usage", () => {
-    const accumulator = new StreamAccumulator();
-    accumulator.push({ type: "message_start", inputTokens: 12 } as never);
-    accumulator.push({ type: "message_end", outputTokens: 4 } as never);
-
-    expect(accumulator.snapshot().usage).toEqual({
-      promptTokens: 12,
-      completionTokens: 4,
-      totalTokens: 16,
-    });
-  });
-});
-```
-
-</details>
-
-这里的 chunk 是教程规定的 provider-local normalized chunk；参数规则是：`index` 在一次
-响应内稳定、`argumentsDelta`/`partialJson` 必须按同一 index 拼接、usage 只在 provider
-明确报告时出现。若你直接消费 SDK event，可先在 `model-provider.ts` 做一次窄转换。
-
-### 7.5 Provider class
-
-目标文件：`src/community/openai/model-provider.ts`
-
-```ts
-export class OpenAIModelProvider implements ModelProvider {
-  private readonly _client: OpenAI;
-
-  constructor(options: { baseURL?: string; apiKey?: string; client?: OpenAI } = {}) {
-    // 标准实现示例：允许测试注入 fake client；production 才创建真实 SDK client。
-    this._client = options.client ?? new OpenAI({
-      baseURL: options.baseURL,
-      apiKey: options.apiKey,
-    });
-  }
-
-  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
-    // TODO 1：构造 request → client.chat.completions.create → parse；透传 signal。
-  }
-
-  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
-    // TODO 2：设置 stream=true；每个 SDK chunk 依次 push，再 yield 累计 snapshot。
-    // TODO 3：结束前确认最后 snapshot 是完整消息，且不带临时 streaming 标记。
-  }
-}
-```
-
-默认使用确定性更强的 provider options，并允许调用方最后覆盖：
-
-```ts
-return {
-  model,
-  messages: convertToOpenAIMessages(messages),
-  tools: tools ? convertToOpenAITools(tools) : undefined,
-  temperature: 0,
-  top_p: 0,
-  ...options,
-};
-```
-
-不要在日志、trace 或测试 snapshot 中记录 API key。
-
-目标文件：`src/community/openai/__tests__/model-provider.test.ts`
-
-<details>
-<summary>展开完整代码：<code>model-provider.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import { OpenAIModelProvider } from "../model-provider";
-
-describe("OpenAIModelProvider", () => {
-  test("passes signal, tools and caller overrides to the SDK", async () => {
-    let request: Record<string, unknown> | undefined;
-    let sdkSignal: AbortSignal | undefined;
-    const client = {
-      chat: {
-        completions: {
-          create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
-            request = body;
-            sdkSignal = options.signal;
-            return {
-              choices: [{ message: { role: "assistant", content: "ok" } }],
-              usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
-            };
-          },
-        },
-      },
-    };
-    const controller = new AbortController();
-    const provider = new OpenAIModelProvider({ client: client as never });
-
-    const result = await provider.invoke({
-      model: "test-model",
-      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
-      tools: [],
-      options: { temperature: 0.25 },
-      signal: controller.signal,
-    });
-
-    expect(request).toMatchObject({
-      model: "test-model",
-      temperature: 0.25,
-      top_p: 0,
-    });
-    expect(sdkSignal).toBe(controller.signal);
-    expect(result).toMatchObject({
-      role: "assistant",
-      content: [{ type: "text", text: "ok" }],
-      usage: { totalTokens: 4 },
-    });
-  });
-});
-```
-
-</details>
-
-SDK `create` 的第二个参数承载 `signal`；不要把 signal 混进 JSON request body。Anthropic
-provider 使用相同注入方式和断言结构，其 wire 转换差异已由 7.3 的完整测试固定。
-
-目标文件：`examples/stage-07-real-model.ts`
-
-示例只把可见 text snapshot 写到终端；最终 JSON 中的 thinking 内容保留 canonical shape，
-但用 `[hidden]` 替换原文。模型名可通过对应环境变量覆盖。
-
-<details>
-<summary>展开完整代码：<code>stage-07-real-model.ts</code></summary>
-
-```ts
-import type { AssistantMessage, UserMessage } from "@/foundation/messages";
-import { Model } from "@/foundation/models/model";
-import type { ModelProvider } from "@/foundation/models/model-provider";
-import { AnthropicModelProvider } from "@/community/anthropic/model-provider";
-import { OpenAIModelProvider } from "@/community/openai/model-provider";
-
-type Vendor = "openai" | "anthropic";
-
-function visibleText(message: AssistantMessage): string {
-  return message.content
-    .map((item) => (item.type === "text" ? item.text : ""))
-    .join("");
-}
-
-function redactThinking(message: AssistantMessage): AssistantMessage {
-  return {
-    ...message,
-    content: message.content.map((item) =>
-      item.type === "thinking" ? { ...item, thinking: "[hidden]" } : item,
-    ),
-  };
-}
-
-async function main(): Promise<void> {
-  const vendor = Bun.argv[2];
-  if (vendor !== "openai" && vendor !== "anthropic") {
-    console.log("Usage: bun run examples/stage-07-real-model.ts <openai|anthropic>");
-    return;
-  }
-
-  const config: Record<Vendor, {
-    apiKey: string | undefined;
-    modelName: string;
-    providerName: string;
-  }> = {
-    openai: {
-      apiKey: Bun.env.OPENAI_API_KEY,
-      modelName: Bun.env.OPENAI_MODEL ?? "gpt-4.1-mini",
-      providerName: "OpenAI",
-    },
-    anthropic: {
-      apiKey: Bun.env.ANTHROPIC_API_KEY,
-      modelName: Bun.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514",
-      providerName: "Anthropic",
-    },
-  };
-  const selected = config[vendor];
-
-  if (!selected.apiKey) {
-    console.log(`Missing ${vendor === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"}.`);
-    console.log("Configure the key and run this optional integration example again.");
-    return;
-  }
-
-  const provider: ModelProvider = vendor === "openai"
-    ? new OpenAIModelProvider({
-        apiKey: selected.apiKey,
-        baseURL: Bun.env.OPENAI_BASE_URL,
-      })
-    : new AnthropicModelProvider({ apiKey: selected.apiKey });
-  const model = new Model({ name: selected.modelName, provider });
-  const userMessage: UserMessage = {
-    role: "user",
-    content: [{ type: "text", text: "用一句话解释 ReAct agent loop。" }],
-  };
-  const startedAt = performance.now();
-  let finalMessage: AssistantMessage | undefined;
-
-  console.log(`provider=${selected.providerName} model=${selected.modelName}`);
-  for await (const snapshot of model.stream({
-    prompt: "Answer concisely. Do not expose hidden reasoning.",
-    messages: [userMessage],
-  })) {
-    process.stdout.write(`\r${visibleText(snapshot)}`);
-    finalMessage = snapshot;
-  }
-  process.stdout.write("\n");
-
-  if (!finalMessage) throw new Error("Provider stream returned no snapshots");
-
-  console.log(JSON.stringify(redactThinking(finalMessage), null, 2));
-  console.log(
-    `tokens prompt=${finalMessage.usage?.promptTokens ?? "n/a"} ` +
-      `output=${finalMessage.usage?.completionTokens ?? "n/a"} ` +
-      `total=${finalMessage.usage?.totalTokens ?? "n/a"}`,
-  );
-  console.log(`elapsed=${Math.round(performance.now() - startedAt)}ms`);
-}
-
-await main();
-```
-
-</details>
-
-### 运行与观察
-
-OpenAI-compatible endpoint：
+最后执行本阶段的完整测试：
 
 ```bash
-OPENAI_API_KEY=... bun run examples/stage-07-real-model.ts openai
+bun test src/community/openai src/community/anthropic
 ```
-
-Anthropic：
-
-```bash
-ANTHROPIC_API_KEY=... bun run examples/stage-07-real-model.ts anthropic
-```
-
-示例应打印：
-
-- provider name 和 model name；
-- streaming progress，不打印隐藏 reasoning 原文；
-- 最终 canonical `AssistantMessage`；
-- prompt/output/total tokens；
-- 总耗时。
-
-如果没有 key，示例给出配置提示后 exit 0；测试套件不能因此失败。
 
 ### 阶段后对照
 
@@ -955,7 +961,7 @@ ABORTED
 
 不要把 command 插入另一层未转义的 shell string。若契约接收完整 shell command，应明确这是 intentional shell execution，并把原始 command 展示在审批界面。
 
-### 8.5 完整测试
+### 8.5 组装 Coding Tools
 
 目标文件：`src/coding/tools/index.ts`
 
@@ -975,6 +981,121 @@ export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
   throw new Error("TODO: implement defineCodingTools");
 }
 ```
+
+参数规则：所有 Tool input 的首字段都是 `description`；文件路径相对固定 `cwd`；
+`startLine/endLine` 为 1-based 且必须成对出现；bash timeout 来自 composition 配置而非模型。
+
+目标文件：`examples/stage-08-coding-tools.ts`
+
+示例在系统临时目录中创建 fixture，三种模式都通过公开 Tool contract 操作。结束时输出
+简化 workspace diff，并在 `finally` 中删除临时目录。
+
+<details>
+<summary>展开完整代码：<code>stage-08-coding-tools.ts</code></summary>
+
+```ts
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { defineCodingTools } from "@/coding/tools";
+
+type Mode = "inspect" | "edit" | "reject-path";
+type WorkspaceSnapshot = Record<string, string>;
+
+const trackedPaths = ["input.ts", "notes.txt"];
+
+async function snapshot(cwd: string): Promise<WorkspaceSnapshot> {
+  const result: WorkspaceSnapshot = {};
+  for (const path of trackedPaths) {
+    try {
+      result[path] = await readFile(join(cwd, path), "utf8");
+    } catch {
+      // 文件尚不存在时不写入 snapshot。
+    }
+  }
+  return result;
+}
+
+function printDiff(before: WorkspaceSnapshot, after: WorkspaceSnapshot): void {
+  const paths = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
+  let changed = false;
+
+  for (const path of paths) {
+    if (before[path] === after[path]) continue;
+    changed = true;
+    console.log(`--- before/${path}`);
+    console.log(`+++ after/${path}`);
+    if (before[path] !== undefined) console.log(`-${before[path]!.trimEnd()}`);
+    if (after[path] !== undefined) console.log(`+${after[path]!.trimEnd()}`);
+  }
+
+  if (!changed) console.log("(no workspace changes)");
+}
+
+async function main(): Promise<void> {
+  const mode = Bun.argv[2];
+  if (mode !== "inspect" && mode !== "edit" && mode !== "reject-path") {
+    console.log("Usage: bun run examples/stage-08-coding-tools.ts <inspect|edit|reject-path>");
+    return;
+  }
+
+  const workspace = await mkdtemp(join(tmpdir(), "harness-tools-demo-"));
+  try {
+    await writeFile(join(workspace, "input.ts"), "export const value = 1;\n", "utf8");
+    const before = await snapshot(workspace);
+    const tools = defineCodingTools({ cwd: workspace, bashTimeoutMs: 1_000 });
+    const invoke = async (name: string, input: Record<string, unknown>) => {
+      const tool = tools.find((candidate) => candidate.name === name);
+      if (!tool) throw new Error(`Missing coding Tool: ${name}`);
+      const result = await tool.invoke({ description: `demo ${name}`, ...input } as never);
+      console.log(`${name}: ${JSON.stringify(result, null, 2)}`);
+      return result;
+    };
+
+    if (mode === "inspect") {
+      await invoke("list_files", { path: "." });
+      await invoke("read_file", { path: "input.ts" });
+      await invoke("grep_search", { path: ".", pattern: "value" });
+    } else if (mode === "edit") {
+      await invoke("str_replace", {
+        path: "input.ts",
+        oldText: "value = 1",
+        newText: "value = 2",
+      });
+      await invoke("write_file", {
+        path: "notes.txt",
+        content: "updated by stage-08-coding-tools\n",
+      });
+    } else {
+      await invoke("read_file", { path: "../outside.txt" });
+    }
+
+    console.log("workspace diff:");
+    printDiff(before, await snapshot(workspace));
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
+
+await main();
+```
+
+</details>
+
+### 运行与观察
+
+创建一个临时 fixture repo，依次运行：
+
+```bash
+bun run examples/stage-08-coding-tools.ts inspect
+bun run examples/stage-08-coding-tools.ts edit
+bun run examples/stage-08-coding-tools.ts reject-path
+```
+
+示例最后打印 workspace diff，而不只是打印 `ok: true`。你应能看到每个 Tool 对外部世界造成的具体变化。
+
+### 8.6 完整测试
 
 目标文件：`src/coding/tools/__tests__/tool-utils.test.ts`
 
@@ -1142,118 +1263,11 @@ describe("bash", () => {
 
 </details>
 
-参数规则：所有 Tool input 的首字段都是 `description`；文件路径相对固定 `cwd`；
-`startLine/endLine` 为 1-based 且必须成对出现；bash timeout 来自 composition 配置而非模型。
-
-目标文件：`examples/stage-08-coding-tools.ts`
-
-示例在系统临时目录中创建 fixture，三种模式都通过公开 Tool contract 操作。结束时输出
-简化 workspace diff，并在 `finally` 中删除临时目录。
-
-<details>
-<summary>展开完整代码：<code>stage-08-coding-tools.ts</code></summary>
-
-```ts
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-
-import { defineCodingTools } from "@/coding/tools";
-
-type Mode = "inspect" | "edit" | "reject-path";
-type WorkspaceSnapshot = Record<string, string>;
-
-const trackedPaths = ["input.ts", "notes.txt"];
-
-async function snapshot(cwd: string): Promise<WorkspaceSnapshot> {
-  const result: WorkspaceSnapshot = {};
-  for (const path of trackedPaths) {
-    try {
-      result[path] = await readFile(join(cwd, path), "utf8");
-    } catch {
-      // 文件尚不存在时不写入 snapshot。
-    }
-  }
-  return result;
-}
-
-function printDiff(before: WorkspaceSnapshot, after: WorkspaceSnapshot): void {
-  const paths = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort();
-  let changed = false;
-
-  for (const path of paths) {
-    if (before[path] === after[path]) continue;
-    changed = true;
-    console.log(`--- before/${path}`);
-    console.log(`+++ after/${path}`);
-    if (before[path] !== undefined) console.log(`-${before[path]!.trimEnd()}`);
-    if (after[path] !== undefined) console.log(`+${after[path]!.trimEnd()}`);
-  }
-
-  if (!changed) console.log("(no workspace changes)");
-}
-
-async function main(): Promise<void> {
-  const mode = Bun.argv[2];
-  if (mode !== "inspect" && mode !== "edit" && mode !== "reject-path") {
-    console.log("Usage: bun run examples/stage-08-coding-tools.ts <inspect|edit|reject-path>");
-    return;
-  }
-
-  const workspace = await mkdtemp(join(tmpdir(), "harness-tools-demo-"));
-  try {
-    await writeFile(join(workspace, "input.ts"), "export const value = 1;\n", "utf8");
-    const before = await snapshot(workspace);
-    const tools = defineCodingTools({ cwd: workspace, bashTimeoutMs: 1_000 });
-    const invoke = async (name: string, input: Record<string, unknown>) => {
-      const tool = tools.find((candidate) => candidate.name === name);
-      if (!tool) throw new Error(`Missing coding Tool: ${name}`);
-      const result = await tool.invoke({ description: `demo ${name}`, ...input } as never);
-      console.log(`${name}: ${JSON.stringify(result, null, 2)}`);
-      return result;
-    };
-
-    if (mode === "inspect") {
-      await invoke("list_files", { path: "." });
-      await invoke("read_file", { path: "input.ts" });
-      await invoke("grep_search", { path: ".", pattern: "value" });
-    } else if (mode === "edit") {
-      await invoke("str_replace", {
-        path: "input.ts",
-        oldText: "value = 1",
-        newText: "value = 2",
-      });
-      await invoke("write_file", {
-        path: "notes.txt",
-        content: "updated by stage-08-coding-tools\n",
-      });
-    } else {
-      await invoke("read_file", { path: "../outside.txt" });
-    }
-
-    console.log("workspace diff:");
-    printDiff(before, await snapshot(workspace));
-  } finally {
-    await rm(workspace, { recursive: true, force: true });
-  }
-}
-
-await main();
-```
-
-</details>
-
-### 运行与观察
-
-创建一个临时 fixture repo，依次运行：
+最后执行本阶段的完整测试：
 
 ```bash
-bun run examples/stage-08-coding-tools.ts inspect
-bun run examples/stage-08-coding-tools.ts edit
-bun run examples/stage-08-coding-tools.ts reject-path
+bun test src/coding/tools
 ```
-
-示例最后打印 workspace diff，而不只是打印 `ok: true`。你应能看到每个 Tool 对外部世界造成的具体变化。
 
 ### 阶段后对照
 
@@ -1458,6 +1472,159 @@ export function defineAskUserQuestionTool(options: {
 ```
 
 测试 handler 被并发 Tool 调度调用时不会丢失 call id。
+
+### 运行与观察
+
+准备 fixture workspace：
+
+```text
+fixture/
+├── AGENTS.md
+├── .agents/skills/test-writer/SKILL.md
+└── src/math.ts
+```
+
+目标文件：`examples/stage-09-coding-agent.ts`
+
+`fixture/AGENTS.md` 应包含一条可辨识的 project guidance，Skill frontmatter 的 name 应为
+`test-writer`。示例会确认二者进入首次 model view，然后使用 scripted responses 驱动
+Skill 文件读取、Todo 更新和源码读取。
+
+<details>
+<summary>展开完整代码：<code>stage-09-coding-agent.ts</code></summary>
+
+```ts
+import { join, resolve } from "node:path";
+
+import { defineCodingAgent } from "@/coding/agents/coding-agent";
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models/model-provider";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+
+class RecordingScriptedProvider implements ModelProvider {
+  readonly requests: ModelProviderInvokeParams[] = [];
+  private readonly _provider: ScriptedModelProvider;
+
+  constructor(responses: AssistantMessage[]) {
+    this._provider = new ScriptedModelProvider({ responses });
+  }
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    this.requests.push(params);
+    return this._provider.invoke(params);
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    this.requests.push(params);
+    yield* this._provider.stream(params);
+  }
+}
+
+const responses: AssistantMessage[] = [
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "skill-1",
+        name: "read_file",
+        input: {
+          description: "load the selected test-writer Skill",
+          path: ".agents/skills/test-writer/SKILL.md",
+        },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "todo-1",
+        name: "todo_write",
+        input: {
+          description: "track fixture inspection",
+          merge: false,
+          items: [{ id: "inspect", text: "Inspect src/math.ts", status: "in_progress" }],
+        },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "read-1",
+        name: "read_file",
+        input: { description: "inspect the fixture source", path: "src/math.ts" },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [{ type: "text", text: "Loaded project guidance, Skill, Todo, and source." }],
+  },
+];
+
+async function main(): Promise<void> {
+  const fixtureArgument = Bun.argv[2];
+  if (!fixtureArgument) {
+    console.log("Usage: bun run examples/stage-09-coding-agent.ts <fixture-workspace>");
+    return;
+  }
+
+  const cwd = resolve(fixtureArgument);
+  const requiredFiles = [
+    "AGENTS.md",
+    ".agents/skills/test-writer/SKILL.md",
+    "src/math.ts",
+  ];
+  for (const path of requiredFiles) {
+    if (!(await Bun.file(join(cwd, path)).exists())) {
+      throw new Error(`Missing fixture file: ${join(cwd, path)}`);
+    }
+  }
+
+  const provider = new RecordingScriptedProvider(responses);
+  const agent = await defineCodingAgent({
+    model: new Model({ name: "scripted", provider }),
+    cwd,
+    skillsDirs: [join(cwd, ".agents", "skills")],
+    askUserQuestion: async ({ question }) => ({ answer: `fixture answer: ${question}` }),
+  });
+  const userMessage: UserMessage = {
+    role: "user",
+    content: [{ type: "text", text: "Inspect the fixture using the test-writing guidance." }],
+  };
+
+  for await (const event of agent.stream(userMessage)) {
+    if (event.type === "message") console.log(JSON.stringify(event.message));
+  }
+
+  const guidance = (await Bun.file(join(cwd, "AGENTS.md")).text()).trim();
+  const firstModelView = JSON.stringify(provider.requests[0]?.messages ?? []);
+  if (!firstModelView.includes("test-writer") || !firstModelView.includes(guidance)) {
+    throw new Error("Project guidance or Skill metadata was not included in the first model view");
+  }
+
+  console.log(JSON.stringify(agent.messages, null, 2));
+  console.log("[offline] completed with ScriptedModelProvider; no API request was made");
+}
+
+await main();
+```
+
+</details>
+
+运行：
+
+```bash
+bun run examples/stage-09-coding-agent.ts fixture
+```
+
+使用 scripted provider 完成一次“读取 guidance → 列出 Skill → 加载 Skill → 建 Todo → 读取文件 → 最终回答”的 run。输出 transcript，并断言没有真实 API。
 
 ### 9.6 完整测试
 
@@ -1701,158 +1868,11 @@ describe("defineCodingAgent", () => {
 
 </details>
 
-### 运行与观察
-
-准备 fixture workspace：
-
-```text
-fixture/
-├── AGENTS.md
-├── .agents/skills/test-writer/SKILL.md
-└── src/math.ts
-```
-
-目标文件：`examples/stage-09-coding-agent.ts`
-
-`fixture/AGENTS.md` 应包含一条可辨识的 project guidance，Skill frontmatter 的 name 应为
-`test-writer`。示例会确认二者进入首次 model view，然后使用 scripted responses 驱动
-Skill 文件读取、Todo 更新和源码读取。
-
-<details>
-<summary>展开完整代码：<code>stage-09-coding-agent.ts</code></summary>
-
-```ts
-import { join, resolve } from "node:path";
-
-import { defineCodingAgent } from "@/coding/agents/coding-agent";
-import type { AssistantMessage, UserMessage } from "@/foundation/messages";
-import { Model } from "@/foundation/models/model";
-import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models/model-provider";
-import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
-
-class RecordingScriptedProvider implements ModelProvider {
-  readonly requests: ModelProviderInvokeParams[] = [];
-  private readonly _provider: ScriptedModelProvider;
-
-  constructor(responses: AssistantMessage[]) {
-    this._provider = new ScriptedModelProvider({ responses });
-  }
-
-  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
-    this.requests.push(params);
-    return this._provider.invoke(params);
-  }
-
-  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
-    this.requests.push(params);
-    yield* this._provider.stream(params);
-  }
-}
-
-const responses: AssistantMessage[] = [
-  {
-    role: "assistant",
-    content: [
-      {
-        type: "tool_use",
-        id: "skill-1",
-        name: "read_file",
-        input: {
-          description: "load the selected test-writer Skill",
-          path: ".agents/skills/test-writer/SKILL.md",
-        },
-      },
-    ],
-  },
-  {
-    role: "assistant",
-    content: [
-      {
-        type: "tool_use",
-        id: "todo-1",
-        name: "todo_write",
-        input: {
-          description: "track fixture inspection",
-          merge: false,
-          items: [{ id: "inspect", text: "Inspect src/math.ts", status: "in_progress" }],
-        },
-      },
-    ],
-  },
-  {
-    role: "assistant",
-    content: [
-      {
-        type: "tool_use",
-        id: "read-1",
-        name: "read_file",
-        input: { description: "inspect the fixture source", path: "src/math.ts" },
-      },
-    ],
-  },
-  {
-    role: "assistant",
-    content: [{ type: "text", text: "Loaded project guidance, Skill, Todo, and source." }],
-  },
-];
-
-async function main(): Promise<void> {
-  const fixtureArgument = Bun.argv[2];
-  if (!fixtureArgument) {
-    console.log("Usage: bun run examples/stage-09-coding-agent.ts <fixture-workspace>");
-    return;
-  }
-
-  const cwd = resolve(fixtureArgument);
-  const requiredFiles = [
-    "AGENTS.md",
-    ".agents/skills/test-writer/SKILL.md",
-    "src/math.ts",
-  ];
-  for (const path of requiredFiles) {
-    if (!(await Bun.file(join(cwd, path)).exists())) {
-      throw new Error(`Missing fixture file: ${join(cwd, path)}`);
-    }
-  }
-
-  const provider = new RecordingScriptedProvider(responses);
-  const agent = await defineCodingAgent({
-    model: new Model({ name: "scripted", provider }),
-    cwd,
-    skillsDirs: [join(cwd, ".agents", "skills")],
-    askUserQuestion: async ({ question }) => ({ answer: `fixture answer: ${question}` }),
-  });
-  const userMessage: UserMessage = {
-    role: "user",
-    content: [{ type: "text", text: "Inspect the fixture using the test-writing guidance." }],
-  };
-
-  for await (const event of agent.stream(userMessage)) {
-    if (event.type === "message") console.log(JSON.stringify(event.message));
-  }
-
-  const guidance = (await Bun.file(join(cwd, "AGENTS.md")).text()).trim();
-  const firstModelView = JSON.stringify(provider.requests[0]?.messages ?? []);
-  if (!firstModelView.includes("test-writer") || !firstModelView.includes(guidance)) {
-    throw new Error("Project guidance or Skill metadata was not included in the first model view");
-  }
-
-  console.log(JSON.stringify(agent.messages, null, 2));
-  console.log("[offline] completed with ScriptedModelProvider; no API request was made");
-}
-
-await main();
-```
-
-</details>
-
-运行：
+最后执行本阶段的完整测试：
 
 ```bash
-bun run examples/stage-09-coding-agent.ts fixture
+bun test src/agent/skills src/agent/todos src/coding/agents src/coding/tools/__tests__/ask-user-question.test.ts
 ```
-
-使用 scripted provider 完成一次“读取 guidance → 列出 Skill → 加载 Skill → 建 Todo → 读取文件 → 最终回答”的 run。输出 transcript，并断言没有真实 API。
 
 ### 阶段后对照
 
@@ -2391,6 +2411,12 @@ describe("TUI state", () => {
 ```
 
 </details>
+
+最后执行本阶段的完整测试：
+
+```bash
+bun test src/cli src/coding/permissions
+```
 
 ### 阶段后对照
 

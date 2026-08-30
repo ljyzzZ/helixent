@@ -394,6 +394,12 @@ describe("Agent", () => {
 
 未知 Tool 和普通 Tool failure 应反馈给模型，让模型有机会修正。只有 runtime invariant 被破坏、用户中止或达到上限时，Agent run 才整体失败。
 
+最后执行本阶段的完整测试：
+
+```bash
+bun test src/agent/__tests__/agent.test.ts
+```
+
 ### 阶段后对照
 
 - `src/agent/agent.ts` 的 `stream()`、`_think()`、`_act()`；
@@ -960,6 +966,12 @@ describe("Agent streaming runtime", () => {
 
 时间测试不要断言精确毫秒。用足够大的快慢差并设置宽松上限，减少 CI 抖动。
 
+最后执行本阶段的完整测试：
+
+```bash
+bun test src/agent/__tests__/agent-streaming.test.ts
+```
+
 ### 阶段后对照
 
 - `src/agent/agent.ts` 中 `AbortController` 和 `Promise.race`；
@@ -1403,6 +1415,12 @@ describe("Agent middleware", () => {
 
 这里固定的标准语义是：Tool throw 先被规范化，再调用 `afterToolUse`；`afterAgentRun`
 在外层 `finally` 中调用一次。若你选择不同语义，必须同时修改说明和完整测试。
+
+最后执行本阶段的完整测试：
+
+```bash
+bun test src/agent/__tests__/middleware.test.ts
+```
 
 ### 阶段后对照
 

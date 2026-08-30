@@ -304,7 +304,114 @@ RUN 8cf... model=... status=completed wall=1832ms
 TOTAL tokens=2032 model=1786ms tools=12ms approval=0ms
 ```
 
-### 11.7 完整测试
+### 11.7 Trace 示例
+
+目标文件：`examples/stage-11-trace.ts`
+
+示例运行一次离线 Tool loop，把 trace 保存到当前 workspace 的 `.harness/runs/`，随后
+重新读取 JSONL 并从事件计算指标。使用唯一 run id，重复运行不会覆盖旧记录。
+
+<details>
+<summary>展开完整代码：<code>stage-11-trace.ts</code></summary>
+
+```ts
+import { join } from "node:path";
+
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+import { defineTool } from "@/foundation/tools/function-tool";
+import { JsonlTraceStore } from "@/runtime/trace/jsonl-trace-store";
+import { reduceRunMetrics } from "@/runtime/trace/metrics";
+import { createTraceRedactor } from "@/runtime/trace/redactor";
+
+const runId = `stage-11-${Date.now()}`;
+const cwd = process.cwd();
+const traceStore = new JsonlTraceStore({
+  rootDir: cwd,
+  redactor: createTraceRedactor({ maxStringCharacters: 2_000 }),
+});
+const responses: AssistantMessage[] = [
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "inspect-1",
+        name: "inspect_fixture",
+        input: { description: "inspect deterministic fixture" },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [{ type: "text", text: "fixture inspected" }],
+    usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 },
+  },
+];
+const inspectTool = defineTool({
+  name: "inspect_fixture",
+  description: "Inspect a deterministic in-memory fixture",
+  parameters: z.object({ description: z.string() }),
+  invoke: async () => ({ files: 1, status: "clean" }),
+});
+const runtime = {
+  clock: {
+    now: () => new Date(),
+    monotonicMs: () => performance.now(),
+  },
+  idGenerator: { next: () => runId },
+  traceSink: traceStore,
+};
+const agent = new Agent({
+  model: new Model({
+    name: "scripted",
+    provider: new ScriptedModelProvider({ responses }),
+  }),
+  prompt: "Inspect the fixture, then answer.",
+  tools: [inspectTool],
+  runtime,
+});
+const userMessage: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "inspect" }],
+};
+
+for await (const _event of agent.stream(userMessage)) {
+  // Trace 由 runtime sink 在关键边界记录。
+}
+
+const events = await traceStore.read(runId);
+for (const event of events) {
+  console.log(`${event.sequence}\t${event.type}\t${event.timestamp}`);
+}
+
+console.log(JSON.stringify(reduceRunMetrics(events), null, 2));
+console.log(`trace=${join(cwd, ".harness", "runs", runId, "trace.jsonl")}`);
+```
+
+</details>
+
+运行后可直接用阶段 11 CLI 查看同一个 run：
+
+```bash
+bun run examples/stage-11-trace.ts
+harness-lab trace list
+```
+
+### 故障注入
+
+让 TraceSink 在第 N 次 append 时抛错，并明确你的策略：
+
+- 默认建议 tracing failure 不终止 Agent，但向 stderr 发 warning；
+- 若开启 compliance mode，可选择 fail closed。
+
+把策略写入配置和 ADR，不能静默丢失。
+
+### 11.8 完整测试
 
 目标文件：`src/runtime/trace/__tests__/jsonl-trace-store.test.ts`
 
@@ -623,112 +730,11 @@ describe("Agent runtime trace", () => {
 
 </details>
 
-### 11.8 Trace 示例
-
-目标文件：`examples/stage-11-trace.ts`
-
-示例运行一次离线 Tool loop，把 trace 保存到当前 workspace 的 `.harness/runs/`，随后
-重新读取 JSONL 并从事件计算指标。使用唯一 run id，重复运行不会覆盖旧记录。
-
-<details>
-<summary>展开完整代码：<code>stage-11-trace.ts</code></summary>
-
-```ts
-import { join } from "node:path";
-
-import { z } from "zod";
-
-import { Agent } from "@/agent/agent";
-import type { AssistantMessage, UserMessage } from "@/foundation/messages";
-import { Model } from "@/foundation/models/model";
-import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
-import { defineTool } from "@/foundation/tools/function-tool";
-import { JsonlTraceStore } from "@/runtime/trace/jsonl-trace-store";
-import { reduceRunMetrics } from "@/runtime/trace/metrics";
-import { createTraceRedactor } from "@/runtime/trace/redactor";
-
-const runId = `stage-11-${Date.now()}`;
-const cwd = process.cwd();
-const traceStore = new JsonlTraceStore({
-  rootDir: cwd,
-  redactor: createTraceRedactor({ maxStringCharacters: 2_000 }),
-});
-const responses: AssistantMessage[] = [
-  {
-    role: "assistant",
-    content: [
-      {
-        type: "tool_use",
-        id: "inspect-1",
-        name: "inspect_fixture",
-        input: { description: "inspect deterministic fixture" },
-      },
-    ],
-  },
-  {
-    role: "assistant",
-    content: [{ type: "text", text: "fixture inspected" }],
-    usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 },
-  },
-];
-const inspectTool = defineTool({
-  name: "inspect_fixture",
-  description: "Inspect a deterministic in-memory fixture",
-  parameters: z.object({ description: z.string() }),
-  invoke: async () => ({ files: 1, status: "clean" }),
-});
-const runtime = {
-  clock: {
-    now: () => new Date(),
-    monotonicMs: () => performance.now(),
-  },
-  idGenerator: { next: () => runId },
-  traceSink: traceStore,
-};
-const agent = new Agent({
-  model: new Model({
-    name: "scripted",
-    provider: new ScriptedModelProvider({ responses }),
-  }),
-  prompt: "Inspect the fixture, then answer.",
-  tools: [inspectTool],
-  runtime,
-});
-const userMessage: UserMessage = {
-  role: "user",
-  content: [{ type: "text", text: "inspect" }],
-};
-
-for await (const _event of agent.stream(userMessage)) {
-  // Trace 由 runtime sink 在关键边界记录。
-}
-
-const events = await traceStore.read(runId);
-for (const event of events) {
-  console.log(`${event.sequence}\t${event.type}\t${event.timestamp}`);
-}
-
-console.log(JSON.stringify(reduceRunMetrics(events), null, 2));
-console.log(`trace=${join(cwd, ".harness", "runs", runId, "trace.jsonl")}`);
-```
-
-</details>
-
-运行后可直接用阶段 11 CLI 查看同一个 run：
+最后执行本阶段的完整测试：
 
 ```bash
-bun run examples/stage-11-trace.ts
-harness-lab trace list
+bun test src/runtime/trace
 ```
-
-### 故障注入
-
-让 TraceSink 在第 N 次 append 时抛错，并明确你的策略：
-
-- 默认建议 tracing failure 不终止 Agent，但向 stderr 发 warning；
-- 若开启 compliance mode，可选择 fail closed。
-
-把策略写入配置和 ADR，不能静默丢失。
 
 ### 验收
 
@@ -815,6 +821,22 @@ export interface ToolExecutionRecord {
 ### 12.2 CheckpointStore
 
 目标文件：`src/runtime/checkpoint/checkpoint-store.ts` 和 `file-checkpoint-store.ts`
+
+故障注入契约放在 `src/runtime/checkpoint/fault-injector.ts`：
+
+```ts
+export interface FaultInjector {
+  hit(point:
+    | "after_model"
+    | "before_tool"
+    | "after_tool"
+    | "before_checkpoint"
+    | "after_temp_write"
+  ): void;
+}
+```
+
+实现应支持在第 N 次 `hit` 抛出 `InjectedCrashError`，供示例和最终恢复测试注入确定性故障。
 
 ```ts
 export interface CheckpointStore {
@@ -986,23 +1008,116 @@ harness-lab replay <run-id>
 
 `inspect` 展示当前 phase、next step、最后一条 message、pending/unknown Tools、project fingerprint 差异。
 
-### 12.7 完整恢复测试
+### 12.7 Recovery 示例
 
-实现 `FaultInjector`：
+目标文件：`examples/stage-12-recovery.ts`
+
+示例先保存稳定 checkpoint，再在临时文件写完后注入故障，确认旧 checkpoint 仍可读取；
+最后使用内存 trace 演示 replay，不创建 Model 或 Tool。
+
+<details>
+<summary>展开完整代码：<code>stage-12-recovery.ts</code></summary>
 
 ```ts
-export interface FaultInjector {
-  hit(point:
-    | "after_model"
-    | "before_tool"
-    | "after_tool"
-    | "before_checkpoint"
-    | "after_temp_write"
-  ): void;
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { FileCheckpointStore } from "@/runtime/checkpoint/file-checkpoint-store";
+import type { RunState } from "@/runtime/checkpoint/run-state";
+import { replayTrace } from "@/runtime/replay/replay";
+import type { RuntimeTraceEvent } from "@/runtime/trace/events";
+
+function defineState(root: string, nextStep: number): RunState {
+  const timestamp = new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    runId: "stage-12-demo",
+    status: "running",
+    phase: "idle",
+    nextStep,
+    prompt: "recovery demo",
+    messages: [],
+    model: {
+      name: "scripted",
+      provider: "scripted",
+      optionsFingerprint: "model-v1",
+    },
+    cwd: root,
+    projectFingerprint: "fixture-v1",
+    toolExecutions: [],
+    middlewareState: {},
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function messageEvent(sequence: number, text: string): RuntimeTraceEvent {
+  return {
+    schemaVersion: 1,
+    runId: "stage-12-demo",
+    sequence,
+    timestamp: `2026-01-01T00:00:00.00${sequence}Z`,
+    type: "message_appended",
+    payload: {
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    },
+  };
+}
+
+const root = await mkdtemp(join(tmpdir(), "harness-recovery-demo-"));
+
+try {
+  const stableStore = new FileCheckpointStore({ rootDir: root });
+  await stableStore.save(defineState(root, 1));
+  console.log("saved nextStep=1");
+
+  const crashingStore = new FileCheckpointStore({
+    rootDir: root,
+    faultInjector: {
+      hit: (point) => {
+        if (point === "after_temp_write") throw new Error("injected crash");
+      },
+    },
+  });
+
+  try {
+    await crashingStore.save(defineState(root, 2));
+  } catch (error) {
+    console.log(`crash=${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const recovered = await stableStore.load("stage-12-demo");
+  console.log(`recovered nextStep=${recovered.nextStep}`);
+  if (recovered.nextStep !== 1) throw new Error("Atomic checkpoint guarantee was violated");
+
+  await replayTrace({
+    events: [messageEvent(2, "second"), messageEvent(1, "first")],
+    noDelay: true,
+    onEvent: (event) => {
+      if (event.type !== "message_appended") return;
+      const text = event.payload.message.content
+        .map((item) => (item.type === "text" ? item.text : ""))
+        .join("");
+      console.log(`replay sequence=${event.sequence} text=${text}`);
+    },
+  });
+} finally {
+  await rm(root, { recursive: true, force: true });
 }
 ```
 
-在第 N 次 hit 抛出 `InjectedCrashError`。目标文件：
+</details>
+
+运行：
+
+```bash
+bun run examples/stage-12-recovery.ts
+```
+
+### 12.8 完整恢复测试
+
+目标文件：
 `src/runtime/checkpoint/__tests__/file-checkpoint-store.test.ts`
 
 <details>
@@ -1246,111 +1361,10 @@ describe("replayTrace", () => {
 三个完整文件固定了最容易被实现错误破坏的自动化不变量：原子保存、unknown 分类、成功
 动作不重访、完成态拒绝和 replay 只读。
 
-### 12.8 Recovery 示例
-
-目标文件：`examples/stage-12-recovery.ts`
-
-示例先保存稳定 checkpoint，再在临时文件写完后注入故障，确认旧 checkpoint 仍可读取；
-最后使用内存 trace 演示 replay，不创建 Model 或 Tool。
-
-<details>
-<summary>展开完整代码：<code>stage-12-recovery.ts</code></summary>
-
-```ts
-import { mkdtemp, rm } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-
-import { FileCheckpointStore } from "@/runtime/checkpoint/file-checkpoint-store";
-import type { RunState } from "@/runtime/checkpoint/run-state";
-import { replayTrace } from "@/runtime/replay/replay";
-import type { RuntimeTraceEvent } from "@/runtime/trace/events";
-
-function defineState(root: string, nextStep: number): RunState {
-  const timestamp = new Date().toISOString();
-  return {
-    schemaVersion: 1,
-    runId: "stage-12-demo",
-    status: "running",
-    phase: "idle",
-    nextStep,
-    prompt: "recovery demo",
-    messages: [],
-    model: {
-      name: "scripted",
-      provider: "scripted",
-      optionsFingerprint: "model-v1",
-    },
-    cwd: root,
-    projectFingerprint: "fixture-v1",
-    toolExecutions: [],
-    middlewareState: {},
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-}
-
-function messageEvent(sequence: number, text: string): RuntimeTraceEvent {
-  return {
-    schemaVersion: 1,
-    runId: "stage-12-demo",
-    sequence,
-    timestamp: `2026-01-01T00:00:00.00${sequence}Z`,
-    type: "message_appended",
-    payload: {
-      message: { role: "assistant", content: [{ type: "text", text }] },
-    },
-  };
-}
-
-const root = await mkdtemp(join(tmpdir(), "harness-recovery-demo-"));
-
-try {
-  const stableStore = new FileCheckpointStore({ rootDir: root });
-  await stableStore.save(defineState(root, 1));
-  console.log("saved nextStep=1");
-
-  const crashingStore = new FileCheckpointStore({
-    rootDir: root,
-    faultInjector: {
-      hit: (point) => {
-        if (point === "after_temp_write") throw new Error("injected crash");
-      },
-    },
-  });
-
-  try {
-    await crashingStore.save(defineState(root, 2));
-  } catch (error) {
-    console.log(`crash=${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  const recovered = await stableStore.load("stage-12-demo");
-  console.log(`recovered nextStep=${recovered.nextStep}`);
-  if (recovered.nextStep !== 1) throw new Error("Atomic checkpoint guarantee was violated");
-
-  await replayTrace({
-    events: [messageEvent(2, "second"), messageEvent(1, "first")],
-    noDelay: true,
-    onEvent: (event) => {
-      if (event.type !== "message_appended") return;
-      const text = event.payload.message.content
-        .map((item) => (item.type === "text" ? item.text : ""))
-        .join("");
-      console.log(`replay sequence=${event.sequence} text=${text}`);
-    },
-  });
-} finally {
-  await rm(root, { recursive: true, force: true });
-}
-```
-
-</details>
-
-运行：
+最后执行本阶段的完整测试：
 
 ```bash
-bun run examples/stage-12-recovery.ts
+bun test src/runtime/checkpoint src/runtime/replay
 ```
 
 ### 验收
@@ -1518,128 +1532,7 @@ Summary 使用明确边界：
 
 Summary 不应伪装成新的用户指令。保留最新用户消息、尚未解决的约束和最近 Tool exchange 原文。
 
-### 13.5 完整 Context 测试
-
-目标文件：`src/runtime/context/__tests__/context-manager.test.ts`
-
-<details>
-<summary>展开完整代码：<code>context-manager.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import type { NonSystemMessage } from "@/foundation/messages";
-
-import { ContextManager } from "../context-manager";
-import { validateToolCallPairs } from "../message-groups";
-
-const estimator = {
-  estimateText: (text: string) => text.length,
-  estimateMessages: (messages: unknown[]) => JSON.stringify(messages).length,
-  estimateTools: (tools: unknown[]) => JSON.stringify(tools).length,
-};
-const budget = {
-  maxInputTokens: 260,
-  reservedOutputTokens: 20,
-  safetyMarginTokens: 20,
-};
-
-function transcript(): NonSystemMessage[] {
-  return [
-    { role: "user", content: [{ type: "text", text: "old request ".repeat(8) }] },
-    {
-      role: "assistant",
-      content: [
-        { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
-        { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
-      ],
-    },
-    {
-      role: "tool",
-      content: [
-        { type: "tool_result", tool_use_id: "a", content: "A" },
-        { type: "tool_result", tool_use_id: "b", content: "B" },
-      ],
-    },
-    { role: "user", content: [{ type: "text", text: "latest constraint" }] },
-  ];
-}
-
-describe("ContextManager", () => {
-  test("returns equivalent content without mutating input when already in budget", async () => {
-    const messages: NonSystemMessage[] = [
-      { role: "user", content: [{ type: "text", text: "small" }] },
-    ];
-    const source = structuredClone(messages);
-    const manager = new ContextManager({
-      estimator,
-      summarizer: { summarize: async () => "unused" },
-    });
-
-    const prepared = await manager.prepare({ messages, prompt: "p", tools: [], budget });
-    expect(prepared.messages).toEqual(source);
-    expect(messages).toEqual(source);
-    expect(prepared.stats.summarizedGroups).toBe(0);
-  });
-
-  test("compacts atomic tool exchanges and keeps the latest user constraint", async () => {
-    const messages = transcript();
-    const source = structuredClone(messages);
-    const manager = new ContextManager({
-      estimator,
-      summarizer: { summarize: async () => "older work summarized" },
-    });
-
-    const prepared = await manager.prepare({ messages, prompt: "p", tools: [], budget });
-    expect(prepared.stats.preparedTokens).toBeLessThanOrEqual(220);
-    expect(JSON.stringify(prepared.messages)).toContain("latest constraint");
-    expect(validateToolCallPairs(prepared.messages)).toEqual({
-      ok: true,
-      orphanToolUseIds: [],
-      orphanToolResultIds: [],
-    });
-    expect(messages).toEqual(source);
-  });
-
-  test("uses deterministic fallback when summarization fails", async () => {
-    const manager = new ContextManager({
-      estimator,
-      summarizer: { summarize: async () => { throw new Error("summary failed"); } },
-    });
-
-    const first = await manager.prepare({ messages: transcript(), prompt: "p", tools: [], budget });
-    const second = await manager.prepare({ messages: transcript(), prompt: "p", tools: [], budget });
-    expect(first).toEqual(second);
-    expect(first.stats.preparedTokens).toBeLessThanOrEqual(220);
-  });
-
-  test("propagates abort while the summarizer is running", async () => {
-    const controller = new AbortController();
-    const manager = new ContextManager({
-      estimator,
-      summarizer: {
-        summarize: async (_groups, signal) => {
-          controller.abort();
-          signal?.throwIfAborted();
-          return "unreachable";
-        },
-      },
-    });
-
-    await expect(manager.prepare({
-      messages: transcript(), prompt: "p", tools: [], budget, signal: controller.signal,
-    })).rejects.toBeDefined();
-  });
-});
-```
-
-</details>
-
-示例输入是 `transcript()`；参数规则中的有效消息预算为 `260 - 20 - 20 = 220`，还要再
-扣除 prompt 和 Tool schema 固定成本。示例断言不依赖某个 provider tokenizer，只依赖注入
-的 deterministic estimator。
-
-### 13.6 Model retry
+### 13.5 Model retry
 
 目标文件：`src/runtime/reliability/resilient-model-provider.ts`
 
@@ -1698,7 +1591,7 @@ delay = min(maxDelay, baseDelay * 2^(attempt-1)) + jitter
 
 等待必须可被 `AbortSignal` 中止。测试注入 fake sleeper，不能真的 sleep 数秒。
 
-### 13.7 Tool timeout 和 idempotency
+### 13.6 Tool timeout 和 idempotency
 
 给 Tool metadata 增加：
 
@@ -1734,7 +1627,7 @@ export async function invokeToolWithTimeout<T>(options: {
 }
 ```
 
-### 13.8 PolicyEngine
+### 13.7 PolicyEngine
 
 把阶段 10 的 Tool-name allowlist 升级为：
 
@@ -1791,212 +1684,6 @@ export class DefaultPolicyEngine implements PolicyEngine {
 - unknown 输入默认 ask 或 deny。
 
 不要尝试用几条正则“证明任意 shell command 安全”。复杂 shell 的静态分析不可靠；无法分类时请求审批。
-
-### 13.9 完整可靠性与 Policy 测试
-
-目标文件：`src/runtime/reliability/__tests__/resilient-model-provider.test.ts`
-
-<details>
-<summary>展开完整代码：<code>resilient-model-provider.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import type { AssistantMessage } from "@/foundation/messages";
-
-import { ResilientModelProvider } from "../resilient-model-provider";
-
-const FINAL: AssistantMessage = {
-  role: "assistant",
-  content: [{ type: "text", text: "done" }],
-};
-const params = { model: "test", messages: [] };
-
-function provider(failures: unknown[]) {
-  let calls = 0;
-  return {
-    calls: () => calls,
-    invoke: async () => {
-      const failure = failures[calls++];
-      if (failure) throw failure;
-      return FINAL;
-    },
-    stream: async function* () {
-      const failure = failures[calls++];
-      if (failure) throw failure;
-      yield FINAL;
-    },
-  };
-}
-
-const policy = {
-  maxAttempts: 3,
-  baseDelayMs: 10,
-  maxDelayMs: 100,
-  classify: (error: unknown) => {
-    if (error instanceof DOMException && error.name === "AbortError") return "aborted" as const;
-    return error instanceof Error && error.message === "transient"
-      ? "transient" as const
-      : "permanent" as const;
-  },
-};
-
-describe("ResilientModelProvider", () => {
-  test("retries only transient errors with deterministic backoff", async () => {
-    const inner = provider([new Error("transient"), new Error("transient")]);
-    const delays: number[] = [];
-    const resilient = new ResilientModelProvider({
-      provider: inner,
-      policy,
-      sleeper: async (delayMs) => void delays.push(delayMs),
-      jitter: () => 0,
-    });
-
-    expect(await resilient.invoke(params)).toEqual(FINAL);
-    expect(inner.calls()).toBe(3);
-    expect(delays).toEqual([10, 20]);
-  });
-
-  test("does not retry permanent errors", async () => {
-    const inner = provider([new Error("permanent")]);
-    const resilient = new ResilientModelProvider({
-      provider: inner,
-      policy,
-      sleeper: async () => undefined,
-      jitter: () => 0,
-    });
-
-    await expect(resilient.invoke(params)).rejects.toThrow("permanent");
-    expect(inner.calls()).toBe(1);
-  });
-
-  test("aborts during backoff without starting another attempt", async () => {
-    const inner = provider([new Error("transient")]);
-    const controller = new AbortController();
-    const resilient = new ResilientModelProvider({
-      provider: inner,
-      policy,
-      sleeper: async (_delayMs, signal) => {
-        controller.abort();
-        signal?.throwIfAborted();
-      },
-      jitter: () => 0,
-    });
-
-    await expect(resilient.invoke({ ...params, signal: controller.signal })).rejects.toBeDefined();
-    expect(inner.calls()).toBe(1);
-  });
-});
-```
-
-</details>
-
-目标文件：`src/runtime/policy/__tests__/policy-engine.test.ts`
-
-<details>
-<summary>展开完整代码：<code>policy-engine.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import { DefaultPolicyEngine } from "../policy-engine";
-
-const workspace = "/workspace/project";
-const engine = new DefaultPolicyEngine({
-  workspace,
-  commandPrefixRules: [["bun", "test"], ["git", "status"]],
-});
-
-function input(name: string, toolInput: Record<string, unknown>, effect: string) {
-  return {
-    cwd: workspace,
-    toolUse: { type: "tool_use", id: "call-1", name, input: toolInput },
-    metadata: { effect, idempotency: effect === "read" ? "safe" : "unknown", defaultTimeoutMs: 1000 },
-  } as never;
-}
-
-describe("DefaultPolicyEngine", () => {
-  test("allows workspace-local reads", async () => {
-    expect(await engine.evaluate(input("read_file", { path: "src/a.ts" }, "read")))
-      .toMatchObject({ action: "allow" });
-  });
-
-  test("denies paths outside the workspace", async () => {
-    expect(await engine.evaluate(input("read_file", { path: "../secret" }, "read")))
-      .toMatchObject({ action: "deny" });
-  });
-
-  test("allows an exact command prefix and asks for unclassified shell", async () => {
-    expect(await engine.evaluate(input("bash", { command: "bun test src/a.test.ts" }, "process")))
-      .toMatchObject({ action: "allow" });
-    expect(await engine.evaluate(input("bash", { command: "curl https://example.test" }, "network")))
-      .toMatchObject({ action: "ask" });
-  });
-
-  test("returns a non-empty reason for every decision", async () => {
-    const decision = await engine.evaluate(input("write_file", { path: "a.ts" }, "write"));
-    expect(decision.reason.length).toBeGreaterThan(0);
-  });
-});
-```
-
-</details>
-
-目标文件：`src/runtime/reliability/__tests__/tool-timeout.test.ts`
-
-<details>
-<summary>展开完整代码：<code>tool-timeout.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import { invokeToolWithTimeout } from "../tool-timeout";
-
-function metadata(effect: "read" | "write" | "process" | "network") {
-  return {
-    effect,
-    idempotency: effect === "read" ? "safe" as const : "unknown" as const,
-    defaultTimeoutMs: 5,
-  };
-}
-
-describe("invokeToolWithTimeout", () => {
-  test("returns a successful value", async () => {
-    expect(await invokeToolWithTimeout({
-      invoke: async () => "ok",
-      metadata: metadata("read"),
-    })).toEqual({ status: "succeeded", value: "ok" });
-  });
-
-  test("distinguishes a safe read timeout from an unknown write effect", async () => {
-    const never = (signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    });
-
-    expect(await invokeToolWithTimeout({ invoke: never, metadata: metadata("read") }))
-      .toMatchObject({ status: "timed_out" });
-    expect(await invokeToolWithTimeout({ invoke: never, metadata: metadata("write") }))
-      .toMatchObject({ status: "unknown" });
-  });
-
-  test("keeps a caller abort distinct from timeout", async () => {
-    const controller = new AbortController();
-    controller.abort(new DOMException("user abort", "AbortError"));
-    expect(await invokeToolWithTimeout({
-      invoke: async (signal) => {
-        signal.throwIfAborted();
-        return "unreachable";
-      },
-      metadata: metadata("process"),
-      signal: controller.signal,
-    })).toMatchObject({ status: "aborted" });
-  });
-});
-```
-
-</details>
-
-Model retry 与 Tool timeout 使用不同测试文件，避免混淆网络请求重试和外部副作用恢复。
 
 目标文件：`examples/stage-13-context.ts`
 
@@ -2219,6 +1906,341 @@ bun run examples/stage-13-retry.ts --fail-first 2
 ```
 
 应显示 attempt、error class、backoff 和最终成功；abort 时不得继续下一次 attempt。
+
+### 13.8 完整测试
+
+#### ContextManager
+
+目标文件：`src/runtime/context/__tests__/context-manager.test.ts`
+
+<details>
+<summary>展开完整代码：<code>context-manager.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { NonSystemMessage } from "@/foundation/messages";
+
+import { ContextManager } from "../context-manager";
+import { validateToolCallPairs } from "../message-groups";
+
+const estimator = {
+  estimateText: (text: string) => text.length,
+  estimateMessages: (messages: unknown[]) => JSON.stringify(messages).length,
+  estimateTools: (tools: unknown[]) => JSON.stringify(tools).length,
+};
+const budget = {
+  maxInputTokens: 260,
+  reservedOutputTokens: 20,
+  safetyMarginTokens: 20,
+};
+
+function transcript(): NonSystemMessage[] {
+  return [
+    { role: "user", content: [{ type: "text", text: "old request ".repeat(8) }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+        { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+      ],
+    },
+    {
+      role: "tool",
+      content: [
+        { type: "tool_result", tool_use_id: "a", content: "A" },
+        { type: "tool_result", tool_use_id: "b", content: "B" },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "latest constraint" }] },
+  ];
+}
+
+describe("ContextManager", () => {
+  test("returns equivalent content without mutating input when already in budget", async () => {
+    const messages: NonSystemMessage[] = [
+      { role: "user", content: [{ type: "text", text: "small" }] },
+    ];
+    const source = structuredClone(messages);
+    const manager = new ContextManager({
+      estimator,
+      summarizer: { summarize: async () => "unused" },
+    });
+
+    const prepared = await manager.prepare({ messages, prompt: "p", tools: [], budget });
+    expect(prepared.messages).toEqual(source);
+    expect(messages).toEqual(source);
+    expect(prepared.stats.summarizedGroups).toBe(0);
+  });
+
+  test("compacts atomic tool exchanges and keeps the latest user constraint", async () => {
+    const messages = transcript();
+    const source = structuredClone(messages);
+    const manager = new ContextManager({
+      estimator,
+      summarizer: { summarize: async () => "older work summarized" },
+    });
+
+    const prepared = await manager.prepare({ messages, prompt: "p", tools: [], budget });
+    expect(prepared.stats.preparedTokens).toBeLessThanOrEqual(220);
+    expect(JSON.stringify(prepared.messages)).toContain("latest constraint");
+    expect(validateToolCallPairs(prepared.messages)).toEqual({
+      ok: true,
+      orphanToolUseIds: [],
+      orphanToolResultIds: [],
+    });
+    expect(messages).toEqual(source);
+  });
+
+  test("uses deterministic fallback when summarization fails", async () => {
+    const manager = new ContextManager({
+      estimator,
+      summarizer: { summarize: async () => { throw new Error("summary failed"); } },
+    });
+
+    const first = await manager.prepare({ messages: transcript(), prompt: "p", tools: [], budget });
+    const second = await manager.prepare({ messages: transcript(), prompt: "p", tools: [], budget });
+    expect(first).toEqual(second);
+    expect(first.stats.preparedTokens).toBeLessThanOrEqual(220);
+  });
+
+  test("propagates abort while the summarizer is running", async () => {
+    const controller = new AbortController();
+    const manager = new ContextManager({
+      estimator,
+      summarizer: {
+        summarize: async (_groups, signal) => {
+          controller.abort();
+          signal?.throwIfAborted();
+          return "unreachable";
+        },
+      },
+    });
+
+    await expect(manager.prepare({
+      messages: transcript(), prompt: "p", tools: [], budget, signal: controller.signal,
+    })).rejects.toBeDefined();
+  });
+});
+```
+
+</details>
+
+示例输入是 `transcript()`；参数规则中的有效消息预算为 `260 - 20 - 20 = 220`，还要再
+扣除 prompt 和 Tool schema 固定成本。示例断言不依赖某个 provider tokenizer，只依赖注入
+的 deterministic estimator。
+
+#### 可靠性与 Policy
+
+目标文件：`src/runtime/reliability/__tests__/resilient-model-provider.test.ts`
+
+<details>
+<summary>展开完整代码：<code>resilient-model-provider.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { AssistantMessage } from "@/foundation/messages";
+
+import { ResilientModelProvider } from "../resilient-model-provider";
+
+const FINAL: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "done" }],
+};
+const params = { model: "test", messages: [] };
+
+function provider(failures: unknown[]) {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    invoke: async () => {
+      const failure = failures[calls++];
+      if (failure) throw failure;
+      return FINAL;
+    },
+    stream: async function* () {
+      const failure = failures[calls++];
+      if (failure) throw failure;
+      yield FINAL;
+    },
+  };
+}
+
+const policy = {
+  maxAttempts: 3,
+  baseDelayMs: 10,
+  maxDelayMs: 100,
+  classify: (error: unknown) => {
+    if (error instanceof DOMException && error.name === "AbortError") return "aborted" as const;
+    return error instanceof Error && error.message === "transient"
+      ? "transient" as const
+      : "permanent" as const;
+  },
+};
+
+describe("ResilientModelProvider", () => {
+  test("retries only transient errors with deterministic backoff", async () => {
+    const inner = provider([new Error("transient"), new Error("transient")]);
+    const delays: number[] = [];
+    const resilient = new ResilientModelProvider({
+      provider: inner,
+      policy,
+      sleeper: async (delayMs) => void delays.push(delayMs),
+      jitter: () => 0,
+    });
+
+    expect(await resilient.invoke(params)).toEqual(FINAL);
+    expect(inner.calls()).toBe(3);
+    expect(delays).toEqual([10, 20]);
+  });
+
+  test("does not retry permanent errors", async () => {
+    const inner = provider([new Error("permanent")]);
+    const resilient = new ResilientModelProvider({
+      provider: inner,
+      policy,
+      sleeper: async () => undefined,
+      jitter: () => 0,
+    });
+
+    await expect(resilient.invoke(params)).rejects.toThrow("permanent");
+    expect(inner.calls()).toBe(1);
+  });
+
+  test("aborts during backoff without starting another attempt", async () => {
+    const inner = provider([new Error("transient")]);
+    const controller = new AbortController();
+    const resilient = new ResilientModelProvider({
+      provider: inner,
+      policy,
+      sleeper: async (_delayMs, signal) => {
+        controller.abort();
+        signal?.throwIfAborted();
+      },
+      jitter: () => 0,
+    });
+
+    await expect(resilient.invoke({ ...params, signal: controller.signal })).rejects.toBeDefined();
+    expect(inner.calls()).toBe(1);
+  });
+});
+```
+
+</details>
+
+目标文件：`src/runtime/policy/__tests__/policy-engine.test.ts`
+
+<details>
+<summary>展开完整代码：<code>policy-engine.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { DefaultPolicyEngine } from "../policy-engine";
+
+const workspace = "/workspace/project";
+const engine = new DefaultPolicyEngine({
+  workspace,
+  commandPrefixRules: [["bun", "test"], ["git", "status"]],
+});
+
+function input(name: string, toolInput: Record<string, unknown>, effect: string) {
+  return {
+    cwd: workspace,
+    toolUse: { type: "tool_use", id: "call-1", name, input: toolInput },
+    metadata: { effect, idempotency: effect === "read" ? "safe" : "unknown", defaultTimeoutMs: 1000 },
+  } as never;
+}
+
+describe("DefaultPolicyEngine", () => {
+  test("allows workspace-local reads", async () => {
+    expect(await engine.evaluate(input("read_file", { path: "src/a.ts" }, "read")))
+      .toMatchObject({ action: "allow" });
+  });
+
+  test("denies paths outside the workspace", async () => {
+    expect(await engine.evaluate(input("read_file", { path: "../secret" }, "read")))
+      .toMatchObject({ action: "deny" });
+  });
+
+  test("allows an exact command prefix and asks for unclassified shell", async () => {
+    expect(await engine.evaluate(input("bash", { command: "bun test src/a.test.ts" }, "process")))
+      .toMatchObject({ action: "allow" });
+    expect(await engine.evaluate(input("bash", { command: "curl https://example.test" }, "network")))
+      .toMatchObject({ action: "ask" });
+  });
+
+  test("returns a non-empty reason for every decision", async () => {
+    const decision = await engine.evaluate(input("write_file", { path: "a.ts" }, "write"));
+    expect(decision.reason.length).toBeGreaterThan(0);
+  });
+});
+```
+
+</details>
+
+目标文件：`src/runtime/reliability/__tests__/tool-timeout.test.ts`
+
+<details>
+<summary>展开完整代码：<code>tool-timeout.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { invokeToolWithTimeout } from "../tool-timeout";
+
+function metadata(effect: "read" | "write" | "process" | "network") {
+  return {
+    effect,
+    idempotency: effect === "read" ? "safe" as const : "unknown" as const,
+    defaultTimeoutMs: 5,
+  };
+}
+
+describe("invokeToolWithTimeout", () => {
+  test("returns a successful value", async () => {
+    expect(await invokeToolWithTimeout({
+      invoke: async () => "ok",
+      metadata: metadata("read"),
+    })).toEqual({ status: "succeeded", value: "ok" });
+  });
+
+  test("distinguishes a safe read timeout from an unknown write effect", async () => {
+    const never = (signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+
+    expect(await invokeToolWithTimeout({ invoke: never, metadata: metadata("read") }))
+      .toMatchObject({ status: "timed_out" });
+    expect(await invokeToolWithTimeout({ invoke: never, metadata: metadata("write") }))
+      .toMatchObject({ status: "unknown" });
+  });
+
+  test("keeps a caller abort distinct from timeout", async () => {
+    const controller = new AbortController();
+    controller.abort(new DOMException("user abort", "AbortError"));
+    expect(await invokeToolWithTimeout({
+      invoke: async (signal) => {
+        signal.throwIfAborted();
+        return "unreachable";
+      },
+      metadata: metadata("process"),
+      signal: controller.signal,
+    })).toMatchObject({ status: "aborted" });
+  });
+});
+```
+
+</details>
+
+Model retry 与 Tool timeout 使用不同测试文件，避免混淆网络请求重试和外部副作用恢复。
+
+最后执行本阶段的完整测试：
+
+```bash
+bun test src/runtime/context src/runtime/reliability src/runtime/policy
+```
 
 ### 验收
 
