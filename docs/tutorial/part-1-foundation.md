@@ -659,8 +659,8 @@ export class ScriptedModelProvider implements ModelProvider {
 
     // TODO 3：每次 yield 都返回完整 AssistantMessage，例如 h、he、hel。
     // TODO 4：最后一次 yield 必须与完整 response 深度相等。
-    // 提示：每次 yield 的返回可以把 partialResponse.content[0]替换成 type 为 "text"、text 为当前累积文本的文本块
-
+    // 提示：每次 yield 时，可以将 partialResponse.content[0] 替换为文本块，
+    // 其中 type 为 "text"，text 为当前累积文本。
   }
 }
 ```
@@ -675,7 +675,22 @@ hell
 hello
 ```
 
-不要产生 `h`、`e`、`l`、`l`、`o` 这种 delta。累计快照让上层 UI 可以无状态替换当前内容，也让不同 provider 的 streaming 行为统一。
+不要产生 `h`、`e`、`l`、`l`、`o` 这种 delta。累计快照让上层 UI 可以无状态
+替换当前内容，也让不同 provider 的 streaming 行为统一。
+
+> **补充理解**
+>
+> 真实网络场景通常使用异步循环，等待模型持续返回事件：
+>
+> ```ts
+> for await (const event of networkStream) {
+>   // 处理模型持续返回的事件
+> }
+> ```
+>
+> 网络读取本身是异步的，天然适合通过 `yield` 产生流式输出。
+> 这里没有真实网络流，因此 `ScriptedModelProvider` 会主动拆分完整 response 的文本块
+> 来模拟这一过程。
 
 ### 2.3 完整测试
 
