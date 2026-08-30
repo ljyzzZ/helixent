@@ -689,8 +689,8 @@ hello
 > ```
 >
 > 网络读取本身是异步的，天然适合通过 `yield` 产生流式输出。
-> 这里没有真实网络流，因此 `ScriptedModelProvider` 会主动拆分完整 response 的文本块
-> 来模拟这一过程。
+> 这里没有真实网络流，因此 `ScriptedModelProvider` 的 `async *stream()` 方法会主动拆分
+> 完整 response 的文本块来模拟这一过程。
 
 ### 2.3 完整测试
 
