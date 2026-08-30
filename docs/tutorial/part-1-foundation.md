@@ -653,10 +653,14 @@ export class ScriptedModelProvider implements ModelProvider {
 
   async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
     // TODO 1：先检查 params.signal，再读取当前 response，且只推进一次 cursor。
+
     // TODO 2：本阶段 fixture 只含一个 text block；按 Unicode code point 逐步累积文本。
+    // 提示：使用 Array.from(text) 避免把 emoji 的 surrogate pair 拆开。
+
     // TODO 3：每次 yield 都返回完整 AssistantMessage，例如 h、he、hel。
     // TODO 4：最后一次 yield 必须与完整 response 深度相等。
-    // 提示：使用 Array.from(text) 避免把 emoji 的 surrogate pair 拆开。
+    // 提示：每次 yield 的返回可以把 partialResponse.content[0]替换成 type 为 "text"、text 为当前累积文本的文本块
+
   }
 }
 ```
