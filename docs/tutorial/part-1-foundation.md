@@ -682,7 +682,8 @@ export class ScriptedModelProvider implements ModelProvider {
   async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
     // TODO 1：先检查 params.signal，再读取当前 response，且只推进一次 cursor。
 
-    // TODO 2：本阶段 fixture 只含一个 text block；按 Unicode code point 逐步累积文本。
+    // TODO 2：response 只含一个 text block 时，按 Unicode code point 逐步累积文本；
+    // 其他 content 组合（例如 tool_use）直接 yield 一次完整 clone，供后续阶段复用。
     // 提示：使用 Array.from(text) 避免把 emoji 的 surrogate pair 拆开。
 
     // TODO 3：每次 yield 都返回完整 AssistantMessage，例如 h、he、hel。
@@ -787,6 +788,28 @@ describe("Model", () => {
   test("stream yields cumulative snapshots", async () => {
     const provider = new ScriptedModelProvider({ responses: [RESPONSE] });
     expect(await collectText(provider)).toEqual(["h", "he", "hel", "hell", "hello"]);
+  });
+
+  test("streams a structured response as one complete snapshot", async () => {
+    const response: AssistantMessage = {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_use",
+          id: "call-1",
+          name: "get_weather",
+          input: { city: "北京" },
+        },
+      ],
+    };
+    const provider = new ScriptedModelProvider({ responses: [response] });
+    const snapshots: AssistantMessage[] = [];
+
+    for await (const snapshot of provider.stream({ model: "scripted", messages: [] })) {
+      snapshots.push(snapshot);
+    }
+
+    expect(snapshots).toEqual([response]);
   });
 
   test("the final stream snapshot equals invoke result", async () => {
@@ -1181,9 +1204,64 @@ describe("ToolRegistry", () => {
 
 </details>
 
+### 3.5 Tool playground
+
+目标文件：`examples/stage-03-tool-playground.ts`
+
+这个 CLI 把命令行中的 Tool name 和 JSON input 交给 `ToolRegistry`。JSON 解析错误同样
+输出 structured error，不打印 stack trace。
+
+<details>
+<summary>展开完整代码：<code>stage-03-tool-playground.ts</code></summary>
+
+```ts
+import { addTool } from "@/foundation/tools/add-tool";
+import { ToolRegistry } from "@/foundation/tools/tool-registry";
+
+function print(value: unknown): void {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+async function main(): Promise<void> {
+  const [toolName, rawInput] = Bun.argv.slice(2);
+
+  if (!toolName || !rawInput) {
+    print({
+      ok: false,
+      code: "INVALID_ARGUMENTS",
+      error: "Usage: bun run examples/stage-03-tool-playground.ts <tool> <json-input>",
+    });
+    process.exitCode = 1;
+    return;
+  }
+
+  let input: unknown;
+  try {
+    input = JSON.parse(rawInput);
+  } catch (error) {
+    print({
+      ok: false,
+      toolName,
+      code: "INVALID_JSON_INPUT",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    process.exitCode = 1;
+    return;
+  }
+
+  const registry = new ToolRegistry({ tools: [addTool] });
+  print(await registry.invoke({ name: toolName, input }));
+}
+
+await main();
+```
+
+</details>
+
 ### 运行与观察
 
 ```bash
+bun test src/foundation/tools/__tests__/tool-registry.test.ts
 bun run examples/stage-03-tool-playground.ts add '{"description":"demo","left":2,"right":3}'
 bun run examples/stage-03-tool-playground.ts add '{"left":2,"right":3}'
 ```

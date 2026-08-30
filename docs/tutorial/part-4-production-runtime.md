@@ -623,6 +623,104 @@ describe("Agent runtime trace", () => {
 
 </details>
 
+### 11.8 Trace 示例
+
+目标文件：`examples/stage-11-trace.ts`
+
+示例运行一次离线 Tool loop，把 trace 保存到当前 workspace 的 `.harness/runs/`，随后
+重新读取 JSONL 并从事件计算指标。使用唯一 run id，重复运行不会覆盖旧记录。
+
+<details>
+<summary>展开完整代码：<code>stage-11-trace.ts</code></summary>
+
+```ts
+import { join } from "node:path";
+
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+import { defineTool } from "@/foundation/tools/function-tool";
+import { JsonlTraceStore } from "@/runtime/trace/jsonl-trace-store";
+import { reduceRunMetrics } from "@/runtime/trace/metrics";
+import { createTraceRedactor } from "@/runtime/trace/redactor";
+
+const runId = `stage-11-${Date.now()}`;
+const cwd = process.cwd();
+const traceStore = new JsonlTraceStore({
+  rootDir: cwd,
+  redactor: createTraceRedactor({ maxStringCharacters: 2_000 }),
+});
+const responses: AssistantMessage[] = [
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "inspect-1",
+        name: "inspect_fixture",
+        input: { description: "inspect deterministic fixture" },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [{ type: "text", text: "fixture inspected" }],
+    usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 },
+  },
+];
+const inspectTool = defineTool({
+  name: "inspect_fixture",
+  description: "Inspect a deterministic in-memory fixture",
+  parameters: z.object({ description: z.string() }),
+  invoke: async () => ({ files: 1, status: "clean" }),
+});
+const runtime = {
+  clock: {
+    now: () => new Date(),
+    monotonicMs: () => performance.now(),
+  },
+  idGenerator: { next: () => runId },
+  traceSink: traceStore,
+};
+const agent = new Agent({
+  model: new Model({
+    name: "scripted",
+    provider: new ScriptedModelProvider({ responses }),
+  }),
+  prompt: "Inspect the fixture, then answer.",
+  tools: [inspectTool],
+  runtime,
+});
+const userMessage: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "inspect" }],
+};
+
+for await (const _event of agent.stream(userMessage)) {
+  // Trace 由 runtime sink 在关键边界记录。
+}
+
+const events = await traceStore.read(runId);
+for (const event of events) {
+  console.log(`${event.sequence}\t${event.type}\t${event.timestamp}`);
+}
+
+console.log(JSON.stringify(reduceRunMetrics(events), null, 2));
+console.log(`trace=${join(cwd, ".harness", "runs", runId, "trace.jsonl")}`);
+```
+
+</details>
+
+运行后可直接用阶段 11 CLI 查看同一个 run：
+
+```bash
+bun run examples/stage-11-trace.ts
+harness-lab trace list
+```
+
 ### 故障注入
 
 让 TraceSink 在第 N 次 append 时抛错，并明确你的策略：
@@ -1147,6 +1245,113 @@ describe("replayTrace", () => {
 示例故障演练还应手工覆盖 model 后/Tool 前、read/write Tool 中途和并发批次崩溃；上面
 三个完整文件固定了最容易被实现错误破坏的自动化不变量：原子保存、unknown 分类、成功
 动作不重访、完成态拒绝和 replay 只读。
+
+### 12.8 Recovery 示例
+
+目标文件：`examples/stage-12-recovery.ts`
+
+示例先保存稳定 checkpoint，再在临时文件写完后注入故障，确认旧 checkpoint 仍可读取；
+最后使用内存 trace 演示 replay，不创建 Model 或 Tool。
+
+<details>
+<summary>展开完整代码：<code>stage-12-recovery.ts</code></summary>
+
+```ts
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { FileCheckpointStore } from "@/runtime/checkpoint/file-checkpoint-store";
+import type { RunState } from "@/runtime/checkpoint/run-state";
+import { replayTrace } from "@/runtime/replay/replay";
+import type { RuntimeTraceEvent } from "@/runtime/trace/events";
+
+function defineState(root: string, nextStep: number): RunState {
+  const timestamp = new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    runId: "stage-12-demo",
+    status: "running",
+    phase: "idle",
+    nextStep,
+    prompt: "recovery demo",
+    messages: [],
+    model: {
+      name: "scripted",
+      provider: "scripted",
+      optionsFingerprint: "model-v1",
+    },
+    cwd: root,
+    projectFingerprint: "fixture-v1",
+    toolExecutions: [],
+    middlewareState: {},
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function messageEvent(sequence: number, text: string): RuntimeTraceEvent {
+  return {
+    schemaVersion: 1,
+    runId: "stage-12-demo",
+    sequence,
+    timestamp: `2026-01-01T00:00:00.00${sequence}Z`,
+    type: "message_appended",
+    payload: {
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    },
+  };
+}
+
+const root = await mkdtemp(join(tmpdir(), "harness-recovery-demo-"));
+
+try {
+  const stableStore = new FileCheckpointStore({ rootDir: root });
+  await stableStore.save(defineState(root, 1));
+  console.log("saved nextStep=1");
+
+  const crashingStore = new FileCheckpointStore({
+    rootDir: root,
+    faultInjector: {
+      hit: (point) => {
+        if (point === "after_temp_write") throw new Error("injected crash");
+      },
+    },
+  });
+
+  try {
+    await crashingStore.save(defineState(root, 2));
+  } catch (error) {
+    console.log(`crash=${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const recovered = await stableStore.load("stage-12-demo");
+  console.log(`recovered nextStep=${recovered.nextStep}`);
+  if (recovered.nextStep !== 1) throw new Error("Atomic checkpoint guarantee was violated");
+
+  await replayTrace({
+    events: [messageEvent(2, "second"), messageEvent(1, "first")],
+    noDelay: true,
+    onEvent: (event) => {
+      if (event.type !== "message_appended") return;
+      const text = event.payload.message.content
+        .map((item) => (item.type === "text" ? item.text : ""))
+        .join("");
+      console.log(`replay sequence=${event.sequence} text=${text}`);
+    },
+  });
+} finally {
+  await rm(root, { recursive: true, force: true });
+}
+```
+
+</details>
+
+运行：
+
+```bash
+bun run examples/stage-12-recovery.ts
+```
 
 ### 验收
 
@@ -1792,6 +1997,202 @@ describe("invokeToolWithTimeout", () => {
 </details>
 
 Model retry 与 Tool timeout 使用不同测试文件，避免混淆网络请求重试和外部副作用恢复。
+
+目标文件：`examples/stage-13-context.ts`
+
+<details>
+<summary>展开完整代码：<code>stage-13-context.ts</code></summary>
+
+```ts
+import type { NonSystemMessage } from "@/foundation/messages";
+import { ContextManager } from "@/runtime/context/context-manager";
+import { validateToolCallPairs } from "@/runtime/context/message-groups";
+
+const estimator = {
+  estimateText: (text: string) => text.length,
+  estimateMessages: (messages: unknown[]) => JSON.stringify(messages).length,
+  estimateTools: (tools: unknown[]) => JSON.stringify(tools).length,
+};
+const messages: NonSystemMessage[] = [];
+
+for (let turn = 1; turn <= 20; turn += 1) {
+  messages.push({
+    role: "user",
+    content: [{ type: "text", text: `request ${turn}: ${"context ".repeat(8)}` }],
+  });
+  messages.push({
+    role: "assistant",
+    content: [{ type: "text", text: `answer ${turn}: ${"result ".repeat(8)}` }],
+  });
+}
+messages.push({
+  role: "assistant",
+  content: [
+    {
+      type: "tool_use",
+      id: "context-check-1",
+      name: "read_file",
+      input: { path: "src/context.ts" },
+    },
+  ],
+});
+messages.push({
+  role: "tool",
+  content: [
+    {
+      type: "tool_result",
+      tool_use_id: "context-check-1",
+      content: "fixture content",
+    },
+  ],
+});
+messages.push({
+  role: "user",
+  content: [{ type: "text", text: "latest constraint: preserve this message" }],
+});
+
+const canonical = JSON.stringify(messages);
+const manager = new ContextManager({
+  estimator,
+  summarizer: {
+    summarize: async (groups) => [
+      '<conversation_summary source="older_transcript">',
+      `- Summarized groups: ${groups.length}`,
+      "- Earlier requests and answers were repetitive fixture data.",
+      "</conversation_summary>",
+    ].join("\n"),
+  },
+});
+const prepared = await manager.prepare({
+  messages,
+  prompt: "Keep the latest user constraint.",
+  tools: [],
+  budget: {
+    maxInputTokens: 1_200,
+    reservedOutputTokens: 100,
+    safetyMarginTokens: 100,
+  },
+});
+const pairs = validateToolCallPairs(prepared.messages);
+
+if (JSON.stringify(messages) !== canonical) {
+  throw new Error("ContextManager mutated the canonical transcript");
+}
+
+console.log(
+  `original: ${messages.length} messages, estimated ${prepared.stats.originalTokens} tokens`,
+);
+console.log(
+  `prepared: ${prepared.messages.length} messages, estimated ${prepared.stats.preparedTokens} tokens`,
+);
+console.log(`summary:  ${prepared.stats.summarizedGroups} groups → 1 summary`);
+console.log(`pairs:    ${pairs.ok ? "valid" : "invalid"}`);
+console.log(`ratio:    ${(prepared.stats.compressionRatio * 100).toFixed(1)}%`);
+```
+
+</details>
+
+目标文件：`examples/stage-13-retry.ts`
+
+<details>
+<summary>展开完整代码：<code>stage-13-retry.ts</code></summary>
+
+```ts
+import type { AssistantMessage } from "@/foundation/messages";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models/model-provider";
+import { ResilientModelProvider } from "@/runtime/reliability/resilient-model-provider";
+
+class TransientModelError extends Error {}
+
+class FailingProvider implements ModelProvider {
+  private _attempt = 0;
+
+  constructor(private readonly _failFirst: number) {}
+
+  async invoke(_params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    this._attempt += 1;
+    console.log(`attempt=${this._attempt}`);
+    if (this._attempt <= this._failFirst) {
+      const error = new TransientModelError(`injected transient failure ${this._attempt}`);
+      console.log(`error=${error.constructor.name}: ${error.message}`);
+      throw error;
+    }
+    return { role: "assistant", content: [{ type: "text", text: "success" }] };
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    yield await this.invoke(params);
+  }
+}
+
+function numberFlag(name: string, fallback: number): number {
+  const index = Bun.argv.indexOf(name);
+  if (index === -1) return fallback;
+  const value = Number(Bun.argv[index + 1]);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function wait(delayMs: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+const failFirst = numberFlag("--fail-first", 0);
+const abortAfter = Bun.argv.includes("--abort-after")
+  ? numberFlag("--abort-after", 0)
+  : undefined;
+const controller = new AbortController();
+const abortTimer = abortAfter === undefined
+  ? undefined
+  : setTimeout(() => controller.abort(new DOMException("user abort", "AbortError")), abortAfter);
+const resilient = new ResilientModelProvider({
+  provider: new FailingProvider(failFirst),
+  policy: {
+    maxAttempts: Math.max(3, failFirst + 1),
+    baseDelayMs: 50,
+    maxDelayMs: 200,
+    classify: (error) => {
+      if (error instanceof DOMException && error.name === "AbortError") return "aborted";
+      return error instanceof TransientModelError ? "transient" : "permanent";
+    },
+  },
+  sleeper: async (delayMs, signal) => {
+    console.log(`backoff=${delayMs}ms`);
+    await wait(delayMs, signal);
+  },
+  jitter: () => 0,
+});
+
+try {
+  const result = await resilient.invoke({
+    model: "fixture",
+    messages: [],
+    signal: controller.signal,
+  });
+  console.log(`result=${JSON.stringify(result)}`);
+} catch (error) {
+  console.log(`stopped=${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
+} finally {
+  if (abortTimer !== undefined) clearTimeout(abortTimer);
+}
+```
+
+</details>
 
 ### 运行与观察
 

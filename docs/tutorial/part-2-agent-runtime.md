@@ -180,7 +180,92 @@ const responses: AssistantMessage[] = [
 ];
 ```
 
-`get_weather` 返回固定结果，不访问网络。运行：
+`get_weather` 返回固定结果，不访问网络。下面是完整的可运行示例：
+
+<details>
+<summary>展开完整代码：<code>stage-04-react-loop.ts</code></summary>
+
+```ts
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import type { AssistantMessage, ToolMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+import { defineTool } from "@/foundation/tools/function-tool";
+
+const responses: AssistantMessage[] = [
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "weather-1",
+        name: "get_weather",
+        input: { description: "查询北京天气", city: "北京" },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [{ type: "text", text: "北京今天晴，26°C。" }],
+  },
+];
+
+const getWeatherTool = defineTool({
+  name: "get_weather",
+  description: "Return deterministic weather without network access",
+  parameters: z.object({
+    description: z.string(),
+    city: z.string(),
+  }),
+  invoke: async () => "晴，26°C",
+});
+
+const userMessage: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "北京天气如何？" }],
+};
+
+function printMessage(message: AssistantMessage | ToolMessage): void {
+  if (message.role === "assistant") {
+    for (const item of message.content) {
+      if (item.type === "tool_use") {
+        console.log(`[assistant/tool_use] ${item.name} #${item.id}`);
+      } else if (item.type === "text") {
+        console.log(`[assistant] ${item.text}`);
+      }
+    }
+    return;
+  }
+
+  for (const item of message.content) {
+    console.log(`[tool/tool_result] #${item.tool_use_id} ${item.content}`);
+  }
+}
+
+const provider = new ScriptedModelProvider({ responses });
+const agent = new Agent({
+  model: new Model({ name: "scripted", provider }),
+  prompt: "Use get_weather when the user asks about weather.",
+  tools: [getWeatherTool],
+});
+const userText = userMessage.content.find((item) => item.type === "text")?.text ?? "";
+let steps = 0;
+
+console.log(`[user] ${userText}`);
+for await (const event of agent.stream(userMessage)) {
+  if (event.type !== "message") continue;
+  if (event.message.role === "assistant") steps += 1;
+  printMessage(event.message);
+}
+
+console.log(`[done] steps=${steps} messages=${agent.messages.length}`);
+```
+
+</details>
+
+运行：
 
 ```bash
 bun run examples/stage-04-react-loop.ts
@@ -452,6 +537,190 @@ invoke: async ({ ms, label }, signal) => {
 完成后还要移除 listener，避免长 session 累积无效闭包。可以用 `try/finally` 或在 resolve/reject 前统一 cleanup。
 
 对于 `Bun.spawn`，abort handler 必须 kill 子进程，而不只是停止等待 stdout。
+
+#### 并发 Tool 示例
+
+目标文件：`examples/stage-05-parallel-tools.ts`
+
+<details>
+<summary>展开完整代码：<code>stage-05-parallel-tools.ts</code></summary>
+
+```ts
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+import { defineTool } from "@/foundation/tools/function-tool";
+
+const userMessage: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "run slow and fast" }],
+};
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+const startedAt = performance.now();
+
+function log(event: "tool_start" | "tool_end", name: string): void {
+  const elapsed = Math.round(performance.now() - startedAt);
+  console.log(`${elapsed}ms  ${event} ${name}`);
+}
+
+function defineDelayTool(name: string, ms: number) {
+  return defineTool({
+    name,
+    description: `Wait ${ms}ms`,
+    parameters: z.object({ description: z.string() }),
+    invoke: async (_input, signal) => {
+      log("tool_start", name);
+      await wait(ms, signal);
+      log("tool_end", name);
+      return { name, ms };
+    },
+  });
+}
+
+const toolCalls: AssistantMessage = {
+  role: "assistant",
+  content: ["slow", "fast"].map((name) => ({
+    type: "tool_use" as const,
+    id: `call-${name}`,
+    name,
+    input: { description: `run ${name}` },
+  })),
+};
+const provider = new ScriptedModelProvider({
+  responses: [
+    toolCalls,
+    { role: "assistant", content: [{ type: "text", text: "done" }] },
+  ],
+});
+const agent = new Agent({
+  model: new Model({ name: "scripted", provider }),
+  prompt: "Run independent tools together.",
+  tools: [defineDelayTool("slow", 300), defineDelayTool("fast", 30)],
+});
+
+for await (const _event of agent.stream(userMessage)) {
+  // Tool 自身记录开始和结束时间；这里只消费完整 event stream。
+}
+```
+
+</details>
+
+#### Abort 示例
+
+目标文件：`examples/stage-05-abort.ts`
+
+<details>
+<summary>展开完整代码：<code>stage-05-abort.ts</code></summary>
+
+```ts
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+import { defineTool } from "@/foundation/tools/function-tool";
+
+function wait(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
+}
+
+const delayTool = defineTool({
+  name: "delay",
+  description: "Wait for a bounded duration",
+  parameters: z.object({
+    description: z.string(),
+    ms: z.number().finite().int().nonnegative(),
+    label: z.string().min(1),
+  }),
+  invoke: async ({ ms, label }, signal) => {
+    await wait(ms, signal);
+    return { label, ms };
+  },
+});
+const toolCall: AssistantMessage = {
+  role: "assistant",
+  content: [
+    {
+      type: "tool_use",
+      id: "delay-1",
+      name: "delay",
+      input: { description: "demonstrate abort", ms: 10_000, label: "slow" },
+    },
+  ],
+};
+const userMessage: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "start a long delay" }],
+};
+const agent = new Agent({
+  model: new Model({
+    name: "scripted",
+    provider: new ScriptedModelProvider({ responses: [toolCall] }),
+  }),
+  prompt: "Run the requested delay.",
+  tools: [delayTool],
+});
+const startedAt = performance.now();
+const abortTimer = setTimeout(() => {
+  console.log("[abort] request user cancellation");
+  agent.abort();
+}, 100);
+
+try {
+  for await (const _event of agent.stream(userMessage)) {
+    // consume
+  }
+} catch (error) {
+  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  console.log(`[stopped] ${message}`);
+} finally {
+  clearTimeout(abortTimer);
+}
+
+console.log(
+  `[done] elapsed=${Math.round(performance.now() - startedAt)}ms streaming=${agent.streaming}`,
+);
+```
+
+</details>
 
 ### 运行与观察
 
@@ -862,6 +1131,68 @@ export function defineLifecycleRecorder(log: string[]): AgentMiddleware {
   };
 }
 ```
+
+目标文件：`examples/stage-06-middleware.ts`
+
+<details>
+<summary>展开完整代码：<code>stage-06-middleware.ts</code></summary>
+
+```ts
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import { defineLifecycleRecorder } from "@/agent/lifecycle-recorder";
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+import { defineTool } from "@/foundation/tools/function-tool";
+
+const responses: AssistantMessage[] = [
+  {
+    role: "assistant",
+    content: [
+      {
+        type: "tool_use",
+        id: "weather-1",
+        name: "get_weather",
+        input: { description: "query fixture weather", city: "北京" },
+      },
+    ],
+  },
+  {
+    role: "assistant",
+    content: [{ type: "text", text: "北京今天晴。" }],
+  },
+];
+const weatherTool = defineTool({
+  name: "get_weather",
+  description: "Return deterministic weather",
+  parameters: z.object({ description: z.string(), city: z.string() }),
+  invoke: async ({ city }) => ({ city, condition: "晴" }),
+});
+const userMessage: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "北京天气如何？" }],
+};
+const log: string[] = [];
+const agent = new Agent({
+  model: new Model({
+    name: "scripted",
+    provider: new ScriptedModelProvider({ responses }),
+  }),
+  prompt: "Use get_weather when needed.",
+  tools: [weatherTool],
+  middlewares: [defineLifecycleRecorder(log)],
+});
+
+for await (const _event of agent.stream(userMessage)) {
+  // 生命周期由 Middleware 记录，event stream 仍需完整消费。
+}
+
+console.log(log.join("\n"));
+```
+
+</details>
 
 ### 运行与观察
 
