@@ -762,9 +762,53 @@ describe("Model", () => {
 });
 ```
 
-### 运行与观察
+### 2.4 离线流式示例
+
+目标文件：`examples/stage-02-model-stream.ts`
+
+下面的示例通过 `Model.stream()` 消费累计快照。循环只读取 canonical
+`AssistantMessage`，不接触 `ScriptedModelProvider` 的内部状态。
+
+```ts
+import type { AssistantMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+
+const response: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "hello" }],
+};
+
+const provider = new ScriptedModelProvider({ responses: [response] });
+const model = new Model({ name: "scripted", provider });
+let finalMessage: AssistantMessage | undefined;
+
+for await (const snapshot of model.stream({ prompt: "", messages: [] })) {
+  const text = snapshot.content
+    .map((item) => (item.type === "text" ? item.text : ""))
+    .join("");
+
+  process.stdout.write(`\r${text}`);
+  finalMessage = snapshot;
+  await Bun.sleep(50);
+}
+
+process.stdout.write("\n");
+
+if (!finalMessage) {
+  throw new Error("Model stream did not yield a response");
+}
+
+console.log(JSON.stringify(finalMessage, null, 2));
+```
+
+### 运行测试与观察
 
 ```bash
+# 先验证 Model 与 ScriptedModelProvider 的行为
+bun test src/foundation/models/__tests__/model.test.ts
+
+# 再观察累计流式快照
 bun run examples/stage-02-model-stream.ts
 ```
 
