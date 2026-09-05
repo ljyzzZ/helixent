@@ -38,6 +38,27 @@ touch src/cli/commands/trace.ts
 touch examples/stage-11-trace.ts
 ```
 
+执行后新增结构如下：
+
+```text
+src/
+├── runtime/trace/
+│   ├── events.ts                       # 定义带版本的 runtime trace events
+│   ├── runtime-clock.ts                # 抽象 clock、id generator 与 trace sink
+│   ├── redactor.ts                     # 复制并脱敏敏感或过长字段
+│   ├── jsonl-trace-store.ts            # 按 run 顺序持久化和读取 JSONL trace
+│   ├── metrics.ts                      # 从事件纯函数归约运行指标
+│   ├── index.ts                        # 导出 observability 公共 API
+│   └── __tests__/
+│       ├── jsonl-trace-store.test.ts   # 验证落盘、顺序和解析错误
+│       ├── metrics.test.ts             # 验证指标归约与空 trace
+│       └── runtime-trace.test.ts       # 验证 Agent 关键路径事件完整性
+└── cli/commands/
+    └── trace.ts                        # 提供查看 trace 与指标的 CLI 命令
+examples/
+└── stage-11-trace.ts                   # 演示生成并检查一次结构化 trace
+```
+
 ### 11.1 Trace event schema
 
 目标文件：`src/runtime/trace/events.ts`
@@ -777,6 +798,29 @@ touch src/runtime/replay/replay.ts src/runtime/replay/index.ts
 touch src/runtime/replay/__tests__/replay.test.ts examples/stage-12-recovery.ts
 ```
 
+执行后新增结构如下：
+
+```text
+src/runtime/
+├── checkpoint/
+│   ├── run-state.ts                    # 定义可恢复的 canonical run state
+│   ├── checkpoint-store.ts             # 定义 checkpoint 持久化接口
+│   ├── file-checkpoint-store.ts        # 原子写入并读取文件 checkpoint
+│   ├── resume-run.ts                   # 校验状态并从安全边界恢复运行
+│   ├── fault-injector.ts               # 为测试注入可重复的崩溃点
+│   ├── index.ts                        # 导出 checkpoint 公共 API
+│   └── __tests__/
+│       ├── file-checkpoint-store.test.ts # 验证原子写入与损坏文件处理
+│       └── resume-run.test.ts          # 验证恢复边界与 unknown side effect
+└── replay/
+    ├── replay.ts                       # 从既有 trace 重建脱敏后的展示时间线
+    ├── index.ts                        # 导出 replay 公共 API
+    └── __tests__/
+        └── replay.test.ts              # 验证 replay 不调用模型或重复执行 Tool
+examples/
+└── stage-12-recovery.ts                # 演示故障注入、checkpoint 与恢复
+```
+
 ### 12.1 RunState schema
 
 目标文件：`src/runtime/checkpoint/run-state.ts`
@@ -1397,6 +1441,32 @@ touch src/runtime/reliability/__tests__/resilient-model-provider.test.ts
 touch src/runtime/reliability/__tests__/tool-timeout.test.ts
 touch src/runtime/policy/policy-engine.ts src/runtime/policy/__tests__/policy-engine.test.ts
 touch examples/stage-13-context.ts examples/stage-13-retry.ts
+```
+
+执行后新增结构如下：
+
+```text
+src/runtime/
+├── context/
+│   ├── token-estimator.ts              # 估算消息、文本与 Tool schema token
+│   ├── message-groups.ts               # 将相关消息分成不可拆散的语义组
+│   ├── context-manager.ts              # 在预算内生成 Model view 并执行 compaction
+│   ├── index.ts                        # 导出 context 管理公共 API
+│   └── __tests__/
+│       └── context-manager.test.ts     # 验证预算、保留规则与 transcript 不变性
+├── reliability/
+│   ├── resilient-model-provider.ts     # 为可重试模型错误提供退避与重试
+│   ├── tool-timeout.ts                 # 为 Tool 执行施加 timeout 和 abort
+│   └── __tests__/
+│       ├── resilient-model-provider.test.ts # 验证重试分类与退避策略
+│       └── tool-timeout.test.ts        # 验证超时、中止与资源清理
+└── policy/
+    ├── policy-engine.ts                # 集中判定 Tool 调用是否允许或需审批
+    └── __tests__/
+        └── policy-engine.test.ts       # 验证允许、拒绝与审批规则
+examples/
+├── stage-13-context.ts                 # 演示长 transcript 的预算内 Model view
+└── stage-13-retry.ts                   # 演示可重试错误与最终失败
 ```
 
 ### 13.1 Canonical transcript 与 Model view

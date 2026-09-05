@@ -52,14 +52,21 @@ src/community/                      # 第三方模型 Provider adapters
 │   ├── model-provider.ts           # 调用 SDK 并实现 ModelProvider
 │   ├── stream-accumulator.ts       # 将 OpenAI chunks 累积为 canonical snapshot
 │   ├── utils.ts                    # 转换 canonical 与 OpenAI wire types
-│   ├── __tests__/                  # OpenAI adapter 的协议测试
-│   └── index.ts                    # 导出 OpenAI adapter 公共 API
+│   ├── index.ts                    # 导出 OpenAI adapter 公共 API
+│   └── __tests__/                  # OpenAI adapter 的协议测试
+│       ├── utils.test.ts           # 验证消息和 Tool schema 双向转换
+│       ├── stream-accumulator.test.ts # 验证交错 chunk 的稳定累积
+│       └── model-provider.test.ts  # 验证 SDK 请求参数、stream 与 abort 边界
 └── anthropic/                      # Anthropic adapter
     ├── model-provider.ts           # 调用 SDK 并实现 ModelProvider
     ├── stream-accumulator.ts       # 将 Anthropic events 累积为 canonical snapshot
     ├── utils.ts                    # 转换 canonical 与 Anthropic wire types
-    ├── __tests__/                  # Anthropic adapter 的协议测试
-    └── index.ts                    # 导出 Anthropic adapter 公共 API
+    ├── index.ts                    # 导出 Anthropic adapter 公共 API
+    └── __tests__/                  # Anthropic adapter 的协议测试
+        ├── utils.test.ts           # 验证 system、消息与 Tool schema 转换
+        └── stream-accumulator.test.ts # 验证按 block index 累积事件
+examples/
+└── stage-07-real-model.ts          # 通过配置切换并调用真实模型 Provider
 ```
 
 ### 7.2 先写纯转换函数
@@ -829,6 +836,31 @@ touch src/coding/tools/__tests__/coding-tools.test.ts
 touch src/coding/tools/index.ts examples/stage-08-coding-tools.ts
 ```
 
+执行后新增结构如下：
+
+```text
+src/coding/tools/                       # 受 workspace 边界约束的 Coding Tools
+├── tool-utils.ts                       # 规范化路径并提供截断等共享辅助函数
+├── tool-result.ts                      # 构造稳定、可序列化的 Tool result
+├── file-info.ts                        # 查询文件或目录元数据
+├── list-files.ts                       # 枚举目录内容
+├── glob-search.ts                      # 按 glob 模式搜索路径
+├── grep-search.ts                      # 按文本或正则搜索文件内容
+├── read-file.ts                        # 按行范围读取文本文件
+├── mkdir.ts                            # 在 workspace 内创建目录
+├── write-file.ts                       # 创建或覆盖文本文件
+├── str-replace.ts                      # 执行唯一、精确的字符串替换
+├── apply-patch.ts                      # 应用 unified diff patch
+├── move-path.ts                        # 移动或重命名文件与目录
+├── bash.ts                             # 执行支持 timeout 与 abort 的子进程
+├── index.ts                            # 组合并导出 Coding Tools
+└── __tests__/
+    ├── tool-utils.test.ts              # 验证路径穿越、符号链接等安全边界
+    └── coding-tools.test.ts            # 验证各 Tool 的公开 contract
+examples/
+└── stage-08-coding-tools.ts            # 在临时 workspace 演示读写与 diff
+```
+
 这个循环只创建空文件，不覆盖内容。所有 Tool 的公开行为集中在一个完整 contract test，
 路径安全单独测试；迭代时可用 `bun test -t "read_file"` 只运行相关用例。
 
@@ -1304,6 +1336,36 @@ touch src/agent/skills/__tests__/skill-reader.test.ts
 touch src/agent/todos/todo-system.ts src/agent/todos/index.ts src/agent/todos/__tests__/todo-system.test.ts
 touch src/coding/tools/ask-user-question.ts src/coding/tools/__tests__/ask-user-question.test.ts
 touch examples/stage-09-coding-agent.ts
+```
+
+执行后新增结构如下：
+
+```text
+src/
+├── coding/
+│   ├── agents/
+│   │   ├── coding-agent.ts             # 组合 prompt、Tools 与 Middleware
+│   │   ├── index.ts                    # 导出 Coding Agent 公共 API
+│   │   └── __tests__/
+│   │       └── coding-agent.test.ts    # 验证 composition root 与项目指令加载
+│   └── tools/
+│       ├── ask-user-question.ts        # 将关键信息缺口交还给用户确认
+│       └── __tests__/
+│           └── ask-user-question.test.ts # 验证提问 handler 的输入输出契约
+└── agent/
+    ├── skills/
+    │   ├── skill-reader.ts             # 发现并解析 SKILL.md
+    │   ├── skills-middleware.ts        # 将匹配的 Skill 指令注入 model view
+    │   ├── index.ts                    # 导出 Skill 系统公共 API
+    │   └── __tests__/
+    │       └── skill-reader.test.ts    # 验证发现、解析和边界条件
+    └── todos/
+        ├── todo-system.ts              # 管理结构化任务列表与状态迁移
+        ├── index.ts                    # 导出 Todo 系统公共 API
+        └── __tests__/
+            └── todo-system.test.ts     # 验证 Todo 状态不变量
+examples/
+└── stage-09-coding-agent.ts            # 演示带 Skills、Todo 与提问能力的 Agent
 ```
 
 ### 9.1 Coding Agent composition root
@@ -1915,6 +1977,35 @@ touch src/cli/tui/app.tsx src/cli/tui/state.ts src/cli/tui/token-usage.ts
 touch src/cli/tui/__tests__/state.test.ts src/cli/tui/__tests__/token-usage.test.ts
 touch src/coding/permissions/approval-middleware.ts src/coding/permissions/index.ts
 touch src/coding/permissions/__tests__/approval-middleware.test.ts docs/manual-test.md
+```
+
+执行后新增结构如下：
+
+```text
+src/
+├── cli/
+│   ├── config/
+│   │   ├── schema.ts                   # 校验模型、Provider 与运行参数配置
+│   │   ├── model-factory.ts            # 根据配置实例化对应 ModelProvider
+│   │   ├── index.ts                    # 导出配置层公共 API
+│   │   └── __tests__/
+│   │       └── schema.test.ts          # 验证默认值、非法配置与 secret 引用
+│   └── tui/
+│       ├── app.tsx                     # 组合 Ink 交互界面与 Agent stream
+│       ├── state.ts                    # 维护消息、状态和用户输入 reducer
+│       ├── token-usage.ts              # 汇总并格式化 token usage
+│       ├── components/                 # 放置可复用的 TUI 展示组件
+│       ├── hooks/                      # 放置 Agent 交互相关 React hooks
+│       └── __tests__/
+│           ├── state.test.ts           # 验证 reducer 状态迁移
+│           └── token-usage.test.ts     # 验证 token 统计与缺省字段
+└── coding/permissions/
+    ├── approval-middleware.ts          # 在有副作用的 Tool 前请求人工审批
+    ├── index.ts                        # 导出权限层公共 API
+    └── __tests__/
+        └── approval-middleware.test.ts # 验证允许、拒绝与中止路径
+docs/
+└── manual-test.md                      # 固化真实终端中的人工验收步骤
 ```
 
 ### 10.1 安装交互依赖

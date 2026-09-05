@@ -34,6 +34,22 @@ touch src/agent/errors.ts src/agent/serialize-tool-result.ts src/agent/index.ts
 touch src/agent/__tests__/agent.test.ts examples/stage-04-react-loop.ts
 ```
 
+执行后新增结构如下：
+
+```text
+src/agent/                              # 通用 Agent runtime
+├── agent-context.ts                    # 保存 prompt、transcript 与可用 Tools
+├── agent-event.ts                      # 定义流式运行期间对外发送的事件
+├── agent.ts                            # 实现最小 ReAct loop 与 transcript 更新
+├── errors.ts                           # 定义最大步数等可识别的运行错误
+├── serialize-tool-result.ts            # 将 Tool 返回值规范化为 transcript 字符串
+├── index.ts                            # 统一导出 Agent runtime 公共 API
+└── __tests__/
+    └── agent.test.ts                   # 验证循环终止、Tool observation 等不变量
+examples/
+└── stage-04-react-loop.ts              # 用离线脚本模型演示一次完整 ReAct 循环
+```
+
 ### 4.1 AgentContext 和 AgentEvent
 
 目标文件：`src/agent/agent-context.ts` 和 `src/agent/agent-event.ts`
@@ -433,6 +449,16 @@ bun test src/agent/__tests__/agent.test.ts
 ```bash
 touch src/agent/__tests__/agent-streaming.test.ts
 touch examples/stage-05-parallel-tools.ts examples/stage-05-abort.ts
+```
+
+执行后新增结构如下：
+
+```text
+src/agent/__tests__/
+└── agent-streaming.test.ts             # 验证流式快照、并行 Tool 与 abort 语义
+examples/
+├── stage-05-parallel-tools.ts          # 演示多个 Tool call 的并行执行与稳定回写
+└── stage-05-abort.ts                   # 演示中止信号如何贯穿 model 和 Tool
 ```
 
 ### 5.1 Streaming 状态机
@@ -1005,6 +1031,18 @@ bun test src/agent/__tests__/agent-streaming.test.ts
 ```bash
 touch src/agent/agent-middleware.ts src/agent/lifecycle-recorder.ts
 touch src/agent/__tests__/middleware.test.ts examples/stage-06-middleware.ts
+```
+
+执行后新增结构如下：
+
+```text
+src/agent/
+├── agent-middleware.ts                 # 定义 Agent、step、model 与 Tool 生命周期 hooks
+├── lifecycle-recorder.ts               # 提供记录 hook 调用次序的示例 Middleware
+└── __tests__/
+    └── middleware.test.ts              # 验证 hook 顺序、mutation 与错误传播
+examples/
+└── stage-06-middleware.ts              # 演示日志等横切能力如何接入生命周期
 ```
 
 ### 6.1 Hook 契约

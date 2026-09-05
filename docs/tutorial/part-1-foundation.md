@@ -31,6 +31,26 @@ mkdir -p examples docs/decisions
 touch src/cli/index.ts src/cli/__tests__/index.test.ts
 ```
 
+本阶段命令完成后的核心结构如下（省略依赖目录）：
+
+```text
+package.json                 # 定义 Bun scripts 与项目依赖
+tsconfig.json                # 开启 TypeScript strict 和路径别名
+bun.lock                     # 锁定依赖版本
+src/
+├── foundation/              # 保存稳定的底层类型和契约
+├── agent/                   # 预留通用 Agent runtime
+├── coding/                  # 预留 Coding Agent 能力
+├── community/               # 预留第三方 Provider adapters
+└── cli/
+    ├── index.ts             # 提供最小 CLI 入口
+    └── __tests__/
+        └── index.test.ts    # 验证 CLI 入口可以调用
+examples/                    # 保存各阶段可运行示例
+docs/
+└── decisions/               # 保存架构决策记录 ADR
+```
+
 `bun init` 生成的根目录 `index.ts` 是临时示例入口。本教程统一使用
 `src/cli/index.ts`，因此删除它，并同时删除 `package.json` 中指向它的
 `"module": "index.ts"`。
@@ -181,6 +201,8 @@ src/foundation/messages/          # canonical Message 模块
 │   └── transcript.test.ts        # 验证 transcript 格式与调用关联
 ├── transcript.ts                 # 将 canonical messages 格式化为可读文本
 └── index.ts                      # 导出 Message 模块的公共 API
+examples/
+└── stage-01-transcript.ts        # 演示 transcript 的格式化输出
 ```
 
 ### 1.2 类型骨架
@@ -554,6 +576,21 @@ touch src/foundation/models/scripted-model-provider.ts
 touch src/foundation/models/index.ts
 touch src/foundation/models/__tests__/model.test.ts
 touch examples/stage-02-model-stream.ts
+```
+
+执行后新增结构如下：
+
+```text
+src/foundation/models/                  # 通用模型调用边界
+├── model-context.ts                    # 定义每次模型调用的 canonical 输入
+├── model-provider.ts                   # 定义 Provider 必须实现的接口
+├── model.ts                            # 封装模型名、选项和 Provider 调用
+├── scripted-model-provider.ts          # 按脚本返回结果，供离线示例与测试使用
+├── index.ts                            # 导出 Models 模块的公共 API
+└── __tests__/
+    └── model.test.ts                   # 验证 invoke、stream 和 abort 契约
+examples/
+└── stage-02-model-stream.ts            # 展示累计式流式快照
 ```
 
 ### 2.1 契约骨架
@@ -952,6 +989,21 @@ touch src/foundation/tools/__tests__/tool-registry.test.ts
 touch examples/stage-03-tool-playground.ts
 ```
 
+执行后新增结构如下：
+
+```text
+src/foundation/tools/                         # Tool 定义与安全执行基础
+├── function-tool.ts                          # 定义 Tool 类型和 defineTool factory
+├── structured-tool-result.ts                 # 定义稳定的成功与错误结果
+├── tool-registry.ts                          # 注册、查找、校验并调用 Tool
+├── add-tool.ts                               # 提供首个确定性示例 Tool
+├── index.ts                                  # 统一导出 Tools 模块公共 API
+└── __tests__/
+    └── tool-registry.test.ts                 # 验证注册、校验与错误边界
+examples/
+└── stage-03-tool-playground.ts               # 从命令行调用 Tool 并观察结果
+```
+
 ### 3.1 Tool 类型
 
 目标文件：`src/foundation/tools/function-tool.ts`
@@ -1016,13 +1068,6 @@ export function errorToolResult(
 }
 ```
 
-完成 Tool 类型后，回到以下两个文件加入 `tools?: Tool[]`：
-
-- `src/foundation/models/model-context.ts`
-- `src/foundation/models/model-provider.ts`
-
-只使用 `import type { Tool } from "@/foundation/tools"`，避免 runtime 循环依赖。
-
 ### 3.2 ToolRegistry 骨架
 
 目标文件：`src/foundation/tools/tool-registry.ts`
@@ -1031,6 +1076,8 @@ export function errorToolResult(
 <summary>展开完整代码：<code>tool-registry.ts</code></summary>
 
 ```ts
+import type { Tool } from "./function-tool";
+
 export type ToolExecutionResult =
   | { ok: true; toolName: string; value: unknown }
   | { ok: false; toolName: string; code: string; error: string };
@@ -1081,6 +1128,9 @@ export class ToolRegistry {
 ```ts
 import { z } from "zod";
 
+import { defineTool } from "./function-tool";
+import { okToolResult } from "./structured-tool-result";
+
 export const addTool = defineTool({
   name: "add",
   description: "Add two finite numbers",
@@ -1100,6 +1150,72 @@ export const addTool = defineTool({
 ```
 
 `description` 是模型解释这次调用意图的字段，不是 Tool 自身的 description。它能改善审批 UI 和 trace 可读性。
+
+目标文件：`src/foundation/tools/index.ts`
+
+完成上述实现文件后，通过 barrel 统一导出公共 API：
+
+```ts
+export { addTool } from "./add-tool";
+export { defineTool } from "./function-tool";
+export type { FunctionTool, Tool } from "./function-tool";
+export { errorToolResult, okToolResult } from "./structured-tool-result";
+export type { StructuredToolResult } from "./structured-tool-result";
+export { ToolRegistry } from "./tool-registry";
+export type { ToolExecutionResult } from "./tool-registry";
+```
+
+现在回到以下两个文件加入 `tools?: Tool[]`。
+
+目标文件：`src/foundation/models/model-context.ts`
+
+```ts
+import type { NonSystemMessage } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
+export interface ModelContext {
+  prompt: string;
+  messages: NonSystemMessage[];
+  tools?: Tool[];
+  signal?: AbortSignal;
+}
+```
+
+目标文件：`src/foundation/models/model-provider.ts`
+
+```ts
+import type { AssistantMessage, Message } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
+export interface ModelProviderInvokeParams {
+  model: string;
+  messages: Message[];
+  tools?: Tool[];
+  options?: Record<string, unknown>;
+  signal?: AbortSignal;
+}
+
+export interface ModelProvider {
+  invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage>;
+  stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage>;
+}
+```
+
+最后在 `src/foundation/models/model.ts` 的 `_buildProviderParams()` 返回值中转发
+`ModelContext.tools`：
+
+```ts
+return {
+  model: this.name,
+  messages,
+  tools: context.tools,
+  options: this.options,
+  signal: context.signal,
+};
+```
+
+此时 `@/foundation/tools` 会解析到上面的 `index.ts`，而 `import type` 不会产生
+runtime 循环依赖。
 
 ### 3.4 Tool playground
 

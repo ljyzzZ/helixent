@@ -34,21 +34,35 @@ touch src/eval/__tests__/eval-runner.test.ts
 ```
 
 命令不会替你生成 fixture 题目答案；`fixture/` 必须是 Agent 每次 trial 收到的干净项目。
+执行后新增结构如下：
 
 ```text
-evals/                           # Evaluation Harness 的任务与产物根目录
-├── tasks/                       # 独立 eval tasks
-│   ├── fix-add/                 # 修复加法逻辑的示例任务
-│   │   ├── task.yaml            # 定义任务元数据、限制和 grader
-│   │   ├── prompt.md            # 保存只对 Agent 可见的用户需求
-│   │   ├── fixture/             # 提供每次 trial 的干净初始项目
-│   │   └── graders/             # 保存与 prompt 隔离的评分器
-│   │       └── test.ts          # 执行确定性任务验收
-│   └── rename-api/              # 另一个 API 重命名任务
-├── suites/                      # 组合可重复运行的任务集合
-│   ├── smoke.yaml               # 定义快速冒烟评测集
-│   └── coding-core.yaml         # 定义核心 Coding 能力评测集
-└── reports/                     # 保存 run artifacts 与汇总报告
+evals/                               # Evaluation Harness 的任务与产物根目录
+├── tasks/
+│   └── fix-add/                     # 修复加法逻辑的首个示例任务
+│       ├── task.yaml                # 定义任务元数据、限制和 grader
+│       ├── prompt.md                # 保存只对 Agent 可见的用户需求
+│       ├── fixture/                 # 提供每次 trial 的干净初始项目
+│       │   ├── package.json         # 定义 fixture 的最小 Bun package
+│       │   └── src/
+│       │       └── add.ts           # 放置等待 Agent 修复的错误实现
+│       └── graders/
+│           └── test.ts              # 执行与 prompt 隔离的确定性验收
+├── suites/
+│   └── smoke.yaml                   # 组合可快速运行的冒烟任务集
+└── reports/                         # 保存 run artifacts 与汇总报告
+src/eval/                            # Evaluation Harness 的运行时代码
+├── types.ts                         # 定义 task、suite、trial 与 report 类型
+├── task-loader.ts                   # 加载并校验 task 和 suite manifest
+├── workspace-factory.ts             # 为每次 trial 创建隔离 workspace
+├── grader-runner.ts                 # 在 Agent 停止后执行 grader
+├── artifact-store.ts                # 保存 patch、trace 与 grader output
+├── eval-runner.ts                   # 编排 task、trial、Agent 与 grader
+├── index.ts                         # 导出 eval 公共 API
+└── __tests__/
+    ├── task-loader.test.ts          # 验证 manifest、路径与重复任务校验
+    ├── test-harness.ts              # 提供 eval 测试共用 fixture 与 fake
+    └── eval-runner.test.ts          # 验证隔离、产物与失败路径
 ```
 
 `task.yaml`：
