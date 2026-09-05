@@ -1078,9 +1078,20 @@ export function errorToolResult(
 ```ts
 import type { Tool } from "./function-tool";
 
+export type ToolExecutionErrorCode =
+  | "TOOL_NOT_FOUND"
+  | "INVALID_TOOL_INPUT"
+  | "ABORTED"
+  | "TOOL_EXECUTION_FAILED";
+
 export type ToolExecutionResult =
   | { ok: true; toolName: string; value: unknown }
-  | { ok: false; toolName: string; code: string; error: string };
+  | {
+      ok: false;
+      toolName: string;
+      code: ToolExecutionErrorCode;
+      error: string;
+    };
 
 export class ToolRegistry {
   private readonly _tools = new Map<string, Tool>();
@@ -1096,7 +1107,8 @@ export class ToolRegistry {
   }
 
   list(): Tool[] {
-    // TODO 1：返回新的数组，避免调用方修改内部 Map；保持注册顺序。
+    // TODO 1：读取 this._tools.values() 并返回新的数组。
+    // Map 会保持插入顺序，因此不需要额外排序；不要把内部 Map 暴露给调用方。
   }
 
   async invoke(options: {
@@ -1104,19 +1116,80 @@ export class ToolRegistry {
     input: unknown;
     signal?: AbortSignal;
   }): Promise<ToolExecutionResult> {
-    // TODO 2：查找 Tool；未知时返回 TOOL_NOT_FOUND，toolName 使用请求中的 name。
-    // TODO 3：parameters.safeParse(input)；失败返回 INVALID_TOOL_INPUT。
-    // TODO 4：signal 已中止时返回 ABORTED，且不得调用真实 Tool。
-    // TODO 5：调用 tool.invoke(parsed.data, signal)，成功时返回 value。
-    // TODO 6：最后防线捕获异常；AbortError 映射 ABORTED，其他异常映射
-    // TOOL_EXECUTION_FAILED。单个 Tool 的异常不能逃出 registry。
+    // TODO 2：用 options.name 查找 Tool。未注册时立即返回 TOOL_NOT_FOUND；
+    // toolName 保留调用方传入的名称，便于 trace 定位模型实际请求了什么。
+    // TODO 3：对 options.input 调用 tool.parameters.safeParse()。
+    // 校验失败时返回 INVALID_TOOL_INPUT，且不得进入 tool.invoke()。
+    // TODO 4：调用 Tool 前检查 options.signal。已经中止时返回 ABORTED，
+    // 确保具有副作用的实现不会在取消后才开始执行。
+    // TODO 5：把 parsed.data 而不是原始 input 传给 tool.invoke()，同时继续传递 signal；
+    // 成功后返回 { ok: true, toolName: tool.name, value }。
+    // TODO 6：用 try/catch 包围真实调用。signal 已中止或捕获到 AbortError 时返回
+    // ABORTED；其余异常转换为 TOOL_EXECUTION_FAILED，并保留可读的错误消息。
+    // 单个 Tool 的异常不能逃出 Registry 并终止整个 Agent loop。
   }
 }
 ```
 
 </details>
 
-本课程在 runtime 增加本地 Zod validation。这比完全信任模型生成的 input 更安全，也是你与参考实现可以明确说明的一项有意差异。
+`ToolRegistry` 是模型输出进入本地代码前的信任边界。虽然 TypeScript 已经为
+`tool.invoke()` 描述了参数类型，但模型返回的是运行时 JSON，可能缺少字段、包含错误类型，
+也可能请求一个根本没有注册的 Tool；静态类型无法验证这些外部数据。因此 `invoke()` 的
+输入必须保持为 `unknown`，并在 Registry 内完成查找和 Zod 校验。
+
+`ToolExecutionErrorCode` 使用字符串字面量 union，而不是 `enum`。这些错误码需要写入
+transcript、trace 和测试结果，直接使用字符串既不会生成额外的 runtime 对象，也能让
+TypeScript 拒绝拼错或尚未定义的错误码。
+
+失败分支中的两个字段承担不同职责：
+
+| 字段 | 用途 | 示例 |
+|---|---|---|
+| `code` | 稳定、机器可读的错误类别，供 Agent、UI 和测试进行分支判断 | `"TOOL_NOT_FOUND"` |
+| `error` | 可读的具体错误消息，携带本次调用的上下文 | `"Unknown tool: missing"` |
+
+因此“返回 `TOOL_NOT_FOUND`”是“返回一个 `code` 为 `TOOL_NOT_FOUND` 的失败对象”的简称，
+不是把错误码转换成另一个字段。例如未注册 Tool 的完整返回值是：
+
+```ts
+return {
+  ok: false,
+  toolName: options.name,
+  code: "TOOL_NOT_FOUND",
+  error: `Unknown tool: ${options.name}`,
+};
+```
+
+其余失败沿用相同 shape，只替换 `code` 和具体消息：
+
+| 失败条件 | `code` | `error` 的来源 |
+|---|---|---|
+| Tool 未注册 | `TOOL_NOT_FOUND` | 包含请求中的 Tool name |
+| Zod 校验失败 | `INVALID_TOOL_INPUT` | 使用 `parsed.error.message` 或等价摘要 |
+| 调用前或执行中被取消 | `ABORTED` | 说明本次 Tool 调用已中止 |
+| Tool 抛出其他异常 | `TOOL_EXECUTION_FAILED` | `Error.message`，非 `Error` 值用 `String(error)` |
+
+实现时按以下顺序处理，顺序不要交换：
+
+1. 根据 `name` 查找 Tool，找不到就返回 `TOOL_NOT_FOUND`；
+2. 使用 `safeParse()` 校验 `input`，失败就返回 `INVALID_TOOL_INPUT`；
+3. 在产生副作用前检查 `AbortSignal`，已经取消就返回 `ABORTED`；
+4. 使用 `parsed.data` 调用 Tool，因为它包含 Zod 执行 default、transform 等规则后的结果；
+5. 捕获 Tool 抛出的异常，将中止和普通执行失败分别归一化为稳定错误码。
+
+这里使用 `safeParse()` 而不是 `parse()`，是因为非法模型输入属于可以预期的运行结果，
+不应依赖异常控制正常分支。调用方只需要检查 `result.ok` 就能缩窄 union：成功时读取
+`value`，失败时读取 `code` 和 `error`，无需解析错误文本或捕获 Registry 异常。
+
+`list()` 同样要返回新数组，例如从 `Map.values()` 展开。这样 Provider 可以按照注册顺序
+生成 Tool definitions，同时调用方无法通过修改返回值破坏 Registry 内部状态。
+
+最后注意两个结果层级：`ToolExecutionResult` 描述 Registry 是否成功找到、校验并调用
+Tool；Tool 实现返回的 `StructuredToolResult` 则是调用成功后放在 `value` 中的业务结果。
+例如 Tool 正常运行并报告“目标文件不存在”时，Registry 仍可能返回
+`{ ok: true, value: { ok: false, ... } }`。前一个 `ok` 属于执行边界，后一个 `ok` 属于
+Tool 的业务语义，不要把两者合并判断。
 
 ### 3.3 第一个 Tool
 
@@ -1162,7 +1235,7 @@ export type { FunctionTool, Tool } from "./function-tool";
 export { errorToolResult, okToolResult } from "./structured-tool-result";
 export type { StructuredToolResult } from "./structured-tool-result";
 export { ToolRegistry } from "./tool-registry";
-export type { ToolExecutionResult } from "./tool-registry";
+export type { ToolExecutionErrorCode, ToolExecutionResult } from "./tool-registry";
 ```
 
 现在回到以下两个文件加入 `tools?: Tool[]`。
@@ -1418,18 +1491,222 @@ bun test src/foundation/tools/__tests__/tool-registry.test.ts
 
 ## 第一部分综合练习
 
-不要调用 LLM，完成一个命令：
+这个练习不调用真实 LLM，而是把前三个阶段的组件串成一条完整数据流。先创建文件：
+
+```bash
+touch examples/foundation-demo.ts
+```
+
+执行后新增结构如下：
+
+```text
+examples/
+└── foundation-demo.ts         # 串联前三阶段能力的离线综合示例
+```
+
+目标文件：`examples/foundation-demo.ts`
+
+<details>
+<summary>展开完整代码：<code>foundation-demo.ts</code></summary>
+
+```ts
+import type {
+  AssistantMessage,
+  Message,
+  NonSystemMessage,
+  ToolResultContent,
+  ToolUseContent,
+} from "@/foundation/messages";
+import { formatTranscript } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import type {
+  ModelProvider,
+  ModelProviderInvokeParams,
+} from "@/foundation/models/model-provider";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+import { addTool, ToolRegistry } from "@/foundation/tools";
+
+function textOf(message: AssistantMessage): string {
+  let text = "";
+  for (const content of message.content) {
+    if (content.type === "text") text += content.text;
+  }
+  return text;
+}
+
+function findToolUse(message: AssistantMessage): ToolUseContent {
+  for (const content of message.content) {
+    if (content.type === "tool_use") return content;
+  }
+  throw new Error("Model response did not contain a tool_use");
+}
+
+function findLatestToolResult(messages: Message[]): ToolResultContent | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "tool") continue;
+
+    for (const content of message.content) {
+      if (content.type === "tool_result") return content;
+    }
+  }
+  return undefined;
+}
+
+function readSum(value: unknown): number {
+  if (typeof value !== "object" || value === null || !("ok" in value) || value.ok !== true) {
+    throw new Error("add Tool did not return a successful StructuredToolResult");
+  }
+  if (!("data" in value) || typeof value.data !== "object" || value.data === null) {
+    throw new Error("add Tool result did not contain data");
+  }
+  if (!("sum" in value.data) || typeof value.data.sum !== "number") {
+    throw new Error("add Tool result did not contain a numeric sum");
+  }
+  return value.data.sum;
+}
+
+class DemoAddModelProvider implements ModelProvider {
+  private readonly _left: number;
+  private readonly _right: number;
+
+  constructor({ left, right }: { left: number; right: number }) {
+    this._left = left;
+    this._right = right;
+  }
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    params.signal?.throwIfAborted();
+
+    const toolResult = findLatestToolResult(params.messages);
+    if (!toolResult) {
+      return {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "add-1",
+            name: "add",
+            input: {
+              description: "计算两个数字的和",
+              left: this._left,
+              right: this._right,
+            },
+          },
+        ],
+      };
+    }
+
+    const observation: unknown = JSON.parse(toolResult.content);
+    const sum = readSum(observation);
+    return {
+      role: "assistant",
+      content: [{ type: "text", text: `计算结果是 ${sum}。` }],
+    };
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    const response = await this.invoke(params);
+    const scripted = new ScriptedModelProvider({ responses: [response] });
+    yield* scripted.stream(params);
+  }
+}
+
+const [leftText = "2", rightText = "3"] = Bun.argv.slice(2);
+const left = Number(leftText);
+const right = Number(rightText);
+if (!Number.isFinite(left) || !Number.isFinite(right)) {
+  throw new Error("Usage: bun run examples/foundation-demo.ts <left> <right>");
+}
+
+const registry = new ToolRegistry({ tools: [addTool] });
+const provider = new DemoAddModelProvider({ left, right });
+const model = new Model({ name: "demo-add", provider });
+const transcript: NonSystemMessage[] = [
+  {
+    role: "user",
+    content: [{ type: "text", text: `请计算 ${left} + ${right}。` }],
+  },
+];
+
+// 第一次模型调用根据用户消息产生 Tool call。
+const toolRequest = await model.invoke({
+  prompt: "需要计算时调用 add Tool。",
+  messages: transcript,
+  tools: registry.list(),
+});
+transcript.push(toolRequest);
+
+const toolUse = findToolUse(toolRequest);
+const execution = await registry.invoke({
+  name: toolUse.name,
+  input: toolUse.input,
+});
+
+// Registry 失败时记录执行错误；成功时把 Tool 自身的 structured result 作为 observation。
+const observation = execution.ok ? execution.value : execution;
+const observationText = JSON.stringify(observation);
+if (observationText === undefined) {
+  throw new Error("Tool observation could not be serialized");
+}
+transcript.push({
+  role: "tool",
+  content: [
+    {
+      type: "tool_result",
+      tool_use_id: toolUse.id,
+      content: observationText,
+    },
+  ],
+});
+
+// 第二次模型调用读取刚刚追加的真实 Tool result，再产生最终回答。
+let finalMessage: AssistantMessage | undefined;
+console.log("Cumulative snapshots:");
+for await (const snapshot of model.stream({
+  prompt: "根据 Tool observation 回答用户。",
+  messages: transcript,
+  tools: registry.list(),
+})) {
+  console.log(textOf(snapshot));
+  finalMessage = snapshot;
+}
+
+if (!finalMessage) {
+  throw new Error("Model stream did not yield a response");
+}
+
+transcript.push(finalMessage);
+
+console.log("\nCanonical transcript:");
+console.log(formatTranscript(transcript));
+```
+
+</details>
+
+数据流中有两个容易混淆的关联点：
+
+1. 第一次 `model.invoke()` 只在 transcript 尚无 Tool result 时产生 `tool_use`，这个消息
+   随后才被追加到 transcript，并不是预先写入 transcript；
+2. `toolUse.id` 与随后 `tool_result.tool_use_id` 都是 `"add-1"`，因此第二次模型调用能找到
+   属于这次调用的 observation；
+3. `execution.ok` 描述 Registry 是否成功完成查找、校验和调用，`execution.value` 才是
+   `addTool` 返回的 `StructuredToolResult`；
+4. `DemoAddModelProvider` 从实际 Tool result 中读取 `data.sum` 后构造最终文本，并只把
+   累计快照的生成委托给 `ScriptedModelProvider`。因此最终数字不再是预设常量。
+
+### 运行与观察
 
 ```bash
 bun run examples/foundation-demo.ts
+bun run examples/foundation-demo.ts 7 8
 ```
 
-它应当：
+第一条命令的累计快照最终是“计算结果是 5。”，第二条则会根据真实 Tool 输出得到
+“计算结果是 15。”。随后打印的 canonical transcript 依次包含 user message、模型生成的
+`tool_use`、关联的 `tool_result` 和基于该 result 生成的最终 assistant message。
 
-1. 构造一段含 `tool_use` 的 canonical transcript；
-2. 使用 `ScriptedModelProvider` 产生累计快照；
-3. 使用 `ToolRegistry` 执行 `add`；
-4. 把 structured result 追加为 `tool_result`；
-5. 使用 `formatTranscript` 输出全过程。
+这里仍然是一个确定性 fake provider：它只模拟“第一次请求 Tool、第二次读取 observation”
+这两个决策。阶段 4 会把当前显式编排的两轮调用提取为可复用的 Agent loop。
 
 如果你能解释每个对象属于 foundation 的原因，就可以进入 Agent loop。
