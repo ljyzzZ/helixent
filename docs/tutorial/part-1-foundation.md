@@ -8,6 +8,8 @@
 
 ## 阶段 0：建立可运行工程
 
+> 开始前回顾：第零部分已经覆盖本教程所需的 TypeScript 类型、模块、异步与流式基础；现在把这些知识落到一个可运行的 Bun 工程中。
+
 ### 目标
 
 - 建立 Bun + TypeScript strict 项目；
@@ -139,6 +141,8 @@ harness-lab ready
 
 ## 阶段 1：用 Message 建立单一事实源
 
+> 上一阶段回顾：阶段 0 建立了 Bun + TypeScript strict 工程、四层目录和 `bun run check` 质量门，并留下了第一个可运行 checkpoint。
+
 ### 本阶段的系统能力
 
 Agent 不是“反复拼字符串”。它维护一个有角色、有内容类型、有调用关联关系的 transcript。后续 model adapter、tool runtime、TUI、checkpoint 和 eval 都应读取同一种 `Message`。
@@ -168,15 +172,15 @@ touch examples/stage-01-transcript.ts
 执行后应得到：
 
 ```text
-src/foundation/messages/
-├── types/
-│   ├── content.ts
-│   ├── message.ts
-│   └── index.ts
-├── __tests__/
-│   └── transcript.test.ts
-├── transcript.ts
-└── index.ts
+src/foundation/messages/          # canonical Message 模块
+├── types/                        # Message 与 Content 类型定义
+│   ├── content.ts                # 定义各类 Content 及其 union
+│   ├── message.ts                # 定义各角色 Message 及其 union
+│   └── index.ts                  # 汇总导出 types
+├── __tests__/                    # Message 模块的自动化测试
+│   └── transcript.test.ts        # 验证 transcript 格式与调用关联
+├── transcript.ts                 # 将 canonical messages 格式化为可读文本
+└── index.ts                      # 导出 Message 模块的公共 API
 ```
 
 ### 1.2 类型骨架
@@ -524,6 +528,8 @@ bun test src/foundation/messages
 - [ ] `ADR-002` 解释为什么 transcript 是 single source of truth。
 
 ## 阶段 2：隔离模型与 Provider
+
+> 上一阶段回顾：阶段 1 定义了 canonical Message/Content union、Tool call 关联规则和 transcript formatter，让后续各层共享同一种对话表示。
 
 ### 本阶段的系统能力
 
@@ -918,6 +924,8 @@ bun test src/foundation/models/__tests__/model.test.ts
 - [ ] `ADR-003` 解释 delta 和 cumulative snapshot 的取舍。
 
 ## 阶段 3：Tool contract 与安全执行边界
+
+> 上一阶段回顾：阶段 2 建立了 Model/Provider 边界，并用离线 Provider 固定了 `invoke`、累计式 `stream` 和 `AbortSignal` 的契约。
 
 ### 本阶段的系统能力
 

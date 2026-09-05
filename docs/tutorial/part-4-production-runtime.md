@@ -12,6 +12,8 @@
 
 ## 阶段 11：结构化 Observability
 
+> 上一阶段回顾：阶段 10 交付了可交互 TUI、模型配置、token 展示和人工审批边界，形成了可用的基础版本。
+
 ### 本阶段目标
 
 每次 Agent run 都能回答：
@@ -747,6 +749,8 @@ bun test src/runtime/trace
 
 ## 阶段 12：Checkpoint、Resume 与 Replay
 
+> 上一阶段回顾：阶段 11 建立了结构化 trace、JSONL 存储、指标 reducer 和查询 CLI，使一次 Agent run 可以被定位和解释。
+
 ### 本阶段的真实难点
 
 保存 `messages.json` 很容易；难的是在副作用执行到一半时确定“发生过什么”。
@@ -1378,6 +1382,8 @@ bun test src/runtime/checkpoint src/runtime/replay
 - [ ] `ADR-013` 解释为什么 arbitrary Tool 无法通用 exactly-once。
 
 ## 阶段 13：Context Budget、Compaction 与可靠性策略
+
+> 上一阶段回顾：阶段 12 实现了版本化 checkpoint、write-ahead Tool intent、安全恢复和只读 replay，明确了未知副作用的处理方式。
 
 创建文件：
 

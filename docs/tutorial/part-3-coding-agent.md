@@ -6,6 +6,8 @@
 
 ## 阶段 7：实现 Provider Adapter
 
+> 上一阶段回顾：阶段 6 建立了 Middleware 生命周期和明确的 mutation boundary，把日志、审批等横切策略从 Agent 主循环中分离出来。
+
 ### 本阶段解决的问题
 
 不同模型厂商在以下方面并不一致：
@@ -45,19 +47,19 @@ touch examples/stage-07-real-model.ts
 执行后目录应为：
 
 ```text
-src/community/
-├── openai/
-│   ├── model-provider.ts
-│   ├── stream-accumulator.ts
-│   ├── utils.ts
-│   ├── __tests__/
-│   └── index.ts
-└── anthropic/
-    ├── model-provider.ts
-    ├── stream-accumulator.ts
-    ├── utils.ts
-    ├── __tests__/
-    └── index.ts
+src/community/                      # 第三方模型 Provider adapters
+├── openai/                         # OpenAI-compatible adapter
+│   ├── model-provider.ts           # 调用 SDK 并实现 ModelProvider
+│   ├── stream-accumulator.ts       # 将 OpenAI chunks 累积为 canonical snapshot
+│   ├── utils.ts                    # 转换 canonical 与 OpenAI wire types
+│   ├── __tests__/                  # OpenAI adapter 的协议测试
+│   └── index.ts                    # 导出 OpenAI adapter 公共 API
+└── anthropic/                      # Anthropic adapter
+    ├── model-provider.ts           # 调用 SDK 并实现 ModelProvider
+    ├── stream-accumulator.ts       # 将 Anthropic events 累积为 canonical snapshot
+    ├── utils.ts                    # 转换 canonical 与 Anthropic wire types
+    ├── __tests__/                  # Anthropic adapter 的协议测试
+    └── index.ts                    # 导出 Anthropic adapter 公共 API
 ```
 
 ### 7.2 先写纯转换函数
@@ -800,6 +802,8 @@ bun test src/community/openai src/community/anthropic
 
 ## 阶段 8：实现 Coding Tools
 
+> 上一阶段回顾：阶段 7 把 canonical protocol 映射到 OpenAI 与 Anthropic，并统一了 streaming、Tool call、usage 和 abort 语义。
+
 ### 本阶段原则
 
 Coding Agent 的能力不来自“更长的 prompt”，而来自高质量的环境接口。Tool 应窄、可组合、有明确 error code，并回显模型下一步决策需要的信息。
@@ -1287,6 +1291,8 @@ bun test src/coding/tools
 
 ## 阶段 9：组装 Coding Agent、Skills、Todo 与项目指令
 
+> 上一阶段回顾：阶段 8 建立了一组窄而安全的 Coding Tools，统一了 workspace boundary、结构化结果、超时与中止行为。
+
 创建新增文件：
 
 ```bash
@@ -1478,10 +1484,10 @@ export function defineAskUserQuestionTool(options: {
 准备 fixture workspace：
 
 ```text
-fixture/
-├── AGENTS.md
-├── .agents/skills/test-writer/SKILL.md
-└── src/math.ts
+fixture/                                      # 离线 Coding Agent 示例 workspace
+├── AGENTS.md                                 # 提供项目级开发约束
+├── .agents/skills/test-writer/SKILL.md       # 提供按需加载的测试 Skill
+└── src/math.ts                               # 供 Agent 检查的示例源码
 ```
 
 目标文件：`examples/stage-09-coding-agent.ts`
@@ -1891,6 +1897,8 @@ bun test src/agent/skills src/agent/todos src/coding/agents src/coding/tools/__t
 - [ ] `ADR-010` 区分 project guidance、Skill、Todo 和 transcript。
 
 ## 阶段 10：CLI/TUI、模型配置与 Human-in-the-loop
+
+> 上一阶段回顾：阶段 9 组装了 Coding Agent，并接入项目指令、渐进式 Skills、Todo 和 `ask_user_question` Tool。
 
 ### 本阶段目标
 

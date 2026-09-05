@@ -4,6 +4,8 @@
 
 ## 阶段 14：建立 Evaluation Harness
 
+> 上一阶段回顾：阶段 13 分离了 canonical transcript 与预算内 Model view，并加入 compaction、retry、Tool timeout 和 PolicyEngine。
+
 ### 14.1 分开两类评测
 
 不要把所有测试都称为 eval。
@@ -34,19 +36,19 @@ touch src/eval/__tests__/eval-runner.test.ts
 命令不会替你生成 fixture 题目答案；`fixture/` 必须是 Agent 每次 trial 收到的干净项目。
 
 ```text
-evals/
-├── tasks/
-│   ├── fix-add/
-│   │   ├── task.yaml
-│   │   ├── prompt.md
-│   │   ├── fixture/
-│   │   └── graders/
-│   │       └── test.ts
-│   └── rename-api/
-├── suites/
-│   ├── smoke.yaml
-│   └── coding-core.yaml
-└── reports/
+evals/                           # Evaluation Harness 的任务与产物根目录
+├── tasks/                       # 独立 eval tasks
+│   ├── fix-add/                 # 修复加法逻辑的示例任务
+│   │   ├── task.yaml            # 定义任务元数据、限制和 grader
+│   │   ├── prompt.md            # 保存只对 Agent 可见的用户需求
+│   │   ├── fixture/             # 提供每次 trial 的干净初始项目
+│   │   └── graders/             # 保存与 prompt 隔离的评分器
+│   │       └── test.ts          # 执行确定性任务验收
+│   └── rename-api/              # 另一个 API 重命名任务
+├── suites/                      # 组合可重复运行的任务集合
+│   ├── smoke.yaml               # 定义快速冒烟评测集
+│   └── coding-core.yaml         # 定义核心 Coding 能力评测集
+└── reports/                     # 保存 run artifacts 与汇总报告
 ```
 
 `task.yaml`：
@@ -831,6 +833,8 @@ bun test src/eval
 
 ## 阶段 15：Capstone 与作品集交付
 
+> 上一阶段回顾：阶段 14 建立了隔离运行的 Evaluation Harness、可复现实验身份、指标报告和 baseline/candidate regression gate。
+
 ### 15.1 最终项目定义
 
 你的 README 第一屏应在 30 秒内回答：
@@ -858,16 +862,16 @@ touch docs/benchmark-report.md docs/manual-test.md
 ```
 
 ```text
-README.md
-docs/
-├── architecture.md
-├── security-model.md
-├── recovery-semantics.md
-├── context-management.md
-├── evaluation-methodology.md
-├── benchmark-report.md
-├── manual-test.md
-└── decisions/
+README.md                       # 概述项目定位、运行方式与量化结果
+docs/                           # 保存设计、验证与决策文档
+├── architecture.md            # 解释分层依赖与一次 run 的数据流
+├── security-model.md          # 描述 Tool 权限、审批和信任边界
+├── recovery-semantics.md      # 定义 checkpoint、unknown 与恢复语义
+├── context-management.md      # 说明预算、分组和 compaction 策略
+├── evaluation-methodology.md  # 记录任务、grader 与统计方法
+├── benchmark-report.md        # 保存实验身份、结果和限制
+├── manual-test.md             # 固化可重复的人工验收步骤
+└── decisions/                 # 收纳各阶段 ADR
 ```
 
 `architecture.md` 画依赖方向和一次 run 数据流；`recovery-semantics.md` 明确 unknown side effect；`benchmark-report.md` 保存实验身份、原始结果和限制。

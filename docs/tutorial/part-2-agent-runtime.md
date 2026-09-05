@@ -13,6 +13,8 @@ act:   tool_use → tool runtime → tool_result → transcript
 
 ## 阶段 4：实现最小 ReAct loop
 
+> 上一阶段回顾：阶段 3 定义了 Tool schema、Registry、本地输入校验、结构化错误和中止边界，使模型只能通过显式注册的 Tool 行动。
+
 ### 本阶段限制
 
 为了看清最小算法，本阶段故意限制为：
@@ -415,6 +417,8 @@ bun test src/agent/__tests__/agent.test.ts
 - [ ] `ADR-005` 解释为什么 Tool failure 是 observation。
 
 ## 阶段 5：Streaming、并发 Tool 与 Abort
+
+> 上一阶段回顾：阶段 4 用离线模型组装了最小顺序 ReAct loop，打通了 think、act、observe、answer，并用 `maxSteps` 限制循环。
 
 ### 本阶段解决的问题
 
@@ -987,6 +991,8 @@ bun test src/agent/__tests__/agent-streaming.test.ts
 - [ ] `ADR-006` 解释 `Promise.race` pending-set 模式。
 
 ## 阶段 6：Middleware 生命周期与策略分离
+
+> 上一阶段回顾：阶段 5 为 Agent 增加了累计式 streaming、同批 Tool 并发和端到端 abort，并让 Tool result 按完成顺序可见。
 
 ### 本阶段解决的问题
 
