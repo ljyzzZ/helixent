@@ -82,6 +82,18 @@ export interface TraceEvent<TType extends string, TPayload> {
 <summary>展开完整代码：<code>events.ts</code></summary>
 
 ```ts
+import type { ApprovalDecision } from "@/coding/permissions/approval-middleware";
+import type { NonSystemMessage, TokenUsage } from "@/foundation/messages";
+
+export interface TraceEvent<TType extends string, TPayload> {
+  schemaVersion: 1;
+  runId: string;
+  sequence: number;
+  timestamp: string;
+  type: TType;
+  payload: TPayload;
+}
+
 export type RuntimeTraceEvent =
   | TraceEvent<"run_start", {
       agentName?: string;
@@ -151,6 +163,8 @@ export type RuntimeTraceEvent =
 目标文件：`src/runtime/trace/runtime-clock.ts`
 
 ```ts
+import type { RuntimeTraceEvent } from "./events";
+
 export interface RuntimeClock {
   now(): Date;
   monotonicMs(): number;
@@ -163,6 +177,12 @@ export interface IdGenerator {
 export interface TraceSink {
   append(event: RuntimeTraceEvent): Promise<void>;
 }
+
+export interface AgentRuntime {
+  clock: RuntimeClock;
+  idGenerator: IdGenerator;
+  traceSink: TraceSink;
+}
 ```
 
 Production 使用真实 clock 和 `crypto.randomUUID()`；测试使用递增 fake。不要在测试里断言真实时间或随机 UUID。
@@ -170,12 +190,19 @@ Production 使用真实 clock 和 `crypto.randomUUID()`；测试使用递增 fak
 把三项依赖作为 `Agent` 构造参数中的 `runtime` 传入；production composition root 提供默认
 实现，单元测试显式传 fake：
 
+目标文件：`src/agent/agent.ts`
+
 ```ts
-runtime?: {
-  clock: RuntimeClock;
-  idGenerator: IdGenerator;
-  traceSink: TraceSink;
-}
+import type { AgentRuntime } from "@/runtime/trace/runtime-clock";
+
+// Agent class 内：
+private readonly _runtime?: AgentRuntime;
+
+// constructor options 内：
+runtime?: AgentRuntime;
+
+// constructor body 内：
+this._runtime = options.runtime;
 ```
 
 ### 11.3 为什么不能只靠 Middleware
@@ -212,11 +239,21 @@ export function createTraceRedactor(options: {
 目标文件：`src/runtime/trace/jsonl-trace-store.ts`
 
 ```ts
+import type { RuntimeTraceEvent } from "./events";
+import type { TraceRedactor } from "./redactor";
+import type { TraceSink } from "./runtime-clock";
+
 export class JsonlTraceStore implements TraceSink {
+  private readonly _rootDir: string;
+  private readonly _redactor: TraceRedactor;
+
   constructor(options: {
     rootDir: string;
     redactor: TraceRedactor;
-  }) {}
+  }) {
+    this._rootDir = options.rootDir;
+    this._redactor = options.redactor;
+  }
 
   async append(event: RuntimeTraceEvent): Promise<void> {
     // 标准实现示例：先做纯 redaction，再序列化；原 event 不能被修改。
@@ -230,6 +267,7 @@ export class JsonlTraceStore implements TraceSink {
 
   async read(runId: string): Promise<RuntimeTraceEvent[]> {
     // TODO 5：逐行解析；空尾行忽略，错误必须报告 runId 和 1-based 行号。
+    throw new Error(`TODO: implement JsonlTraceStore.read for ${runId}`);
   }
 }
 ```
@@ -262,6 +300,8 @@ export class JsonlTraceStore implements TraceSink {
 <summary>展开完整代码：<code>metrics.ts</code></summary>
 
 ```ts
+import type { RuntimeTraceEvent } from "./events";
+
 export interface RunMetrics {
   steps: number;
   modelCalls: number;
@@ -829,6 +869,8 @@ examples/
 <summary>展开完整代码：<code>run-state.ts</code></summary>
 
 ```ts
+import type { NonSystemMessage } from "@/foundation/messages";
+
 export interface RunState {
   schemaVersion: 1;
   runId: string;
@@ -886,7 +928,11 @@ export interface FaultInjector {
 
 实现应支持在第 N 次 `hit` 抛出 `InjectedCrashError`，供示例和最终恢复测试注入确定性故障。
 
+目标文件：`src/runtime/checkpoint/checkpoint-store.ts`
+
 ```ts
+import type { RunState } from "./run-state";
+
 export interface CheckpointStore {
   save(state: RunState): Promise<void>;
   load(runId: string): Promise<RunState>;
@@ -905,12 +951,21 @@ export interface RunStateSummary {
 目标文件：`src/runtime/checkpoint/file-checkpoint-store.ts`
 
 ```ts
+import type { CheckpointStore, RunStateSummary } from "./checkpoint-store";
+import type { FaultInjector } from "./fault-injector";
+import type { RunState } from "./run-state";
+
 export class FileCheckpointStore implements CheckpointStore {
+  private readonly _rootDir: string;
+  private readonly _faultInjector?: FaultInjector;
+
   constructor(options: {
     rootDir: string;
     faultInjector?: FaultInjector;
   }) {
-    // TODO 1：保存 rootDir/faultInjector；构造阶段不访问文件系统。
+    // 构造阶段只保存依赖，不访问文件系统。
+    this._rootDir = options.rootDir;
+    this._faultInjector = options.faultInjector;
   }
 
   async save(state: RunState): Promise<void> {
@@ -968,6 +1023,11 @@ Tool 执行按以下协议：
 目标文件：`src/runtime/checkpoint/resume-run.ts`
 
 ```ts
+import type { Agent } from "@/agent/agent";
+
+import type { CheckpointStore } from "./checkpoint-store";
+import type { RunState, ToolExecutionRecord } from "./run-state";
+
 export type UnknownToolResolution = "retry" | "skip" | "ask_user";
 
 export type UnknownToolResolver = (
@@ -985,10 +1045,10 @@ export async function resumeRun(options: {
     modelOptionsFingerprint: string;
   };
 }): Promise<void> {
-  const state = await checkpointStore.load(runId);
+  const state = await options.checkpointStore.load(options.runId);
   // 标准实现示例：completed run 是稳定终态，必须在创建 Agent 前拒绝。
   if (state.status === "completed") {
-    throw new Error(`Run ${runId} is already completed`);
+    throw new Error(`Run ${options.runId} is already completed`);
   }
 
   // TODO 1：按 schemaVersion migrate；未知新版拒绝读取，不能猜字段。
@@ -1032,13 +1092,20 @@ Replay 按 sequence 消费 `message_appended` 和 lifecycle events。它展示�
 目标文件：`src/runtime/replay/replay.ts`
 
 ```ts
+import type { RuntimeTraceEvent } from "@/runtime/trace/events";
+
 export async function replayTrace(options: {
   events: RuntimeTraceEvent[];
   onEvent: (event: RuntimeTraceEvent) => void | Promise<void>;
   speed?: number;
   noDelay?: boolean;
   signal?: AbortSignal;
-}): Promise<void>;
+}): Promise<void> {
+  // TODO 1：按 sequence 稳定排序，并拒绝重复或倒退的 sequence。
+  // TODO 2：依据相邻 timestamp 和 speed 计算可中止延迟；noDelay 时跳过等待。
+  // TODO 3：依次 await options.onEvent(event)，不得请求模型或执行 Tool。
+  throw new Error("TODO: implement replayTrace");
+}
 ```
 
 这个公开契约故意不接收 ModelProvider、ToolRegistry 或 CheckpointStore，因此 replay 从类型
@@ -1485,6 +1552,9 @@ Context manager 只在 `beforeModel` 阶段生成 view，不原地删除 canonic
 目标文件：`src/runtime/context/token-estimator.ts`
 
 ```ts
+import type { Message } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
 export interface TokenEstimator {
   estimateText(text: string): number;
   estimateMessages(messages: Message[]): number;
@@ -1514,7 +1584,11 @@ available = maxInputTokens
 
 Compaction 不能逐条随意裁剪。先把 transcript 分组：
 
+目标文件：`src/runtime/context/message-groups.ts`
+
 ```ts
+import type { NonSystemMessage } from "@/foundation/messages";
+
 export interface MessageGroup {
   kind: "user_turn" | "assistant_final" | "tool_exchange";
   messages: NonSystemMessage[];
@@ -1531,14 +1605,16 @@ export interface MessageGroup {
 
 写一个 validator：
 
-目标文件：`src/runtime/context/message-groups.ts`
-
 ```ts
 export function validateToolCallPairs(messages: NonSystemMessage[]): {
   ok: boolean;
   orphanToolUseIds: string[];
   orphanToolResultIds: string[];
-};
+} {
+  // TODO 1：收集 assistant tool_use id 和 tool_result.tool_use_id。
+  // TODO 2：分别返回缺少 result 和缺少 use 的 id，结果顺序保持稳定。
+  throw new Error("TODO: implement validateToolCallPairs");
+}
 ```
 
 每次 compaction 后都执行。
@@ -1551,6 +1627,12 @@ export function validateToolCallPairs(messages: NonSystemMessage[]): {
 <summary>展开完整代码：<code>context-manager.ts</code></summary>
 
 ```ts
+import type { NonSystemMessage } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
+import type { MessageGroup } from "./message-groups";
+import type { ContextBudget, TokenEstimator } from "./token-estimator";
+
 export interface PreparedContext {
   messages: NonSystemMessage[];
   stats: {
@@ -1567,10 +1649,16 @@ export interface ConversationSummarizer {
 }
 
 export class ContextManager {
+  private readonly _estimator: TokenEstimator;
+  private readonly _summarizer: ConversationSummarizer;
+
   constructor(options: {
     estimator: TokenEstimator;
     summarizer: ConversationSummarizer;
-  }) {}
+  }) {
+    this._estimator = options.estimator;
+    this._summarizer = options.summarizer;
+  }
 
   async prepare(options: {
     messages: NonSystemMessage[];
@@ -1588,6 +1676,7 @@ export class ContextManager {
     // TODO 4：仍超限时按最旧 group 删除；最新 user message 不得删除。
     // TODO 5：validateToolCallPairs；失败属于 runtime invariant error。
     // TODO 6：返回新 messages、完整 stats，并确认 options.messages 深度不变。
+    throw new Error("TODO: implement ContextManager.prepare");
   }
 }
 ```
@@ -1618,6 +1707,9 @@ Summary 不应伪装成新的用户指令。保留最新用户消息、尚未解
 <summary>展开完整代码：<code>resilient-model-provider.ts</code></summary>
 
 ```ts
+import type { AssistantMessage } from "@/foundation/messages";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
+
 export interface RetryPolicy {
   maxAttempts: number;
   baseDelayMs: number;
@@ -1628,13 +1720,22 @@ export interface RetryPolicy {
 export type RetrySleeper = (delayMs: number, signal?: AbortSignal) => Promise<void>;
 
 export class ResilientModelProvider implements ModelProvider {
+  private readonly _provider: ModelProvider;
+  private readonly _policy: RetryPolicy;
+  private readonly _sleeper: RetrySleeper;
+  private readonly _jitter: () => number;
+
   constructor(options: {
     provider: ModelProvider;
     policy: RetryPolicy;
     sleeper: RetrySleeper;
     jitter: () => number;
   }) {
-    // TODO 1：保存依赖；构造阶段不调用 provider，也不启动 timer。
+    // 构造阶段只保存依赖，不调用 provider，也不启动 timer。
+    this._provider = options.provider;
+    this._policy = options.policy;
+    this._sleeper = options.sleeper;
+    this._jitter = options.jitter;
   }
 
   async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
@@ -1671,6 +1772,8 @@ delay = min(maxDelay, baseDelay * 2^(attempt-1)) + jitter
 
 给 Tool metadata 增加：
 
+目标文件：`src/runtime/reliability/tool-timeout.ts`
+
 ```ts
 export interface ToolRuntimeMetadata {
   effect: "read" | "write" | "process" | "network";
@@ -1683,8 +1786,6 @@ export interface ToolRuntimeMetadata {
 - write/process/network 默认不自动 retry；
 - timeout 后如果无法确认副作用是否发生，状态为 `unknown`；
 - timeout 和 abort 不能都归类为普通 execution failure。
-
-目标文件：`src/runtime/reliability/tool-timeout.ts`
 
 ```ts
 export async function invokeToolWithTimeout<T>(options: {
@@ -1713,6 +1814,12 @@ export async function invokeToolWithTimeout<T>(options: {
 <summary>展开完整代码：<code>policy-engine.ts</code></summary>
 
 ```ts
+import { resolve } from "node:path";
+
+import type { ToolUseContent } from "@/foundation/messages";
+
+import type { ToolRuntimeMetadata } from "../reliability/tool-timeout";
+
 export type PolicyDecision =
   | { action: "allow"; reason: string }
   | { action: "ask"; reason: string }
@@ -1727,11 +1834,16 @@ export interface PolicyEngine {
 }
 
 export class DefaultPolicyEngine implements PolicyEngine {
+  private readonly _workspace: string;
+  private readonly _commandPrefixRules: string[][];
+
   constructor(options: {
     workspace: string;
     commandPrefixRules: string[][];
   }) {
-    // TODO 1：保存规范化 workspace 和 prefix rules；不要执行 command。
+    // 构造阶段保存配置，不执行 command。
+    this._workspace = resolve(options.workspace);
+    this._commandPrefixRules = options.commandPrefixRules.map((rule) => [...rule]);
   }
 
   async evaluate(input: {

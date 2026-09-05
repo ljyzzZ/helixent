@@ -686,7 +686,7 @@ export class Model {
 
 </details>
 
-这里使用单一 options object 构造函数。即使参考版本存在 positional constructor，也不要为逐字一致牺牲可扩展性。
+这里统一使用单一 options object 构造函数，便于后续增加 provider 配置而不改变参数顺序。
 
 ### 2.2 离线 ScriptedModelProvider
 
@@ -767,6 +767,18 @@ hello
 > 网络读取本身是异步的，天然适合通过 `yield` 产生流式输出。
 > 这里没有真实网络流，因此 `ScriptedModelProvider` 的 `async *stream()` 方法会主动拆分
 > 完整 response 的文本块来模拟这一过程。
+
+目标文件：`src/foundation/models/index.ts`
+
+完成 `ScriptedModelProvider` 后，通过 barrel 统一导出 Model 层公共 API，后续测试才能使用
+`import { Model, ScriptedModelProvider } from "@/foundation/models"`：
+
+```ts
+export type { ModelContext } from "./model-context";
+export { Model } from "./model";
+export type { ModelProvider, ModelProviderInvokeParams } from "./model-provider";
+export { ScriptedModelProvider } from "./scripted-model-provider";
+```
 
 ### 2.3 离线流式示例
 

@@ -80,12 +80,18 @@ OpenAI adapter 至少拆成以下函数。`convertToOpenAITools()` 是标准实�
 <summary>展开完整代码：<code>utils.ts</code></summary>
 
 ```ts
+import OpenAI from "openai";
+
+import type { AssistantMessage, Message, TokenUsage } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
 export function convertToOpenAIMessages(
   messages: Message[],
 ): OpenAI.ChatCompletionMessageParam[] {
   // TODO 1：system/user text 直接转换；image_url 只允许出现在 user。
   // TODO 2：assistant 的 text 与 tool_use 合并为一条 wire message。
   // TODO 3：每个 ToolResultContent 转成带 tool_call_id 的 tool role message。
+  throw new Error("TODO: implement convertToOpenAIMessages");
 }
 
 export function convertToOpenAITools(
@@ -109,6 +115,7 @@ export function parseOpenAIAssistantMessage(
   // TODO 4：content 转为 text；reasoning_content 转为 thinking（若 endpoint 提供）。
   // TODO 5：tool_calls arguments 用 JSON.parse；最终仍非法时抛出带 call id 的转换错误。
   // TODO 6：usage 缺省时不要伪造 0，保持 AssistantMessage.usage 为 undefined。
+  throw new Error("TODO: implement parseOpenAIAssistantMessage");
 }
 ```
 
@@ -119,6 +126,11 @@ export function parseOpenAIAssistantMessage(
 实现 Anthropic 协议转换函数：
 
 ```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+import type { AssistantMessage, Message } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
 export function extractSystemPrompt(messages: Message[]): string | undefined {
   // TODO 1：只收集 system text，并用两个换行连接；没有 system 时返回 undefined。
   // 参数规则：不得修改 messages，也不得把非 system 内容混入 prompt。
@@ -155,6 +167,8 @@ export function parseAnthropicAssistantMessage(message: Anthropic.Message): Assi
 <summary>展开完整代码：<code>stream-accumulator.ts</code></summary>
 
 ```ts
+import type { AssistantMessage, TokenUsage } from "@/foundation/messages";
+
 export interface ProviderChunk {
   textDelta?: string;
   thinkingDelta?: string;
@@ -190,6 +204,7 @@ export class StreamAccumulator {
   snapshot(): AssistantMessage {
     // TODO 4：按稳定顺序构造完整 content 数组；argumentsText 不完整时暂用 {}。
     // TODO 5：返回新对象和新数组，调用方修改 snapshot 不能污染 accumulator。
+    throw new Error("TODO: implement StreamAccumulator.snapshot");
   }
 }
 ```
@@ -202,6 +217,8 @@ Anthropic event 先转成以下固定 provider-local union，再进入同名 acc
 event type 泄漏到 Agent：
 
 ```ts
+import type { AssistantMessage } from "@/foundation/messages";
+
 export type ProviderChunk =
   | { type: "text_delta"; index: number; text: string }
   | { type: "thinking_delta"; index: number; thinking: string }
@@ -342,6 +359,11 @@ describe("Anthropic StreamAccumulator", () => {
 目标文件：`src/community/openai/model-provider.ts`
 
 ```ts
+import OpenAI from "openai";
+
+import type { AssistantMessage } from "@/foundation/messages";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
+
 export class OpenAIModelProvider implements ModelProvider {
   private readonly _client: OpenAI;
 
@@ -355,6 +377,7 @@ export class OpenAIModelProvider implements ModelProvider {
 
   async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
     // TODO 1：构造 request → client.chat.completions.create → parse；透传 signal。
+    throw new Error("TODO: implement OpenAIModelProvider.invoke");
   }
 
   async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
@@ -885,6 +908,8 @@ examples/
 创建 `src/coding/tools/tool-utils.ts`：
 
 ```ts
+import { resolve } from "node:path";
+
 export type PathValidationResult =
   | { ok: true; path: string }
   | { ok: false; code: "INVALID_PATH" | "PATH_OUTSIDE_WORKSPACE"; error: string };
@@ -900,6 +925,7 @@ export async function resolveWorkspacePath(options: {
   // TODO 2：向上找到 absolutePath 最近的已存在祖先并 realpath，处理 symlink。
   // TODO 3：用 relative(realCwd, realAncestor) 判断是否越界；拒绝 ".." 和绝对结果。
   // TODO 4：将尚不存在的尾部路径重新接到真实祖先，并返回最终 path。
+  throw new Error("TODO: implement resolveWorkspacePath");
 }
 ```
 
@@ -929,6 +955,10 @@ export async function resolveWorkspacePath(options: {
 绑定 workspace；`cwd` 是已初始化的可信边界，不允许模型通过 Tool input 修改：
 
 ```ts
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
 export function defineReadFileTool(options: { cwd: string; maxCharacters?: number }) {
   return defineTool({
     name: "read_file",
@@ -948,6 +978,7 @@ export function defineReadFileTool(options: { cwd: string; maxCharacters?: numbe
       // TODO 3：startLine/endLine 必须成对满足 1 <= start <= end <= lineCount。
       // TODO 4：全文件读取返回原文；范围读取返回带 1-based 行号的文本。
       // TODO 5：应用字符上限并在截断时添加明确 marker。
+      throw new Error("TODO: implement read_file");
     },
   });
 }
@@ -1004,6 +1035,8 @@ ABORTED
 用 `defineCodingTools()` 创建阶段 8 的全部 Tool：
 
 ```ts
+import type { Tool } from "@/foundation/tools";
+
 export interface DefineCodingToolsOptions {
   cwd: string;
   bashTimeoutMs?: number;
@@ -1370,9 +1403,17 @@ examples/
 
 ### 9.1 Coding Agent composition root
 
-不要把 Coding 逻辑放回通用 `Agent`。创建：
+不要把 Coding 逻辑放回通用 `Agent`。
+
+目标文件：`src/coding/agents/coding-agent.ts`
 
 ```ts
+import { Agent } from "@/agent/agent";
+import type { AgentMiddleware } from "@/agent/agent-middleware";
+import type { Model } from "@/foundation/models";
+
+import type { AskUserQuestionHandler } from "../tools/ask-user-question";
+
 export async function defineCodingAgent(options: {
   model: Model;
   cwd?: string;
@@ -1390,6 +1431,7 @@ export async function defineCodingAgent(options: {
   // TODO 3：构造绑定 cwd 的 coding tools。
   // TODO 4：构造 skills/todo/policy middlewares，顺序写入测试。
   // TODO 5：返回通用 Agent；本文件不实现 loop 或 filesystem 细节。
+  throw new Error("TODO: implement defineCodingAgent");
 }
 ```
 
@@ -1496,8 +1538,12 @@ export interface TodoWriteInput {
 }
 
 export class TodoSystem {
+  private readonly _reminderAfterSteps: number;
+  private _items: TodoItem[] = [];
+  private _lastUpdatedStep = 0;
+
   constructor(options: { reminderAfterSteps: number }) {
-    // TODO 1：保存 reminderAfterSteps，并初始化私有 Todo store/lastUpdatedStep。
+    this._reminderAfterSteps = options.reminderAfterSteps;
   }
 
   write(input: TodoWriteInput): void {
@@ -1524,7 +1570,11 @@ export class TodoSystem {
 
 Tool call 不只用于机器 API。定义 `ask_user_question`，把需要人类补充的信息表示为可等待的 Tool：
 
+目标文件：`src/coding/tools/ask-user-question.ts`
+
 ```ts
+import type { FunctionTool } from "@/foundation/tools";
+
 export type AskUserQuestionHandler = (params: {
   question: string;
   choices?: string[];
@@ -2091,6 +2141,11 @@ harness-lab config model set-default <name>
 <summary>展开完整代码：<code>state.ts</code></summary>
 
 ```ts
+import type { AgentEvent } from "@/agent/agent-event";
+import type { TodoItem } from "@/agent/todos/todo-system";
+import type { ApprovalRequest } from "@/coding/permissions/approval-middleware";
+import type { NonSystemMessage } from "@/foundation/messages";
+
 export interface AgentLoopViewState {
   messages: NonSystemMessage[];
   streaming: boolean;
@@ -2181,6 +2236,9 @@ const TOOLS_REQUIRING_APPROVAL = [
 决策：
 
 ```ts
+import type { AgentMiddleware } from "@/agent/agent-middleware";
+import type { ToolUseContent } from "@/foundation/messages";
+
 export type ApprovalDecision =
   | "allow_once"
   | "allow_always_project"
@@ -2231,6 +2289,8 @@ export function defineApprovalMiddleware(options: {
 只从 assistant message 的 provider-reported usage 聚合：
 
 ```ts
+import type { NonSystemMessage } from "@/foundation/messages";
+
 export function calculateTokenUsage(messages: NonSystemMessage[]) {
   const assistantWithUsage = messages.filter(
     (message) => message.role === "assistant" && message.usage,

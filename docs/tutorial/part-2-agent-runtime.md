@@ -52,14 +52,23 @@ examples/
 
 ### 4.1 AgentContext 和 AgentEvent
 
-目标文件：`src/agent/agent-context.ts` 和 `src/agent/agent-event.ts`
+目标文件：`src/agent/agent-context.ts`
 
 ```ts
+import type { NonSystemMessage } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
 export interface AgentContext {
   prompt: string;
   messages: NonSystemMessage[];
   tools?: Tool[];
 }
+```
+
+目标文件：`src/agent/agent-event.ts`
+
+```ts
+import type { AssistantMessage, ToolMessage } from "@/foundation/messages";
 
 export type AgentEvent =
   | { type: "message"; message: AssistantMessage | ToolMessage }
@@ -96,6 +105,19 @@ export class MaximumStepsError extends Error {
 <summary>展开完整代码：<code>agent.ts</code></summary>
 
 ```ts
+import type {
+  AssistantMessage,
+  NonSystemMessage,
+  ToolMessage,
+  ToolUseContent,
+  UserMessage,
+} from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import type { Tool } from "@/foundation/tools";
+
+import type { AgentContext } from "./agent-context";
+import type { AgentEvent } from "./agent-event";
+
 export class Agent {
   private readonly _context: AgentContext;
 
@@ -110,12 +132,12 @@ export class Agent {
     maxSteps?: number;
   }) {
     // 标准实现示例：复制外部数组，默认最多运行 20 个 step。
-    this.model = model;
-    this.maxSteps = maxSteps ?? 20;
+    this.model = options.model;
+    this.maxSteps = options.maxSteps ?? 20;
     this._context = {
-      prompt,
-      messages: [...(messages ?? [])],
-      tools: [...(tools ?? [])],
+      prompt: options.prompt,
+      messages: [...(options.messages ?? [])],
+      tools: [...(options.tools ?? [])],
     };
   }
 
@@ -136,11 +158,13 @@ export class Agent {
 
   private _extractToolUses(message: AssistantMessage): ToolUseContent[] {
     // TODO 9：使用 filter + type predicate；禁止 `as ToolUseContent[]`。
+    throw new Error("TODO: implement Agent._extractToolUses");
   }
 
   private async _invokeTool(toolUse: ToolUseContent): Promise<ToolMessage> {
     // TODO 10：通过 ToolRegistry 执行并用 serializeToolResult 转为字符串；
     // tool_use_id 必须原样复制 toolUse.id。
+    throw new Error("TODO: implement Agent._invokeTool");
   }
 }
 ```
@@ -155,16 +179,15 @@ Provider wire protocol 通常要求 Tool result content 是字符串。定义一
 
 ```ts
 export function serializeToolResult(result: unknown): string {
+  const fallback =
+    '{"ok":false,"summary":"Tool returned a non-serializable value",' +
+    '"error":"Tool result cannot be serialized","code":"NON_SERIALIZABLE_TOOL_RESULT"}';
+
   if (typeof result === "string") return result;
   try {
-    return JSON.stringify(result);
+    return JSON.stringify(result) ?? fallback;
   } catch {
-    return JSON.stringify({
-      ok: false,
-      summary: "Tool returned a non-serializable value",
-      error: "Tool result cannot be serialized",
-      code: "NON_SERIALIZABLE_TOOL_RESULT",
-    });
+    return fallback;
   }
 }
 ```
@@ -1055,6 +1078,11 @@ examples/
 <summary>展开完整代码：<code>agent-middleware.ts</code></summary>
 
 ```ts
+import type { AssistantMessage, ToolUseContent } from "@/foundation/messages";
+import type { ModelContext } from "@/foundation/models/model-context";
+
+import type { AgentContext } from "./agent-context";
+
 export interface AgentMiddleware {
   beforeAgentRun?(params: {
     agentContext: AgentContext;
@@ -1114,12 +1142,27 @@ export interface AgentMiddleware {
 
 目标文件：`src/agent/agent.ts`
 
-在 `Agent` 内实现 `_beforeAgentRun()` 等私有方法。`_beforeModel()` 是标准实现示例；
+先在文件顶部导入 `AgentMiddleware`，再为 `Agent` 保存一份 Middleware 数组：
+
+```ts
+import type { AgentMiddleware } from "./agent-middleware";
+
+// Agent class 内：
+private readonly _middlewares: AgentMiddleware[];
+```
+
+在构造参数中增加 `middlewares?: AgentMiddleware[]`，并在 constructor 内复制数组：
+
+```ts
+this._middlewares = [...(options.middlewares ?? [])];
+```
+
+然后在 `Agent` 内实现 `_beforeAgentRun()` 等私有方法。`_beforeModel()` 是标准实现示例；
 其余 host 方法保持相同的 middleware 顺序和合并规则。
 
 ```ts
-private async _beforeModel(modelContext: ModelContext) {
-  for (const middleware of this.middlewares) {
+private async _beforeModel(modelContext: ModelContext): Promise<void> {
+  for (const middleware of this._middlewares) {
     const result = await middleware.beforeModel?.({
       modelContext,
       agentContext: this._context,
@@ -1157,6 +1200,8 @@ type BeforeToolUseDecision =
 其余 hook 完整给出，复制后可直接通过 Promise return type 检查。
 
 ```ts
+import type { AgentMiddleware } from "./agent-middleware";
+
 export function defineLifecycleRecorder(log: string[]): AgentMiddleware {
   return {
     beforeAgentRun: async () => {

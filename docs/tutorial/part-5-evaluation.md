@@ -154,6 +154,8 @@ Runner 只把 `fixture/` 复制到 trial workspace，并把 Agent 的 `cwd` 限�
 目标文件：`src/eval/types.ts`
 
 ```ts
+import type { RunMetrics } from "@/runtime/trace/metrics";
+
 export interface EvalTask {
   id: string;
   version: number;
@@ -177,9 +179,16 @@ export interface EvalSuite {
 实现任务加载器：
 
 ```ts
+import { resolve } from "node:path";
+
+import type { EvalSuite, EvalTask } from "./types";
+
 export class TaskLoader {
+  private readonly _evalRoot: string;
+
   constructor(options: { evalRoot: string }) {
-    // TODO 1：保存 realpath 后的 evalRoot；构造阶段不加载任何 task。
+    // 构造阶段只规范化路径；首次加载时再通过 realpath 校验实际边界。
+    this._evalRoot = resolve(options.evalRoot);
   }
 
   async loadTask(taskDirectory: string): Promise<EvalTask> {
@@ -263,7 +272,7 @@ LLM judge 适合评价解释质量或开放式结果，但会引入额外模型�
 定义 `EvalRunner` 依赖的接口：
 
 <details>
-<summary>展开完整代码：<code>types.ts</code></summary>
+<summary>展开代码：<code>types.ts</code> 的 EvalRunner 依赖接口</summary>
 
 ```ts
 export type EvalConfig = Record<string, unknown>;
@@ -327,6 +336,17 @@ export interface EvalSuiteResult {
 <summary>展开完整代码：<code>eval-runner.ts</code></summary>
 
 ```ts
+import type {
+  EvalAgentFactory,
+  EvalArtifactStore,
+  EvalConfig,
+  EvalIdentityProvider,
+  EvalSuiteResult,
+  EvalTaskLoader,
+  EvalWorkspaceFactory,
+  GraderRunner,
+} from "./types";
+
 export class EvalRunner {
   private readonly _taskLoader: EvalTaskLoader;
   private readonly _workspaceFactory: EvalWorkspaceFactory;
@@ -373,6 +393,7 @@ export class EvalRunner {
     // TODO 4：无论成功失败都保存 patch、trace、grader output；路径必须在 eval root 内。
     // TODO 5：aggregate 时排除 infra_error 的能力分母，同时单独报告其数量。
     // TODO 6：signal 中止后不启动新 trial，等待已启动 trial 清理后持久化部分报告。
+    throw new Error(`TODO: implement EvalRunner.runSuite for ${suite.name}`);
   }
 }
 ```
