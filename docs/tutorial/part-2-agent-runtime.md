@@ -28,10 +28,11 @@ act:   tool_use → tool runtime → tool_result → transcript
 创建文件：
 
 ```bash
-mkdir -p src/agent/__tests__ examples
+mkdir -p src/agent/__tests__ examples/__tests__
 touch src/agent/agent-context.ts src/agent/agent-event.ts src/agent/agent.ts
 touch src/agent/errors.ts src/agent/serialize-tool-result.ts src/agent/index.ts
 touch src/agent/__tests__/agent.test.ts examples/stage-04-react-loop.ts
+touch examples/message-stream-printer.ts examples/__tests__/message-stream-printer.test.ts
 ```
 
 执行后新增结构如下：
@@ -47,7 +48,19 @@ src/agent/                              # 通用 Agent runtime
 └── __tests__/
     └── agent.test.ts                   # 验证循环终止、Tool observation 等不变量
 examples/
-└── stage-04-react-loop.ts              # 用离线脚本模型演示一次完整 ReAct 循环
+├── stage-04-react-loop.ts              # 用离线脚本模型演示一次完整 ReAct 循环
+├── message-stream-printer.ts           # 重放完整消息，在当前行逐步显示
+└── __tests__/
+    └── message-stream-printer.test.ts  # 验证逐行重放不会重复输出
+```
+
+本阶段还会修改两个阶段 2 已有文件：
+
+```text
+src/foundation/models/
+├── scripted-model-provider.ts          # 扩展 stream，为三种 assistant content 生成累计快照
+└── __tests__/
+    └── model.test.ts                   # 增加结构化 response 的回归测试
 ```
 
 ### 4.1 AgentContext 和 AgentEvent
@@ -113,6 +126,7 @@ import type {
   UserMessage,
 } from "@/foundation/messages";
 import { Model } from "@/foundation/models/model";
+import { ToolRegistry } from "@/foundation/tools";
 import type { Tool } from "@/foundation/tools";
 
 import type { AgentContext } from "./agent-context";
@@ -120,6 +134,7 @@ import type { AgentEvent } from "./agent-event";
 
 export class Agent {
   private readonly _context: AgentContext;
+  private readonly _toolRegistry: ToolRegistry;
 
   readonly model: Model;
   readonly maxSteps: number;
@@ -134,10 +149,11 @@ export class Agent {
     // 标准实现示例：复制外部数组，默认最多运行 20 个 step。
     this.model = options.model;
     this.maxSteps = options.maxSteps ?? 20;
+    this._toolRegistry = new ToolRegistry({ tools: options.tools ?? [] });
     this._context = {
       prompt: options.prompt,
       messages: [...(options.messages ?? [])],
-      tools: [...(options.tools ?? [])],
+      tools: this._toolRegistry.list(),
     };
   }
 
@@ -162,14 +178,18 @@ export class Agent {
   }
 
   private async _invokeTool(toolUse: ToolUseContent): Promise<ToolMessage> {
-    // TODO 10：通过 ToolRegistry 执行并用 serializeToolResult 转为字符串；
-    // tool_use_id 必须原样复制 toolUse.id。
+    // TODO 10：通过 this._toolRegistry.invoke() 执行。成功时序列化 result.value，
+    // 失败时序列化完整错误结果；tool_use_id 必须原样复制 toolUse.id。
     throw new Error("TODO: implement Agent._invokeTool");
   }
 }
 ```
 
 </details>
+
+`_toolRegistry` 是 Tool 执行的唯一入口，负责查找、输入校验和错误规范化；
+`AgentContext.tools` 保存 `list()` 返回的数组副本，供 Model 和 Middleware 查看可用 Tool。
+两者在构造阶段来自同一份 `options.tools`，运行过程中不要再建立临时 Registry。
 
 ### 4.3 Tool result 序列化策略
 
@@ -194,34 +214,202 @@ export function serializeToolResult(result: unknown): string {
 
 不要把原始对象塞进 canonical `ToolResultContent`，否则 checkpoint、provider converter 和 TUI 会分别发明序列化行为。
 
-### 4.4 离线 weather agent
+最后填充本阶段创建的 Agent barrel：
+
+目标文件：`src/agent/index.ts`
+
+```ts
+export { Agent } from "./agent";
+export type { AgentContext } from "./agent-context";
+export type { AgentEvent } from "./agent-event";
+export { MaximumStepsError } from "./errors";
+```
+
+这里只导出 Agent runtime 的公共入口；`serializeToolResult` 是 Agent 内部使用的协议边界，
+不需要暴露为公共 API。
+
+### 4.4 让 ScriptedModelProvider 支持三种 Content 的累计快照
+
+阶段 2 的 `ScriptedModelProvider.stream()` 只接受单个 text block。现在把它扩展为按
+content 数组顺序生成快照，每个快照都保留已经完成的 block：
+
+- `text.text` 和 `thinking.thinking` 按 Unicode code point 累积；
+- `tool_use` 保持 `id` 稳定，先累积 `name`，再逐个填充 `input` 字段。字符串字段逐字累积，
+  数字、布尔值、null、数组和嵌套对象作为一个字段值整体加入；
+- `input` 始终是对象，不把不完整的 JSON 字符串冒充 canonical input。真实 Provider 的
+  fragmented JSON 解析留到阶段 7；这里模拟的是解析后的累计对象；
+- 空 content、空文本、空 thinking 和空参数也有最终快照。中间快照相互独立，
+  最终快照与同一脚本 response 的 `invoke()` 结果深度相等。
+
+目标文件：`src/foundation/models/scripted-model-provider.ts`
+
+用下面的版本替换原文件：
+
+<details>
+<summary>展开完整代码：<code>scripted-model-provider.ts</code></summary>
+
+```ts
+import type { AssistantMessage } from "@/foundation/messages";
+
+import type { ModelProvider, ModelProviderInvokeParams } from "./model-provider";
+
+type AssistantContent = AssistantMessage["content"][number];
+
+function* textPrefixes(text: string): Generator<string> {
+  let accumulated = "";
+  if (text.length === 0) yield accumulated;
+  for (const character of text) {
+    accumulated += character;
+    yield accumulated;
+  }
+}
+
+function* contentSnapshots(content: AssistantContent): Generator<AssistantContent> {
+  if (content.type === "text") {
+    for (const text of textPrefixes(content.text)) yield { ...content, text };
+  } else if (content.type === "thinking") {
+    for (const thinking of textPrefixes(content.thinking)) yield { ...content, thinking };
+  } else {
+    for (const name of textPrefixes(content.name)) yield { ...content, name, input: {} };
+
+    let input: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(content.input)) {
+      if (typeof value === "string") {
+        for (const prefix of textPrefixes(value)) {
+          yield { ...content, input: { ...input, [key]: prefix } };
+        }
+      } else {
+        yield { ...content, input: { ...input, [key]: value } };
+      }
+      input = { ...input, [key]: value };
+    }
+  }
+}
+
+export class ScriptedModelProvider implements ModelProvider {
+  private readonly _responses: AssistantMessage[];
+  private _cursor = 0;
+
+  constructor({ responses }: { responses: AssistantMessage[] }) {
+    this._responses = structuredClone(responses);
+  }
+
+  async invoke({ signal }: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    return this._nextResponse(signal);
+  }
+
+  async *stream({ signal }: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    const response = this._nextResponse(signal);
+    const completed: AssistantContent[] = [];
+    let pending: AssistantMessage | undefined;
+
+    for (const content of response.content) {
+      for (const partial of contentSnapshots(content)) {
+        signal?.throwIfAborted();
+        // 向前看一个快照，避免额外重复发送最后一个完整快照。
+        if (pending) yield pending;
+        pending = { role: "assistant", content: structuredClone([...completed, partial]) };
+      }
+      completed.push(content);
+    }
+    signal?.throwIfAborted();
+    yield response;
+  }
+
+  private _nextResponse(signal?: AbortSignal): AssistantMessage {
+    signal?.throwIfAborted();
+    const response = this._responses[this._cursor];
+    if (!response) {
+      throw new Error("ScriptedModelProvider has no response left");
+    }
+    this._cursor += 1;
+    return structuredClone(response);
+  }
+}
+```
+
+</details>
+
+`invoke()` 和 `stream()` 共用 `_nextResponse()`，每次调用只推进一次 cursor。构造函数、
+读取 response 和中间快照各自复制数据，避免消费者修改快照时污染后续输出。
+`pending` 暂存最新快照：只有发现下一个快照时才把它作为中间结果发出；遍历结束后直接
+发送原始完整 response，因此最终结果保留 usage 等元数据。这里按迭代结束判断响应完成，无需增加新的 Message 字段。
+
+### 4.5 离线 weather agent
+
+阶段 4 的 Agent 仍只对外返回完整 `message`，不转发模型的中间快照。这里把流式展示
+放在示例层：收到完整 assistant message 后，用新的 `ScriptedModelProvider` 将这条消息
+重放成累计快照，再把新增字符写到终端。
+
+这是消息完成后的展示重放；模型生成期间的进度仍留到阶段 5。Tool 返回的 `ToolMessage`
+不属于 `ModelProvider` 的输出类型，它的结果行直接交给逐字 `write` 函数。
+
+目标文件：`examples/message-stream-printer.ts`
+
+```ts
+import type { AssistantMessage, ToolMessage } from "@/foundation/messages";
+import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
+
+/** 在展示层逐行重放完整消息，write 可注入终端输出或测试收集函数。 */
+export function defineMessagePrinter({ write }: {
+  write: (text: string) => void | Promise<void>;
+}): (message: AssistantMessage | ToolMessage) => Promise<void> {
+  return async (message) => {
+    if (message.role === "tool") {
+      for (const item of message.content) {
+        await write(`[tool/tool_result] #${item.tool_use_id} ${item.content}`);
+        await write("\n");
+      }
+      return;
+    }
+
+    let contentIndex = 0;
+    let written = "";
+    let lineOpen = false;
+
+    async function printSnapshot(snapshot: AssistantMessage, complete: boolean): Promise<void> {
+      while (contentIndex < snapshot.content.length) {
+        const item = snapshot.content[contentIndex];
+        if (!item) break;
+        const label = item.type === "text" ? "assistant" : `assistant/${item.type}`;
+        const body = item.type === "text" ? item.text
+          : item.type === "thinking" ? item.thinking : item.name;
+
+        if (!lineOpen) {
+          await write(`[${label}] `);
+          lineOpen = true;
+        }
+        await write(body.slice(written.length));
+        written = body;
+
+        if (!complete && contentIndex === snapshot.content.length - 1) break;
+        if (item.type === "tool_use") await write(` #${item.id}`);
+        await write("\n");
+        contentIndex += 1;
+        written = "";
+        lineOpen = false;
+      }
+    }
+
+    const replay = new ScriptedModelProvider({ responses: [message] });
+    for await (const snapshot of replay.stream({ model: "display-replay", messages: [] })) {
+      await printSnapshot(snapshot, false);
+    }
+    await printSnapshot(message, true);
+  };
+}
+```
+
+每次重放独立记录当前 block 及已经写出的正文长度，只追加累计快照中新增的后缀。
+下一个 block 出现或重放结束时才换行，因此不会把 `上`、`上海` 等累计内容重复打印。
+Tool call 行逐步显示 name，完成时补上稳定的 id；input 也在重放快照中逐步补齐，
+简短展示沿用原来的 `name #id` 格式。
 
 目标文件：`examples/stage-04-react-loop.ts`
 
-准备两个 scripted responses。以下是示例输入：第一个 response 发出 Tool call，第二个
-response 给最终文本；`weather-1` 在这次 run 中必须唯一。
-
-```ts
-const responses: AssistantMessage[] = [
-  {
-    role: "assistant",
-    content: [
-      {
-        type: "tool_use",
-        id: "weather-1",
-        name: "get_weather",
-        input: { description: "查询北京天气", city: "北京" },
-      },
-    ],
-  },
-  {
-    role: "assistant",
-    content: [{ type: "text", text: "北京今天晴，26°C。" }],
-  },
-];
-```
-
-`get_weather` 返回固定结果，不访问网络。下面是完整的可运行示例：
+下面使用一个确定性的 fake provider：第一轮
+生成 `tool_use`，第二轮按 `tool_use_id` 读取真实 Tool exchange，再根据 observation 生成文本。
+`get_weather` 使用传入的 `city` 生成离线结果，不访问网络。
 
 <details>
 <summary>展开完整代码：<code>stage-04-react-loop.ts</code></summary>
@@ -230,28 +418,119 @@ const responses: AssistantMessage[] = [
 import { z } from "zod";
 
 import { Agent } from "@/agent/agent";
-import type { AssistantMessage, ToolMessage, UserMessage } from "@/foundation/messages";
+import type {
+  AssistantMessage,
+  Message,
+  ToolResultContent,
+  ToolUseContent,
+  UserMessage,
+} from "@/foundation/messages";
 import { Model } from "@/foundation/models/model";
+import type {
+  ModelProvider,
+  ModelProviderInvokeParams,
+} from "@/foundation/models/model-provider";
 import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
 import { defineTool } from "@/foundation/tools/function-tool";
 
-const responses: AssistantMessage[] = [
-  {
-    role: "assistant",
-    content: [
-      {
-        type: "tool_use",
-        id: "weather-1",
-        name: "get_weather",
-        input: { description: "查询北京天气", city: "北京" },
-      },
-    ],
-  },
-  {
-    role: "assistant",
-    content: [{ type: "text", text: "北京今天晴，26°C。" }],
-  },
-];
+import { defineMessagePrinter } from "./message-stream-printer";
+
+interface WeatherObservation {
+  city: string;
+  condition: string;
+  temperatureC: number;
+}
+
+function findLatestWeatherExchange(messages: Message[]): {
+  toolUse: ToolUseContent;
+  toolResult: ToolResultContent;
+} | undefined {
+  for (let resultIndex = messages.length - 1; resultIndex >= 0; resultIndex -= 1) {
+    const resultMessage = messages[resultIndex];
+    if (resultMessage?.role !== "tool") continue;
+
+    for (const toolResult of resultMessage.content) {
+      for (let useIndex = resultIndex - 1; useIndex >= 0; useIndex -= 1) {
+        const useMessage = messages[useIndex];
+        if (useMessage?.role !== "assistant") continue;
+
+        const toolUse = useMessage.content.find(
+          (item): item is ToolUseContent =>
+            item.type === "tool_use" && item.id === toolResult.tool_use_id,
+        );
+        if (toolUse?.name === "get_weather") return { toolUse, toolResult };
+      }
+    }
+  }
+  return undefined;
+}
+
+function parseWeatherObservation(content: string): WeatherObservation {
+  const value: unknown = JSON.parse(content);
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("city" in value) ||
+    typeof value.city !== "string" ||
+    !("condition" in value) ||
+    typeof value.condition !== "string" ||
+    !("temperatureC" in value) ||
+    typeof value.temperatureC !== "number"
+  ) {
+    throw new Error("get_weather returned an invalid observation");
+  }
+  return {
+    city: value.city,
+    condition: value.condition,
+    temperatureC: value.temperatureC,
+  };
+}
+
+class DemoWeatherModelProvider implements ModelProvider {
+  constructor(private readonly _city: string) {}
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    params.signal?.throwIfAborted();
+
+    const exchange = findLatestWeatherExchange(params.messages);
+    if (!exchange) {
+      return {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "weather-1",
+            name: "get_weather",
+            input: { description: `查询${this._city}天气`, city: this._city },
+          },
+        ],
+      };
+    }
+
+    const requestedCity = exchange.toolUse.input.city;
+    if (typeof requestedCity !== "string") {
+      throw new Error("get_weather tool_use did not contain a city");
+    }
+    const observation = parseWeatherObservation(exchange.toolResult.content);
+    if (observation.city !== requestedCity) {
+      throw new Error("get_weather observation does not match its tool_use");
+    }
+
+    return {
+      role: "assistant",
+      content: [{
+        type: "text",
+        text: `${requestedCity}今天${observation.condition}，${observation.temperatureC}°C。`,
+      }],
+    };
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    const response = await this.invoke(params);
+    const scripted = new ScriptedModelProvider({ responses: [response] });
+    yield* scripted.stream(params);
+  }
+}
 
 const getWeatherTool = defineTool({
   name: "get_weather",
@@ -260,32 +539,25 @@ const getWeatherTool = defineTool({
     description: z.string(),
     city: z.string(),
   }),
-  invoke: async () => "晴，26°C",
+  invoke: async ({ city }) => ({ city, condition: "晴", temperatureC: 26 }),
 });
 
+const city = Bun.argv[2]?.trim() || "北京";
 const userMessage: UserMessage = {
   role: "user",
-  content: [{ type: "text", text: "北京天气如何？" }],
+  content: [{ type: "text", text: `${city}天气如何？` }],
 };
 
-function printMessage(message: AssistantMessage | ToolMessage): void {
-  if (message.role === "assistant") {
-    for (const item of message.content) {
-      if (item.type === "tool_use") {
-        console.log(`[assistant/tool_use] ${item.name} #${item.id}`);
-      } else if (item.type === "text") {
-        console.log(`[assistant] ${item.text}`);
-      }
+const printMessage = defineMessagePrinter({
+  write: async (text) => {
+    for (const character of text) {
+      process.stdout.write(character);
+      if (character !== "\n") await Bun.sleep(20);
     }
-    return;
-  }
+  },
+});
 
-  for (const item of message.content) {
-    console.log(`[tool/tool_result] #${item.tool_use_id} ${item.content}`);
-  }
-}
-
-const provider = new ScriptedModelProvider({ responses });
+const provider = new DemoWeatherModelProvider(city);
 const agent = new Agent({
   model: new Model({ name: "scripted", provider }),
   prompt: "Use get_weather when the user asks about weather.",
@@ -298,7 +570,7 @@ console.log(`[user] ${userText}`);
 for await (const event of agent.stream(userMessage)) {
   if (event.type !== "message") continue;
   if (event.message.role === "assistant") steps += 1;
-  printMessage(event.message);
+  await printMessage(event.message);
 }
 
 console.log(`[done] steps=${steps} messages=${agent.messages.length}`);
@@ -306,23 +578,164 @@ console.log(`[done] steps=${steps} messages=${agent.messages.length}`);
 
 </details>
 
+这个 fake provider 只预设“先调用哪个 Tool”，不预设最终答案。第二轮回答读取真实的
+`tool_result`，再根据 Tool observation 生成文本。若 Agent 没有追加 `tool_result`、关联错
+`tool_use_id`，或者 Tool 返回的 city 与调用参数不一致，示例会直接失败。
+
 运行：
 
 ```bash
 bun run examples/stage-04-react-loop.ts
+bun run examples/stage-04-react-loop.ts 上海
 ```
 
-示例程序应该根据 `AgentEvent` 打印以下示例输出：
+示例只消费 `message` 事件。每收到一条完整消息，就等待这一条的展示重放结束，
+再读取下一个事件，从而保持 Tool call、Tool result、最终回答三行的顺序。
+`ScriptedModelProvider` 在模型侧用于离线响应，在展示侧用于重放已经完成的消息；
+这两个用途使用独立实例，展示不会推进模型侧的 cursor，也不会修改 transcript。
+
+每个字符间的 20ms 延迟用于看清离线演示，Provider 本身不等待。
+`get_weather` 的结果在工具执行完成后一次性返回，再由 `write` 逐字显示；
+assistant 的 name/text 也在完整消息到达后开始重放。这一阶段展示的是完整结果的逐字效果。
+
+运行 `bun run examples/stage-04-react-loop.ts 上海`，逐字显示结束后应得到：
 
 ```text
-[user] 北京天气如何？
+[user] 上海天气如何？
 [assistant/tool_use] get_weather #weather-1
-[tool/tool_result] #weather-1 晴，26°C
-[assistant] 北京今天晴，26°C。
+[tool/tool_result] #weather-1 {"city":"上海","condition":"晴","temperatureC":26}
+[assistant] 上海今天晴，26°C。
 [done] steps=2 messages=4
 ```
 
-### 4.5 完整测试
+### 4.6 完整测试
+
+先为刚刚扩展的结构化 response 增加回归测试。
+
+目标文件：`src/foundation/models/__tests__/model.test.ts`
+
+在文件末尾增加：
+
+<details>
+<summary>展开新增测试：<code>model.test.ts</code></summary>
+
+```ts
+async function collectSnapshots(provider: ScriptedModelProvider): Promise<AssistantMessage[]> {
+  const snapshots: AssistantMessage[] = [];
+  for await (const snapshot of provider.stream({ model: "scripted", messages: [] })) {
+    snapshots.push(snapshot);
+  }
+  return snapshots;
+}
+
+test("streams thinking, tool_use and text without losing earlier blocks", async () => {
+  const response: AssistantMessage = {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "查🤔" },
+      {
+        type: "tool_use", id: "call-1", name: "get_weather",
+        input: { city: "上海", days: 2, options: { units: "celsius" } },
+      },
+      { type: "text", text: "好🌤" },
+    ],
+    usage: { promptTokens: 2, completionTokens: 3, totalTokens: 5 },
+  };
+  const snapshots = await collectSnapshots(new ScriptedModelProvider({ responses: [response] }));
+  const invoked = await new ScriptedModelProvider({ responses: [response] })
+    .invoke({ model: "scripted", messages: [] });
+
+  expect(snapshots[0]?.content).toEqual([{ type: "thinking", thinking: "查" }]);
+  expect(snapshots.some((snapshot) => snapshot.content.some(
+    (item) => item.type === "tool_use" && item.name === "g" && item.id === "call-1",
+  ))).toBe(true);
+  expect(snapshots.some((snapshot) => snapshot.content.some(
+    (item) => item.type === "tool_use" && item.input.city === "上",
+  ))).toBe(true);
+  expect(snapshots.some((snapshot) => snapshot.content.some(
+    (item) => item.type === "text" && item.text === "好",
+  ))).toBe(true);
+  for (const snapshot of snapshots) {
+    if (snapshot.content.length >= 2) expect(snapshot.content[0]).toEqual(response.content[0]);
+    if (snapshot.content.length === 3) expect(snapshot.content[1]).toEqual(response.content[1]);
+  }
+  expect(snapshots.at(-1)).toEqual(invoked);
+});
+
+test("emits a final snapshot for empty content and empty blocks", async () => {
+  const contents: AssistantMessage["content"][] = [
+    [],
+    [{ type: "text", text: "" }],
+    [{ type: "thinking", thinking: "" }],
+    [{ type: "tool_use", id: "empty", name: "noop", input: {} }],
+    [
+      { type: "thinking", thinking: "" },
+      { type: "tool_use", id: "empty", name: "noop", input: { value: "", enabled: false, data: null, items: [] } },
+      { type: "text", text: "" },
+    ],
+  ];
+  for (const content of contents) {
+    const response: AssistantMessage = { role: "assistant", content };
+    const snapshots = await collectSnapshots(new ScriptedModelProvider({ responses: [response] }));
+    expect(snapshots.length).toBeGreaterThan(0);
+    expect(snapshots.at(-1)).toEqual(response);
+  }
+});
+
+test("isolates snapshots from consumers and the original script", async () => {
+  const response: AssistantMessage = {
+    role: "assistant",
+    content: [
+      { type: "tool_use", id: "call-1", name: "go", input: { nested: { value: 1 }, city: "上海" } },
+      { type: "text", text: "完成" },
+    ],
+  };
+  const expected = structuredClone(response);
+  const provider = new ScriptedModelProvider({ responses: [response] });
+  response.content.length = 0;
+  const stream = provider.stream({ model: "scripted", messages: [] });
+  for await (const snapshot of stream) {
+    const item = snapshot.content[0];
+    if (item?.type === "tool_use" && item.input.nested) {
+      Object.assign(item.input.nested, { value: 99 });
+      item.name = "changed";
+      snapshot.content.length = 0;
+      // 此时后面还有 city 和 text；继续读取，验证它们未受修改影响。
+      let final: AssistantMessage | undefined;
+      for await (const remaining of stream) final = remaining;
+      expect(final).toEqual(expected);
+      return;
+    }
+  }
+  throw new Error("Expected an intermediate snapshot containing nested input");
+});
+
+test("checks abort before consuming a response and between snapshots", async () => {
+  const first: AssistantMessage = { role: "assistant", content: [{ type: "thinking", thinking: "想一想" }] };
+  const second: AssistantMessage = { role: "assistant", content: [{ type: "text", text: "next" }] };
+  const provider = new ScriptedModelProvider({ responses: [first, second] });
+  const aborted = new AbortController();
+  aborted.abort();
+  const stopped = provider.stream({ model: "scripted", messages: [], signal: aborted.signal });
+  await expect(stopped.next()).rejects.toBeDefined();
+
+  const controller = new AbortController();
+  const stream = provider.stream({ model: "scripted", messages: [], signal: controller.signal });
+  const start = await stream.next();
+  expect(start.value?.content[0]).toEqual({ type: "thinking", thinking: "想" });
+  controller.abort();
+  await expect(stream.next()).rejects.toBeDefined();
+  expect(await provider.invoke({ model: "scripted", messages: [] })).toEqual(second);
+});
+```
+
+</details>
+
+先单独运行这些回归测试，确认阶段 4 对 `ScriptedModelProvider` 的适配生效：
+
+```bash
+bun test src/foundation/models/__tests__/model.test.ts
+```
 
 目标文件：`src/agent/__tests__/agent.test.ts`
 
@@ -333,34 +746,20 @@ bun run examples/stage-04-react-loop.ts
 import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
-import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import type {
+  AssistantMessage,
+  Message,
+  ToolResultContent,
+  ToolUseContent,
+  UserMessage,
+} from "@/foundation/messages";
 import { Model, ScriptedModelProvider } from "@/foundation/models";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
 import { defineTool } from "@/foundation/tools";
+import type { Tool } from "@/foundation/tools";
 
 import { Agent } from "../agent";
 import { MaximumStepsError } from "../errors";
-
-const USER_MESSAGE: UserMessage = {
-  role: "user",
-  content: [{ type: "text", text: "北京天气如何？" }],
-};
-
-const WEATHER_CALL: AssistantMessage = {
-  role: "assistant",
-  content: [
-    {
-      type: "tool_use",
-      id: "weather-1",
-      name: "get_weather",
-      input: { description: "查询北京天气", city: "北京" },
-    },
-  ],
-};
-
-const FINAL_ANSWER: AssistantMessage = {
-  role: "assistant",
-  content: [{ type: "text", text: "北京今天晴，26°C。" }],
-};
 
 const weatherTool = defineTool({
   name: "get_weather",
@@ -369,20 +768,115 @@ const weatherTool = defineTool({
   invoke: async ({ city }) => ({ city, condition: "晴", temperatureC: 26 }),
 });
 
-async function drain(agent: Agent): Promise<void> {
-  for await (const _event of agent.stream(USER_MESSAGE)) {
+function userMessage(city: string): UserMessage {
+  return {
+    role: "user",
+    content: [{ type: "text", text: `${city}天气如何？` }],
+  };
+}
+
+function findLatestWeatherExchange(messages: Message[]): {
+  toolUse: ToolUseContent;
+  toolResult: ToolResultContent;
+} | undefined {
+  for (let resultIndex = messages.length - 1; resultIndex >= 0; resultIndex -= 1) {
+    const resultMessage = messages[resultIndex];
+    if (resultMessage?.role !== "tool") continue;
+
+    for (const toolResult of resultMessage.content) {
+      for (let useIndex = resultIndex - 1; useIndex >= 0; useIndex -= 1) {
+        const useMessage = messages[useIndex];
+        if (useMessage?.role !== "assistant") continue;
+        const toolUse = useMessage.content.find(
+          (item): item is ToolUseContent =>
+            item.type === "tool_use" && item.id === toolResult.tool_use_id,
+        );
+        if (toolUse?.name === "get_weather") return { toolUse, toolResult };
+      }
+    }
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function recordFromJson(content: string): Record<string, unknown> {
+  const value: unknown = JSON.parse(content);
+  if (!isRecord(value)) {
+    throw new Error("Expected a JSON object Tool observation");
+  }
+  return value;
+}
+
+class WeatherLoopProvider implements ModelProvider {
+  constructor(private readonly _city: string) {}
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    params.signal?.throwIfAborted();
+
+    const exchange = findLatestWeatherExchange(params.messages);
+    if (!exchange) {
+      return {
+        role: "assistant",
+        content: [{
+          type: "tool_use",
+          id: "weather-1",
+          name: "get_weather",
+          input: { description: `查询${this._city}天气`, city: this._city },
+        }],
+      };
+    }
+
+    const observation = recordFromJson(exchange.toolResult.content);
+    if (observation.ok === false) {
+      const code = typeof observation.code === "string"
+        ? observation.code
+        : "UNKNOWN_TOOL_ERROR";
+      return {
+        role: "assistant",
+        content: [{ type: "text", text: `天气查询失败：${code}` }],
+      };
+    }
+
+    const city = exchange.toolUse.input.city;
+    if (
+      typeof city !== "string" ||
+      observation.city !== city ||
+      typeof observation.condition !== "string" ||
+      typeof observation.temperatureC !== "number"
+    ) {
+      throw new Error("Invalid or mismatched weather observation");
+    }
+    return {
+      role: "assistant",
+      content: [{
+        type: "text",
+        text: `${city}今天${observation.condition}，${observation.temperatureC}°C。`,
+      }],
+    };
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    const response = await this.invoke(params);
+    const scripted = new ScriptedModelProvider({ responses: [response] });
+    yield* scripted.stream(params);
+  }
+}
+
+async function drain(agent: Agent, city = "北京"): Promise<void> {
+  for await (const _event of agent.stream(userMessage(city))) {
     // 消费完整 event stream；断言统一读取 agent.messages。
   }
 }
 
 function defineWeatherAgent(options: {
-  responses?: AssistantMessage[];
-  tools?: typeof weatherTool[];
+  city?: string;
+  tools?: Tool[];
   maxSteps?: number;
 } = {}): Agent {
-  const provider = new ScriptedModelProvider({
-    responses: options.responses ?? [WEATHER_CALL, FINAL_ANSWER],
-  });
+  const provider = new WeatherLoopProvider(options.city ?? "北京");
   return new Agent({
     model: new Model({ name: "scripted", provider }),
     prompt: "Answer with tools when needed",
@@ -392,9 +886,19 @@ function defineWeatherAgent(options: {
 }
 
 describe("Agent", () => {
-  test("runs think-act-observe until the model returns text", async () => {
-    const agent = defineWeatherAgent();
-    await drain(agent);
+  test("feeds the real Tool observation into the next model step", async () => {
+    const receivedCities: string[] = [];
+    const rainyWeatherTool = defineTool({
+      name: "get_weather",
+      description: "Return a test-specific weather observation",
+      parameters: z.object({ description: z.string(), city: z.string() }),
+      invoke: async ({ city }) => {
+        receivedCities.push(city);
+        return { city, condition: "雨", temperatureC: 17 };
+      },
+    });
+    const agent = defineWeatherAgent({ city: "上海", tools: [rainyWeatherTool] });
+    await drain(agent, "上海");
 
     expect(agent.messages.map((message) => message.role)).toEqual([
       "user",
@@ -402,6 +906,17 @@ describe("Agent", () => {
       "tool",
       "assistant",
     ]);
+    expect(receivedCities).toEqual(["上海"]);
+    const toolMessage = agent.messages.find((message) => message.role === "tool");
+    expect(JSON.parse(toolMessage?.content[0]?.content ?? "null")).toEqual({
+      city: "上海",
+      condition: "雨",
+      temperatureC: 17,
+    });
+    expect(agent.messages.at(-1)).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "上海今天雨，17°C。" }],
+    });
   });
 
   test("preserves tool_use_id in the result message", async () => {
@@ -421,11 +936,14 @@ describe("Agent", () => {
     const toolMessage = agent.messages.find((message) => message.role === "tool");
 
     expect(toolMessage?.content[0]?.content).toContain("TOOL_NOT_FOUND");
-    expect(agent.messages.at(-1)).toEqual(FINAL_ANSWER);
+    expect(agent.messages.at(-1)).toEqual({
+      role: "assistant",
+      content: [{ type: "text", text: "天气查询失败：TOOL_NOT_FOUND" }],
+    });
   });
 
   test("fails with a typed error after maxSteps", async () => {
-    const agent = defineWeatherAgent({ responses: [WEATHER_CALL], maxSteps: 1 });
+    const agent = defineWeatherAgent({ maxSteps: 1 });
     expect(drain(agent)).rejects.toBeInstanceOf(MaximumStepsError);
   });
 });
@@ -435,21 +953,93 @@ describe("Agent", () => {
 
 未知 Tool 和普通 Tool failure 应反馈给模型，让模型有机会修正。只有 runtime invariant 被破坏、用户中止或达到上限时，Agent run 才整体失败。
 
+再验证展示层：只传入完整消息，也能分多次写入正文，并且每个 block 只输出一行。
+
+目标文件：`examples/__tests__/message-stream-printer.test.ts`
+
+```ts
+import { expect, test } from "bun:test";
+
+import type { AssistantMessage } from "@/foundation/messages";
+
+import { defineMessagePrinter } from "../message-stream-printer";
+
+test("replays complete weather messages incrementally without duplicate lines", async () => {
+  const chunks: string[] = [];
+  const print = defineMessagePrinter({ write: (text) => { chunks.push(text); } });
+  const call: AssistantMessage = {
+    role: "assistant",
+    content: [{ type: "tool_use", id: "weather-1", name: "get_weather", input: { city: "上海" } }],
+  };
+  const original = structuredClone(call);
+  await print(call);
+  expect(call).toEqual(original);
+  expect(chunks).toContain("g");
+  expect(chunks).toContain("e");
+  expect(chunks.join("")).toBe("[assistant/tool_use] get_weather #weather-1\n");
+
+  await print({
+    role: "tool",
+    content: [{ type: "tool_result", tool_use_id: "weather-1", content: '{"city":"上海","condition":"晴","temperatureC":26}' }],
+  });
+  await print({ role: "assistant", content: [{ type: "text", text: "上海今天晴，26°C。" }] });
+  expect(chunks).toContain("上");
+  expect(chunks).toContain("海");
+  expect(chunks.join("")).toBe(
+    '[assistant/tool_use] get_weather #weather-1\n' +
+    '[tool/tool_result] #weather-1 {"city":"上海","condition":"晴","temperatureC":26}\n' +
+    '[assistant] 上海今天晴，26°C。\n',
+  );
+});
+
+test("keeps mixed blocks, Unicode and consecutive tool calls on separate lines", async () => {
+  const chunks: string[] = [];
+  const print = defineMessagePrinter({ write: (text) => { chunks.push(text); } });
+  await print({
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "想🤔" },
+      { type: "text", text: "" },
+      { type: "tool_use", id: "a", name: "first", input: {} },
+      { type: "tool_use", id: "b", name: "second", input: {} },
+      { type: "text", text: "好🌤" },
+    ],
+  });
+  await print({ role: "assistant", content: [] });
+  expect(chunks).toContain("🤔");
+  expect(chunks).toContain("🌤");
+  expect(chunks.join("")).toBe(
+    "[assistant/thinking] 想🤔\n[assistant] \n" +
+    "[assistant/tool_use] first #a\n[assistant/tool_use] second #b\n[assistant] 好🌤\n",
+  );
+});
+```
+
 最后执行本阶段的完整测试：
 
 ```bash
-bun test src/agent/__tests__/agent.test.ts
+bun test
 ```
 
-### 阶段后对照
+### 本阶段小结
 
-- `src/agent/agent.ts` 的 `stream()`、`_think()`、`_act()`；
-- `src/agent/tool-result-runtime.ts`；
-- `src/agent/__tests__/tool-result-runtime.test.ts`。
+本阶段把 Message、Model 和 Tool 连接成最小的顺序 ReAct loop：Agent 保存 transcript，
+调用模型生成 `tool_use`，通过 ToolRegistry 执行 Tool，再将序列化后的 `tool_result`
+作为 observation 交给下一轮模型。没有 Tool call 时结束循环，超过 `maxSteps` 时抛出
+`MaximumStepsError`；普通 Tool failure 也会成为模型可见的 observation。
+
+`ScriptedModelProvider` 已支持 `text`、`thinking`、`tool_use` 及混合内容的累计快照。
+离线 weather 示例根据真实 Tool observation 生成回答，Agent 对外仍只返回完整消息，
+示例层再逐行、逐字重放这些消息。因此，展示效果与 Agent 的最小循环保持各自的职责。
+
+阶段 5 将继续加入模型生成期间的 progress、并发 Tool 调度和 AbortSignal 传递，
+阶段 6 再引入 Middleware。
 
 ### 验收
 
 - [ ] transcript 的 role 顺序正确；
+- [ ] `text`、`thinking`、`tool_use` 及混合 content 都产生累计快照；
+- [ ] 示例只消费完整 message，在展示层逐行重放，不改变 AgentEvent 或 transcript；
 - [ ] 每个 `tool_result` 都能关联 `tool_use_id`；
 - [ ] 最后一条无 Tool call 的 assistant message 终止循环；
 - [ ] `maxSteps` 是 runtime guard，不是 prompt 建议；
@@ -546,7 +1136,7 @@ async *stream(message: UserMessage): AsyncGenerator<AgentEvent> {
 ```ts
 const pending = toolUses.map(async (toolUse, index) => {
   try {
-    const result = await registry.invoke({
+    const result = await this._toolRegistry.invoke({
       name: toolUse.name,
       input: toolUse.input,
       signal,

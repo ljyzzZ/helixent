@@ -693,7 +693,7 @@ export class Model {
 目标文件：`src/foundation/models/scripted-model-provider.ts`
 
 `invoke()` 给出标准实现示例。它规定了 abort、响应耗尽和 cursor 推进的语义；
-`stream()` 由读者根据分项提示实现。
+本阶段的 `stream()` 只处理单个 text block，结构化响应会在阶段 4 引入 Tool loop 时扩展。
 
 <details>
 <summary>展开完整代码：<code>scripted-model-provider.ts</code></summary>
@@ -727,9 +727,8 @@ export class ScriptedModelProvider implements ModelProvider {
   async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
     // TODO 1：先检查 params.signal，再读取当前 response，且只推进一次 cursor。
 
-    // TODO 2：response 只含一个 text block 时，按 Unicode code point 逐步累积文本；
-    // 其他 content 组合（例如 tool_use）直接 yield 一次完整 clone，供后续阶段复用。
-    // 提示：使用 Array.from(text) 避免把 emoji 的 surrogate pair 拆开。
+    // TODO 2：本阶段要求 response 只含一个 text block，否则抛出带上下文的错误。
+    // 按 Unicode code point 逐步累积文本；使用 Array.from(text) 避免拆开 emoji。
 
     // TODO 3：每次 yield 都返回完整 AssistantMessage，例如 h、he、hel。
     // TODO 4：最后一次 yield 必须与完整 response 深度相等。
@@ -898,28 +897,6 @@ describe("Model", () => {
   test("stream yields cumulative snapshots", async () => {
     const provider = new ScriptedModelProvider({ responses: [RESPONSE] });
     expect(await collectText(provider)).toEqual(["h", "he", "hel", "hell", "hello"]);
-  });
-
-  test("streams a structured response as one complete snapshot", async () => {
-    const response: AssistantMessage = {
-      role: "assistant",
-      content: [
-        {
-          type: "tool_use",
-          id: "call-1",
-          name: "get_weather",
-          input: { city: "北京" },
-        },
-      ],
-    };
-    const provider = new ScriptedModelProvider({ responses: [response] });
-    const snapshots: AssistantMessage[] = [];
-
-    for await (const snapshot of provider.stream({ model: "scripted", messages: [] })) {
-      snapshots.push(snapshot);
-    }
-
-    expect(snapshots).toEqual([response]);
   });
 
   test("the final stream snapshot equals invoke result", async () => {
