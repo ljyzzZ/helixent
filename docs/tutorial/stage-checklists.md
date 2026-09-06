@@ -72,7 +72,7 @@
 
 ## 阶段 4：ReAct loop
 
-- [ ] 离线 demo 展示 think/act/observe/answer；
+- [ ] 离线 demo 展示 think/act/observe/answer，并能指出四个环节在最小循环中的位置；
 - [ ] transcript role 顺序正确；
 - [ ] unknown Tool 变成 observation；
 - [ ] `maxSteps` 可测试；
@@ -81,6 +81,9 @@
 
 ## 阶段 5：并发与中止
 
+- [ ] 从顺序循环提取 `_think()`、`_act()` 后，阶段 4 测试仍通过；
+- [ ] 创建并填写 `think-hints.test.ts`，在 5.1 运行全部 6 项聚焦测试；
+- [ ] assistant 消息在 `stream()` 中追加并输出一次，Tool observation 在 `_act()` 中回写；
 - [ ] 同批 Tool 并发启动；
 - [ ] 快 Tool 结果先可见；
 - [ ] 单个 Tool failure 不取消其他 Tool；

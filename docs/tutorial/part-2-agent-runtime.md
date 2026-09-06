@@ -9,7 +9,9 @@ think: transcript → model → assistant message
 act:   tool_use → tool runtime → tool_result → transcript
 ```
 
-所谓 observation 并不是隐藏的第四种状态，它就是追加进 transcript 的 `ToolMessage`。下一轮 model 调用能看到这条消息，因此可以继续决策。
+observation 就是追加进 transcript 的 `ToolMessage`，下一轮 model 调用能看到它并继续决策。
+answer 是模型返回无 Tool call 的 assistant message 后结束循环的分支。think、act、observe、answer
+描述的是流程中的四个环节，不要求实现四个同名方法。
 
 ## 阶段 4：实现最小 ReAct loop
 
@@ -113,6 +115,18 @@ export class MaximumStepsError extends Error {
 
 构造函数和 getter 是标准实现示例。getter 返回数组副本，防止调用方绕过 Agent
 直接篡改 transcript；核心 loop 留给读者按分项提示完成。
+
+本阶段把主流程集中在 `stream()` 中，先看清消息如何流转。四个环节对应下面这些 TODO：
+
+| 环节 | 在最小循环中的位置 |
+|---|---|
+| think | TODO 2～3：把当前 transcript 交给模型，取得最终 assistant message；不要求消息包含 `thinking` block。 |
+| act | TODO 6、10：按顺序执行 `tool_use`，通过 Registry 调用工具。 |
+| observe | TODO 6～7、10：将工具结果或错误转换为 `ToolMessage`，追加到 transcript，供下一轮模型读取。 |
+| answer | TODO 4～5：输出完整 assistant message；没有 Tool call 时结束循环。 |
+
+有 Tool call 时，执行工具并回写结果后继续下一轮 think，直到某轮模型生成不含 Tool call
+的最终回答。阶段 5 再从这里提取 `_think()`、`_act()`，为 progress、并发和取消信号建立清晰的修改位置。
 
 <details>
 <summary>展开完整代码：<code>agent.ts</code></summary>
@@ -346,6 +360,9 @@ export class ScriptedModelProvider implements ModelProvider {
 
 目标文件：`examples/message-stream-printer.ts`
 
+<details>
+<summary>展开完整代码：<code>message-stream-printer.ts</code></summary>
+
 ```ts
 import type { AssistantMessage, ToolMessage } from "@/foundation/messages";
 import { ScriptedModelProvider } from "@/foundation/models/scripted-model-provider";
@@ -399,6 +416,8 @@ export function defineMessagePrinter({ write }: {
   };
 }
 ```
+
+</details>
 
 每次重放独立记录当前 block 及已经写出的正文长度，只追加累计快照中新增的后缀。
 下一个 block 出现或重放结束时才换行，因此不会把 `上`、`上海` 等累计内容重复打印。
@@ -957,6 +976,9 @@ describe("Agent", () => {
 
 目标文件：`examples/__tests__/message-stream-printer.test.ts`
 
+<details>
+<summary>展开完整代码：<code>message-stream-printer.test.ts</code></summary>
+
 ```ts
 import { expect, test } from "bun:test";
 
@@ -1015,6 +1037,8 @@ test("keeps mixed blocks, Unicode and consecutive tool calls on separate lines",
 });
 ```
 
+</details>
+
 最后执行本阶段的完整测试：
 
 ```bash
@@ -1032,11 +1056,12 @@ bun test
 离线 weather 示例根据真实 Tool observation 生成回答，Agent 对外仍只返回完整消息，
 示例层再逐行、逐字重放这些消息。因此，展示效果与 Agent 的最小循环保持各自的职责。
 
-阶段 5 将继续加入模型生成期间的 progress、并发 Tool 调度和 AbortSignal 传递，
-阶段 6 再引入 Middleware。
+阶段 5 先从 `stream()` 提取 `_think()`、`_act()`，用本阶段测试确认行为一致，
+再加入模型生成期间的 progress、并发 Tool 调度和 AbortSignal 传递。阶段 6 再引入 Middleware。
 
 ### 验收
 
+- [ ] 能指出 think、act、observe、answer 在最小循环中的位置，不依赖四个同名方法；
 - [ ] transcript 的 role 顺序正确；
 - [ ] `text`、`thinking`、`tool_use` 及混合 content 都产生累计快照；
 - [ ] 示例只消费完整 message，在展示层逐行重放，不改变 AgentEvent 或 transcript；
@@ -1047,7 +1072,7 @@ bun test
 
 ## 阶段 5：Streaming、并发 Tool 与 Abort
 
-> 上一阶段回顾：阶段 4 用离线模型组装了最小顺序 ReAct loop，打通了 think、act、observe、answer，并用 `maxSteps` 限制循环。
+> 上一阶段回顾：阶段 4 在 `stream()` 中组装了最小顺序 ReAct loop，覆盖 think、act、observe、answer 四个环节，并用 `maxSteps` 限制循环。本阶段先提取模型调用和工具执行方法，再扩展运行能力。
 
 ### 本阶段解决的问题
 
@@ -1060,6 +1085,7 @@ bun test
 创建新增文件：
 
 ```bash
+touch src/agent/__tests__/think-hints.test.ts
 touch src/agent/__tests__/agent-streaming.test.ts
 touch examples/stage-05-parallel-tools.ts examples/stage-05-abort.ts
 ```
@@ -1068,11 +1094,86 @@ touch examples/stage-05-parallel-tools.ts examples/stage-05-abort.ts
 
 ```text
 src/agent/__tests__/
-└── agent-streaming.test.ts             # 验证流式快照、并行 Tool 与 abort 语义
+├── think-hints.test.ts                 # 5.1 验证 progress 分类、最终消息和 transcript 边界
+└── agent-streaming.test.ts             # 5.4 验证并行 Tool 与 abort 语义
 examples/
 ├── stage-05-parallel-tools.ts          # 演示多个 Tool call 的并行执行与稳定回写
 └── stage-05-abort.ts                   # 演示中止信号如何贯穿 model 和 Tool
 ```
+
+### 5.0 提取模型调用与工具执行
+
+目标文件：`src/agent/agent.ts`
+
+先整理已经通过阶段 4 测试的代码。模型调用即将增加 progress，工具执行即将改为并发，
+把它们分别提取出来，可以让 `stream()` 继续专注于循环编排。这一步仍顺序执行 Tool、
+只输出完整 message，不改变消息内容、顺序、终止条件或错误语义。
+
+按以下顺序移动已有逻辑：
+
+1. 把读取模型累计快照、保留最终消息的部分移入 `_think()`。它返回完整
+   `AssistantMessage`，不写入 transcript；若模型没有产生消息，抛出错误。
+2. 把顺序执行工具、追加并输出 `ToolMessage` 的部分移入 `_act()`，继续复用
+   阶段 4 的 `_invokeTool()`。
+3. `stream()` 保留用户消息追加、步数限制、assistant 消息追加与输出，以及无 Tool call 时的终止分支。
+
+下面给出提取后的标准实现供对比。用它替换原 `stream()`，并在 `Agent` 内增加两个私有方法；
+保留构造函数、getter、`_extractToolUses()`、`_invokeTool()` 及阶段 4 已补齐的 imports
+（包括 `MaximumStepsError` 和 `serializeToolResult`）。
+
+```ts
+async *stream(userMessage: UserMessage): AsyncGenerator<AgentEvent> {
+  this._context.messages.push(userMessage);
+
+  for (let step = 1; step <= this.maxSteps; step++) {
+    const assistantMessage = yield* this._think();
+    this._context.messages.push(assistantMessage);
+    yield { type: "message", message: assistantMessage };
+
+    const toolUses = this._extractToolUses(assistantMessage);
+    if (toolUses.length === 0) return;
+
+    yield* this._act(toolUses);
+  }
+
+  throw new MaximumStepsError({ maxSteps: this.maxSteps });
+}
+
+private async *_think(): AsyncGenerator<AgentEvent, AssistantMessage> {
+  let latest: AssistantMessage | undefined;
+  for await (const snapshot of this.model.stream(this._context)) {
+    latest = snapshot;
+  }
+  if (!latest) throw new Error("Model stream did not yield an assistant message");
+  return latest;
+}
+
+private async *_act(toolUses: ToolUseContent[]): AsyncGenerator<AgentEvent> {
+  for (const toolUse of toolUses) {
+    const message = await this._invokeTool(toolUse);
+    this._context.messages.push(message);
+    yield { type: "message", message };
+  }
+}
+```
+
+`AsyncGenerator<AgentEvent, AssistantMessage>` 的两个类型参数分别表示 `yield` 的事件和
+`return` 的最终值。`yield* this._think()` 会转发内部事件，并把最终返回值赋给
+`assistantMessage`。此时 `_think()` 还不 yield 事件，5.1 加入 progress 后可继续使用这个签名。
+`return latest` 本身不会向调用方发送 message event，所以 assistant 消息统一在 `stream()` 中
+先追加、再 yield，避免重复回写或输出。
+
+observe 仍由 `_invokeTool()` 构造 `ToolMessage`、`_act()` 回写结果共同完成；
+answer 仍是 `stream()` 输出无 Tool call 的 assistant message 后结束循环。
+本阶段无需增加 `_observe()`、`_answer()`，也无需为最终回答再调用一次模型。
+
+先运行阶段 4 的回归测试，再继续 5.1：
+
+```bash
+bun test src/agent/__tests__/agent.test.ts
+```
+
+天气回答仍须来自实际 Tool observation，`tool_use_id`、普通错误回写和 `maxSteps` 行为均应保持一致。
 
 ### 5.1 Streaming 状态机
 
@@ -1097,14 +1198,16 @@ abort() {
 `stream()` 必须满足：
 
 ```ts
-async *stream(message: UserMessage): AsyncGenerator<AgentEvent> {
+async *stream(userMessage: UserMessage): AsyncGenerator<AgentEvent> {
   if (this._streaming) throw new Error("Agent is already streaming");
 
   this._abortController = new AbortController();
   this._streaming = true;
   try {
-    // TODO 1：复用阶段 4 loop，并把 this._abortController.signal 同时传入 Model 和 Tool。
-    // TODO 2：累计 snapshot 只产生 progress；最后一个 snapshot 才进入 transcript。
+    // TODO 1：放入 5.0 的主循环，包括 userMessage 追加和 MaximumStepsError。
+    // userMessage 只追加一次；重入检查必须发生在追加之前。
+    // TODO 2：取本次 signal，每轮开始检查中止，并传给 _think(signal)、_act(toolUses, signal)。
+    // 在 _think 返回后、_act 完成后也检查中止，避免取消被当成正常结束或达到步数上限。
   } finally {
     this._streaming = false;
     this._abortController = null;
@@ -1114,13 +1217,190 @@ async *stream(message: UserMessage): AsyncGenerator<AgentEvent> {
 
 注意 `finally`：成功、模型异常、Tool 异常、达到 max steps 和 abort 都必须复位状态。
 
-在 `_think()` 中将 signal 放入 `ModelContext`。对 provider 每个累计 snapshot：
+先为 5.0 的 `_think()`、`_act()` 和已有 `_invokeTool()` 增加 `signal?: AbortSignal` 参数，
+保留各自的返回类型。`_act()` 调用 `_invokeTool(toolUse, signal)`，后者把 signal 传给
+`this._toolRegistry.invoke({ name: toolUse.name, input: toolUse.input, signal })`，从而贯通 Tool 调用。
 
-- 只有 text/thinking 时 yield `{ type: "progress", subtype: "thinking" }`；
-- 出现 `tool_use` 时 yield `{ type: "progress", subtype: "tool", ... }`；
-- 只有最后的完整 message 才 append 到 transcript 并产生 `message` event。
+在 `_think()` 中，将 `this.model.stream(this._context)` 改为
+`this.model.stream({ ...this._context, signal })`。这会构造本次调用的 `ModelContext`，
+不会把 signal 永久写入 `AgentContext`。
 
-不要把每个累计 snapshot 都追加到 transcript。
+接下来只在 `_think()` 的 `for await` 循环内增加 progress 生成逻辑。
+这里有两种输出：循环中的 `yield` 报告模型生成进度；循环结束后的 `return` 交付完整消息。
+为了达成这一目标，如果你在 5.0 使用了 `async _think(): Promise<AssistantMessage>`，现在需要把它改为参考实现的
+`AsyncGenerator` 异步生成器签名，并将主循环里的 `await this._think()` 改为 `yield* this._think(signal)`。
+
+按以下顺序处理每个 snapshot：
+
+1. 先执行 `latest = snapshot`，保留目前最新的累计快照。暂时不能认定它是最终消息，
+   因为 provider 后面可能还会产生新的快照。
+2. 调用已有的 `this._extractToolUses(snapshot)`，从 content 数组提取工具调用。
+   取最新的一个；空数组会得到 `undefined`，不需要类型断言。
+3. 没有工具调用时，yield `{ type: "progress", subtype: "thinking" }`。
+   这里的 `thinking` 是进度分类，普通文本生成也属于这一类，不要求 content 含 `thinking` block。
+4. 有工具调用时，yield 一个 `subtype: "tool"` 的 progress。事件的 `name` 和 `input`
+   从 `toolUseContent` 中取；input 保持对象，不做序列化。
+
+> 辅助示例：可以用这些输入判断分支是否正确。表中 A、B 表示同一累计快照内按顺序出现的两个 `tool_use`：
+> | snapshot 的 content | 本次应该 yield 的 progress |
+> |---|---|
+> | 空数组、只有 `text`、只有 `thinking`，或两者混合 | `type: "progress"`、`subtype: > "thinking"` |
+> | `text` 与工具调用 A 混合 | `type: "progress"`、`subtype: "tool"`，携带 A 的 name 和 input |
+> | 工具调用 A 与 B 同时存在，B 时序位于 A 之后 | 只产生一个工具进度事件，携带最后一个 B 的 name 和 input |
+
+本节按每个 snapshot 产生一次 progress，无需去重。`name` 和 `input` 可能还在累积，
+所以 tool progress 只表示模型正在生成工具调用；实际执行仍要等最终消息返回后进入 `_act()`。
+
+如何判断最终消息：等 `for await` 正常结束，此时 `latest` 才是最后的完整消息。
+不要在循环内部 `return snapshot`，也不要根据有没有 `tool_use` 提前结束。
+若 provider 没有产生任何快照，保留上面的空流错误；无需给 `Message` 增加完成标记。
+
+在同一文件的 `stream()` 主循环中，保留 5.0 已有的消息回写位置，并沿用本节的中止检查：
+
+```ts
+const assistantMessage = yield* this._think(signal);
+signal.throwIfAborted();
+this._context.messages.push(assistantMessage);
+yield { type: "message", message: assistantMessage };
+```
+
+这里的 signal 是本次 `AbortController.signal`。`yield*` 会把 `_think()` 的 progress 转发给外部，
+并在它结束时取得 `return latest` 的值。最终消息只在上述位置追加并输出一次；
+不要在 `_think()` 中再 yield 一个 message event 或追加 assistant 消息。
+
+完成后先自查一个最小场景：模型依次产生文本 `你`、`你好` 两个累计快照。
+外部应先收到两个 thinking progress，再收到一个正文为 `你好` 的 message event。
+对于没有历史消息的新 Agent，transcript 应只有 user 和最终 assistant 两条消息，
+不包含 progress，也不包含中间的 `你`。随后再检查表中的工具调用和混合内容分支。
+
+#### 验证 progress 与最终消息
+
+把上面的自查落实为 5.1 的聚焦测试。目标文件：`src/agent/__tests__/think-hints.test.ts`。
+
+将下面完整内容填入该文件。测试通过公开的 `Agent.stream()` 检查行为，
+无需访问私有 `_think()`。fake provider 显式给出每个累计快照，使断言不依赖分块策略。
+工具分支的测试在收到完整 assistant 消息后关闭迭代器，工具尚未开始执行，
+所以此时保留顺序 `_act()` 即可，不需要提前完成 5.2 的并发调度。
+
+<details>
+<summary>展开完整代码：<code>think-hints.test.ts</code></summary>
+
+```ts
+import { expect, test } from "bun:test";
+
+import type { AssistantMessage, ToolUseContent, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models";
+import type { ModelProvider } from "@/foundation/models";
+
+import { Agent } from "../agent";
+import type { AgentEvent } from "../agent-event";
+
+const USER: UserMessage = { role: "user", content: [{ type: "text", text: "test" }] };
+const THINKING_PROGRESS: AgentEvent = { type: "progress", subtype: "thinking" };
+const TOOL_A: ToolUseContent = { type: "tool_use", id: "a", name: "tool_a", input: { x: 1 } };
+const TOOL_B: ToolUseContent = { type: "tool_use", id: "b", name: "tool_b", input: { x: 2 } };
+
+function defineTextMessage(text: string): AssistantMessage {
+  return { role: "assistant", content: [{ type: "text", text }] };
+}
+
+function defineAgent(snapshots: AssistantMessage[]): Agent {
+  const provider: ModelProvider = {
+    invoke: async () => { throw new Error("Expected streaming model invocation"); },
+    stream: async function* ({ signal }) {
+      for (const snapshot of snapshots) {
+        signal?.throwIfAborted();
+        yield snapshot;
+      }
+    },
+  };
+  return new Agent({ model: new Model({ name: "hints", provider }), prompt: "" });
+}
+
+test("text progress precedes one final message without entering the transcript", async () => {
+  const final = defineTextMessage("你好");
+  const agent = defineAgent([defineTextMessage("你"), final]);
+  const events: AgentEvent[] = [];
+
+  for await (const event of agent.stream(USER)) {
+    if (event.type === "progress") expect(agent.messages).toEqual([USER]);
+    events.push(event);
+  }
+
+  expect(events).toEqual([
+    THINKING_PROGRESS,
+    THINKING_PROGRESS,
+    { type: "message", message: final },
+  ]);
+  expect(agent.messages).toEqual([USER, final]);
+});
+
+const cases: {
+  name: string;
+  content: AssistantMessage["content"];
+  progress: AgentEvent;
+}[] = [
+  { name: "empty content", content: [], progress: THINKING_PROGRESS },
+  {
+    name: "text with thinking",
+    content: [{ type: "thinking", thinking: "想" }, { type: "text", text: "好" }],
+    progress: THINKING_PROGRESS,
+  },
+  {
+    name: "text with a tool",
+    content: [{ type: "text", text: "查" }, TOOL_A],
+    progress: { type: "progress", subtype: "tool", name: TOOL_A.name, input: TOOL_A.input },
+  },
+  {
+    name: "the last of two tools",
+    content: [TOOL_A, TOOL_B],
+    progress: { type: "progress", subtype: "tool", name: TOOL_B.name, input: TOOL_B.input },
+  },
+];
+
+for (const scenario of cases) {
+  test(`classifies ${scenario.name}`, async () => {
+    const snapshot: AssistantMessage = { role: "assistant", content: scenario.content };
+    const agent = defineAgent([snapshot]);
+    const iterator = agent.stream(USER);
+
+    try {
+      expect(await iterator.next()).toEqual({ done: false, value: scenario.progress });
+      expect(agent.messages).toEqual([USER]);
+      expect(await iterator.next()).toEqual({
+        done: false,
+        value: { type: "message", message: snapshot },
+      });
+      expect(agent.messages).toEqual([USER, snapshot]);
+    } finally {
+      // 在进入 _act() 前结束本次迭代，同时让 stream() 的 finally 清理运行状态。
+      await iterator.return(undefined);
+    }
+  });
+}
+
+test("an empty model stream retains the error path", async () => {
+  const agent = defineAgent([]);
+  await expect(agent.stream(USER).next()).rejects.toThrow(
+    "Model stream did not yield an assistant message",
+  );
+  expect(agent.messages).toEqual([USER]);
+});
+```
+
+</details>
+
+完成 `_think()` 后，在练习项目根目录运行：
+
+```bash
+bun test src/agent/__tests__/think-hints.test.ts
+```
+
+预期为 **6 pass、0 fail**：文本的两个累计快照、表中的四种分类，以及模型空流错误。
+如果第一项就收到 message，检查是否仍用 `await` 调用 `_think()`，或遗漏了 progress 的 `yield`；
+如果工具分类失败，检查是否选中了最后一个 `tool_use` 并保留 name/input；
+如果 transcript 断言失败，检查是否把快照或 progress 提前写入，或重复追加了最终消息。
+这些测试通过后再继续 5.2；并发和 abort 的完整验证留到 5.4。
 
 ### 5.2 并发 Tool 调度
 
@@ -1129,38 +1409,37 @@ async *stream(message: UserMessage): AsyncGenerator<AgentEvent> {
 - Tool 启动顺序：按模型给出的数组顺序；
 - Tool result 进入 transcript 的顺序：按实际完成顺序。
 
-目标文件：`src/agent/agent.ts` 的 `_act()`（从阶段 4 的顺序执行逻辑中提取）。
+目标文件：`src/agent/agent.ts` 的 `_act()`（5.0 已提取，5.1 已增加 signal 参数）。
 
-核心骨架已实现“启动全部 promise”和“按完成顺序取结果”；最后一步留给读者：
+用下面的调度骨架替换 `_act()` 内部的顺序循环，保留 5.1 增加的 signal 参数。
+`_invokeTool()` 继续负责 Registry 调用、结果序列化和 `tool_use_id` 关联，
+调度器只负责启动任务与按完成顺序回写。核心骨架已实现前两步；回写步骤留给读者：
 
 ```ts
 const pending = toolUses.map(async (toolUse, index) => {
-  try {
-    const result = await this._toolRegistry.invoke({
-      name: toolUse.name,
-      input: toolUse.input,
-      signal,
-    });
-    return { index, toolUse, result };
-  } catch (error) {
-    return { index, toolUse, result: normalizeUnexpectedError(error) };
-  }
+  const message = await this._invokeTool(toolUse, signal);
+  return { index, message };
 });
 
 const remaining = new Set(pending.map((_, index) => index));
 
 while (remaining.size > 0) {
+  signal?.throwIfAborted();
   const candidates = [...remaining].map((index) => pending[index]!);
   const resolved = await Promise.race(candidates);
+  signal?.throwIfAborted();
   remaining.delete(resolved.index);
-  // TODO 3：把 resolved.result 序列化成与 resolved.toolUse.id 关联的 ToolMessage；
-  // 先 append transcript，再 yield message event。不得按 resolved.index 重新排序。
+  // TODO 3：把 resolved.message 先 append 到 transcript，再 yield message event。
+  // 不得按 resolved.index 重新排序，也不要重复序列化或再次执行 Tool。
 }
 ```
 
 为什么不直接 `Promise.all`：它虽然并发启动，但只能等最慢 Tool 完成后统一返回，用户看不到先完成的结果。
 
-每个 pending promise 必须在内部捕获普通 Tool 异常，否则 `Promise.race` 的 rejection 会让整个调度器提前退出。
+普通 Tool 异常已由阶段 3 的 Registry 捕获并规范化，再由 `_invokeTool()` 转换为
+`ToolMessage`，因此单个 Tool failure 不会通过 promise rejection 提前终止调度器。
+signal 中止则终止整个 run：Registry 即使返回结构化 `ABORTED`，runtime 仍通过
+`throwIfAborted()` 传播取消，不再进入下一轮模型调用。
 
 ### 5.3 Abort Tool
 
@@ -1612,8 +1891,11 @@ describe("Agent streaming runtime", () => {
 最后执行本阶段的完整测试：
 
 ```bash
-bun test src/agent/__tests__/agent-streaming.test.ts
+bun test src/agent/__tests__/agent.test.ts src/agent/__tests__/think-hints.test.ts src/agent/__tests__/agent-streaming.test.ts
 ```
+
+这条命令同时运行阶段 4 的循环回归、5.1 的 progress 聚焦测试，以及本节的并发和 abort 测试。
+按教程提供的测试内容，预期为 **15 pass、0 fail**。
 
 ### 阶段后对照
 
@@ -1623,6 +1905,8 @@ bun test src/agent/__tests__/agent-streaming.test.ts
 
 ### 验收
 
+- [ ] 先提取 `_think()`、`_act()` 并通过阶段 4 回归测试，再加入本阶段能力；
+- [ ] `think-hints.test.ts` 的 6 项 progress、最终消息和空流测试通过；
 - [ ] streaming snapshot 不污染 transcript；
 - [ ] Tool result 按完成顺序可见；
 - [ ] abort 能到达 model 和 Tool；
