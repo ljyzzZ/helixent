@@ -39,3 +39,8 @@ docs/.vitepress/.temp/
 .omx/
 
 .helixent
+
+# VitePress generated files
+docs/tutorial/.vitepress/cache/
+docs/tutorial/.vitepress/.temp/
+docs/tutorial/.vitepress/dist/

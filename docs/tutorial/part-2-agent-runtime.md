@@ -21,7 +21,7 @@ answer 是模型返回无 Tool call 的 assistant message 后结束循环的分�
 
 为了看清最小算法，本阶段故意限制为：
 
-- 使用离线 `ScriptedModelProvider`；
+- 使用离线 `ScriptedModelProvider` 模拟真实模型行为；
 - Tool 顺序执行；
 - 暂不支持 Middleware；
 - 暂不实现 Ctrl+C abort；
@@ -1927,6 +1927,7 @@ bun test src/agent/__tests__/agent.test.ts src/agent/__tests__/think-hints.test.
 
 ```bash
 touch src/agent/agent-middleware.ts src/agent/lifecycle-recorder.ts
+touch src/agent/__tests__/host-hooks.test.ts
 touch src/agent/__tests__/middleware.test.ts examples/stage-06-middleware.ts
 ```
 
@@ -1937,12 +1938,32 @@ src/agent/
 ├── agent-middleware.ts                 # 定义 Agent、step、model 与 Tool 生命周期 hooks
 ├── lifecycle-recorder.ts               # 提供记录 hook 调用次序的示例 Middleware
 └── __tests__/
+    ├── host-hooks.test.ts              # 聚焦验证 host 调用次数和返回值合并
     └── middleware.test.ts              # 验证 hook 顺序、mutation 与错误传播
 examples/
 └── stage-06-middleware.ts              # 演示日志等横切能力如何接入生命周期
 ```
 
 ### 6.1 Hook 契约
+
+**Hook（钩子）是程序在特定时机留出的扩展入口。** 你提供一个函数，主流程运行到约定位置时调用它，让你插入自己的逻辑。在本章中，它就是一个由 Agent runtime 调用的回调函数，名称如 `beforeModel` 表示它介入的时机。
+
+例如，Agent 原本只需要“构造请求 → 调用模型 → 处理回复”。增加 hook 后，可以在调用模型前执行 `beforeModel`，在取得最终回复后执行 `afterModel`。需要增加日志或调整本次请求时，就把逻辑放进对应 hook，无需每增加一种用途都修改 Agent 循环。
+
+Hook 常用于日志与计时、输入检查、权限审批、调整数据以及资源清理。你可能见过的 Git `pre-commit` hook 也是这个思路：Git 在提交前运行指定脚本，用来执行检查。具体到本章，可以这样选择入口：
+
+| 要做的事 | 可以使用的 hook | 它在这里负责什么 |
+|---|---|---|
+| 给本次模型请求追加提醒 | `beforeModel` | 返回本次 `ModelContext` 的修改，不永久追加到 transcript |
+| 记录模型回复中的 token 用量 | `afterModel` | 读取本次最终 `AssistantMessage`，记录统计数据 |
+| 在运行 `bash` 前询问用户 | `beforeToolUse` | 等待审批；拒绝时返回约定的 skip 结果 |
+| 在一次 Agent run 结束时收尾 | `afterAgentRun` | 按本章约定，由外层 `finally` 调用，覆盖成功、失败和中止 |
+
+这里还需要区分三个角色：**hook 是入口，Middleware 是提供这些入口实现的对象，host 是负责调用它们的 Agent。** 一个 Middleware 可以只实现自己需要的 hook，再通过 `new Agent({ middlewares: [...] })` 注册。仅仅定义一个名叫 `beforeModel` 的方法不会让它自动运行，host 必须在模型调用前显式调用它。
+
+“契约”则回答三个问题：**什么时候调用、传入什么、如何处理返回值。** 下面接口中的 `?` 表示方法可选；`Promise<...>` 表示 host 需要等待异步逻辑完成；返回 `void` 表示不请求修改上下文，返回 `Partial<...>` 表示只提供需要更新的字段，由 host 合并到对应对象。`beforeToolUse` 额外允许返回 `{ __skip: true, result }`，表示跳过真实 Tool 调用，并把 `result` 作为结果反馈给 Agent。
+
+这些返回值只有在 host 实现了对应处理逻辑后才会生效。类似地，`after` 这个名字本身也不保证失败时一定调用；是否进入 `finally`、是否覆盖终止 step，都需要像后面的实现提示一样明确规定。
 
 目标文件：`src/agent/agent-middleware.ts`
 
@@ -2016,6 +2037,33 @@ export interface AgentMiddleware {
 
 目标文件：`src/agent/agent.ts`
 
+先区分 **Middleware hook 的返回值**和 **host 方法的返回值**。例如，`beforeAgentRun()` 和 `_beforeAgentRun()` 是两个不同的方法：
+
+- `middleware.beforeAgentRun()` 由 Middleware 提供，返回 `Promise<Partial<AgentContext> | void>`，告诉 host“我想更新这些字段”或“不更新”。
+- `agent._beforeAgentRun()` 由 Agent 提供，负责依次调用上述 hook，并把返回的字段合并到 `this._context`。修改已经在方法内部完成，所以它只返回 `Promise<void>`，让 `stream()` 等待执行完成即可。
+
+它们的调用关系是：
+
+```text
+stream() 等待 _beforeAgentRun()
+  → host 等待 middleware.beforeAgentRun()
+  ← Middleware 返回更新字段，或不返回值
+  → host 执行 Object.assign(this._context, 更新字段)
+  ← host 执行结束，stream() 继续读取已更新的 this._context
+```
+
+因此，`_beforeAgentRun()` 并不是在实现 `AgentMiddleware.beforeAgentRun` 接口，而是在调用它；两者的返回类型不必一致。下划线只是本项目标记私有成员的命名约定，不会让这两个方法自动产生关联。`Promise<void>` 也不表示“没有修改任何对象”或“不会抛错”，只表示调用方不需要从返回值取得数据。
+
+`Object.assign` 自身会返回被修改的目标对象，但 host 没有写 `return Object.assign(...)`，所以不会把它继续返回。这里的 async 方法执行结束后，Promise 解析为 `undefined`；调用方持有的对象已被原地更新。
+
+如果你看的是后面的 lifecycle recorder，它属于 Middleware 实现，但同样可以不返回值：接口中的 `Partial<AgentContext> | void` 已经允许 `void` 这一分支，并不要求每个实现都返回更新字段。
+
+**合并目标要查契约，不能只看 hook 名称或传入参数。** 6.1 的 hooks 并非全部返回 `Partial<AgentContext>`：`beforeModel` 返回 `Partial<ModelContext>`，`afterModel` 返回 `Partial<AssistantMessage>`，`beforeToolUse` 还允许返回 skip 指令。
+
+实现 hooks 方法时，先查返回类型中的 `Partial<T>`，再找契约指定的那个 `T` 类型的对象，使用 `Object.assign(target, result)`。没有返回值就不合并。例如，`afterToolUse` 虽然接收 `toolResult`，但返回的是 `Partial<AgentContext>`，所以更新的是 `this._context`，不能把返回值写进 `toolResult`。`Object.assign` 只负责复制字段，不会根据类型帮你选择目标，传入错误对象也可能不被 TypeScript 拦住。
+
+`_beforeToolUse()` 是这里唯一需要把业务数据返回给调用方的 host：调用方要根据它决定是否执行真实 Tool。下面会定义 `BeforeToolUseDecision`；skip 指令必须转成这个决策返回，不能作为普通字段合并进上下文。
+
 先在文件顶部导入 `AgentMiddleware`，再为 `Agent` 保存一份 Middleware 数组：
 
 ```ts
@@ -2031,22 +2079,236 @@ private readonly _middlewares: AgentMiddleware[];
 this._middlewares = [...(options.middlewares ?? [])];
 ```
 
-然后在 `Agent` 内实现 `_beforeAgentRun()` 等私有方法。`_beforeModel()` 是标准实现示例；
-其余 host 方法保持相同的 middleware 顺序和合并规则。
+然后在 `Agent` 内实现以下三个示例中的私有方法，再按前面实现的 `Hook契约` 补齐剩余方法及其调用位置。
+
+**示例一：`_beforeModel()` 修改本次模型请求**
+
+Middleware 的 `beforeModel` 返回请求更新字段，host 合并到本次 `modelContext`：
 
 ```ts
 private async _beforeModel(modelContext: ModelContext): Promise<void> {
   for (const middleware of this._middlewares) {
+    // host 在这里真正调用 hook；
+    // ?. 让未实现 beforeModel 的 Middleware 自动跳过。
+    // await 保证当前 hook 完成并合并结果后，才轮到下一个 Middleware。
     const result = await middleware.beforeModel?.({
       modelContext,
       agentContext: this._context,
     });
+    // 只修改本次模型请求的视图。Object.assign 是浅合并：同名字段由后者覆盖。
+    // 例如返回 { messages: [...] } 会替换整个 messages 字段，而不是自动追加。
     if (result) Object.assign(modelContext, result);
   }
 }
 ```
 
+例如，给本次模型请求加提醒时，某个 `beforeModel` 可以返回包含新 `messages` 数组的对象，上面的 host 会将它合并到本次 `modelContext`；下一个 Middleware 看到的就是更新后的请求。这里虽然也传入了 `agentContext` 供读取，但返回值不会合并到它。实现 hook 时应构造新数组，避免直接 `push` 到与 transcript 共享的数组上，否则仍可能修改持久状态。
+
 所有 hooks 按 middleware 数组顺序串行执行。这样后一个 middleware 能观察前一个的结果，调用顺序也可预测。
+
+**示例二：`_beforeAgentRun()` 修改持久上下文**
+
+与 `_beforeModel()` 相比，遍历和等待逻辑不变，但传入参数及合并目标都变成了 `AgentContext`：
+
+```ts
+private async _beforeAgentRun(): Promise<void> {
+  for (const middleware of this._middlewares) {
+    const result = await middleware.beforeAgentRun?.({
+      agentContext: this._context,
+    });
+    // 修改保存在 Agent 上，后续 step 会继续使用这些字段。
+    if (result) Object.assign(this._context, result);
+  }
+}
+```
+
+TODO：在 `stream()` 中完成运行状态初始化、追加本次用户消息后，在第一轮 step 开始前调用 `await this._beforeAgentRun()`。把调用放在已有的 `try` 内，让 hook 抛错时也能进入 `finally` 清理运行状态；不要放进 step 循环，否则每一轮都会重复执行。
+
+**示例三：`_afterModel()` 修改本次最终回复**
+
+Middleware 的 `afterModel` 返回回复更新字段，host 合并到本次 `message`，不能照抄上例合并进 `AgentContext`：
+
+```ts
+private async _afterModel(message: AssistantMessage): Promise<void> {
+  for (const middleware of this._middlewares) {
+    const result = await middleware.afterModel?.({
+      agentContext: this._context,
+      message,
+    });
+    // 原地更新本次回复；下一个 Middleware 和后续 Tool 提取都读取更新后的对象。
+    if (result) Object.assign(message, result);
+  }
+}
+```
+
+TODO：在阶段 5 的 `stream()` 中，取得 `_think()` 返回的完整回复后接入它。保留已有的 abort 检查，再按下面的相对顺序组织代码；不要在每次 progress snapshot 到来时调用：
+
+```ts
+const assistantMessage = yield* this._think(signal);
+signal.throwIfAborted();
+await this._afterModel(assistantMessage);
+// hook 可能等待异步操作，等待期间用户也可能 abort。
+signal.throwIfAborted();
+this._context.messages.push(assistantMessage);
+yield { type: "message", message: assistantMessage };
+// 后续再从 assistantMessage 提取 Tool calls，沿用已有的执行与终止逻辑。
+```
+
+#### 小阶段自查
+
+目标文件：`src/agent/__tests__/host-hooks.test.ts`。
+
+这份文件用于你的练习项目，可在接入上述 host 方法后运行，不依赖后面的 lifecycle recorder。它通过公开的 `Agent.stream()` 验证行为，不直接调用私有方法。测试内的 fake provider 每次请求只返回一个完整回复，便于把注意力集中在 host 上；累计快照和 progress 仍由阶段 5 的测试覆盖。
+
+<details>
+<summary>展开完整代码：<code>host-hooks.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+import { z } from "zod";
+
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import type { ModelProvider } from "@/foundation/models/model-provider";
+import { defineTool } from "@/foundation/tools";
+
+import { Agent } from "../agent";
+import type { AgentMiddleware } from "../agent-middleware";
+
+const USER: UserMessage = {
+  role: "user",
+  content: [{ type: "text", text: "run" }],
+};
+const TOOL_CALL: AssistantMessage = {
+  role: "assistant",
+  content: [{
+    type: "tool_use",
+    id: "work-1",
+    name: "work",
+    input: { description: "verify the second model step" },
+  }],
+};
+const FINAL: AssistantMessage = {
+  role: "assistant",
+  content: [{ type: "text", text: "done" }],
+};
+
+function defineHostTestAgent(options: {
+  responses: AssistantMessage[];
+  middlewares: AgentMiddleware[];
+  invoke?: () => Promise<unknown>;
+}): Agent {
+  let cursor = 0;
+  const provider: ModelProvider = {
+    async invoke({ signal }) {
+      signal?.throwIfAborted();
+      const response = options.responses[cursor++];
+      if (!response) throw new Error("No fixture response left");
+      // 每次交付独立对象，防止 Middleware 修改共享 fixture，污染其他测试。
+      return structuredClone(response);
+    },
+    async *stream(params) {
+      yield await this.invoke(params);
+    },
+  };
+  const tool = defineTool({
+    name: "work",
+    description: "Return a fixture result",
+    parameters: z.object({ description: z.string() }),
+    invoke: options.invoke ?? (async () => "ok"),
+  });
+  return new Agent({
+    model: new Model({ name: "host-test", provider }),
+    prompt: "test",
+    tools: [tool],
+    middlewares: options.middlewares,
+    maxSteps: 3,
+  });
+}
+
+describe("Agent host hooks", () => {
+  test("calls beforeAgentRun once across two model steps", async () => {
+    const calls: string[] = [];
+    let toolCalls = 0;
+    const agent = defineHostTestAgent({
+      responses: [TOOL_CALL, FINAL],
+      middlewares: [{
+        beforeAgentRun: async () => { calls.push("beforeAgentRun"); },
+        beforeModel: async () => { calls.push("beforeModel"); },
+      }],
+      invoke: async () => {
+        toolCalls += 1;
+        return "ok";
+      },
+    });
+
+    for await (const _event of agent.stream(structuredClone(USER))) {
+      // 必须消费到结束，第二轮模型请求才会发生。
+    }
+
+    expect(calls).toEqual(["beforeAgentRun", "beforeModel", "beforeModel"]);
+    expect(toolCalls).toBe(1);
+    expect(agent.messages.map((message) => message.role)).toEqual([
+      "user", "assistant", "tool", "assistant",
+    ]);
+  });
+
+  test("merges afterModel updates before the next hook and message event", async () => {
+    const expectedContent: AssistantMessage["content"] = [
+      { type: "text", text: "reviewed: done" },
+    ];
+    const seenByNextHook: AssistantMessage["content"][] = [];
+    const emittedMessages: AssistantMessage[] = [];
+    const agent = defineHostTestAgent({
+      responses: [FINAL],
+      middlewares: [
+        {
+          afterModel: async () => {
+            await Promise.resolve();
+            // 只返回更新字段，不直接修改 message，确保测试真正检查 host 的合并。
+            return { content: structuredClone(expectedContent) };
+          },
+        },
+        {
+          afterModel: async ({ message }) => {
+            // 立即复制，固定“第二个 hook 执行时”看到的内容。
+            seenByNextHook.push(structuredClone(message.content));
+          },
+        },
+      ],
+    });
+
+    for await (const event of agent.stream(structuredClone(USER))) {
+      if (event.type === "message" && event.message.role === "assistant") {
+        // 同样记录收到事件时的快照，不能等 run 结束后才读取共享对象。
+        emittedMessages.push(structuredClone(event.message));
+      }
+    }
+
+    expect(seenByNextHook).toEqual([expectedContent]);
+    expect(emittedMessages).toHaveLength(1);
+    expect(emittedMessages[0]?.content).toEqual(expectedContent);
+    expect(agent.messages).toEqual([
+      USER,
+      { role: "assistant", content: expectedContent },
+    ]);
+  });
+});
+```
+
+</details>
+
+运行：
+
+```bash
+bun test src/agent/__tests__/host-hooks.test.ts
+```
+
+两个 host 接入正确后，预期为 **2 pass、0 fail**。如果第一个测试多出 `beforeAgentRun`，检查它是否误放进 step 循环；如果第二个 hook 仍看到 `done`，检查是否等待了前一个 hook 并将返回值合并到 `message`；如果消息事件仍是旧内容，检查 `_afterModel()` 是否放在最终 `message` 事件发出之前。
+
+测试中的 `structuredClone` 用于固定观察时刻。只保存对象引用，可能会因为对象在之后被修改而误通过，从而漏掉“先发事件、后执行 hook”的错误。
+
+#### 补齐其余 hooks
 
 为 `beforeToolUse` 单独实现 skip normalization：
 
@@ -2056,19 +2318,23 @@ type BeforeToolUseDecision =
   | { skip: true; result: unknown };
 ```
 
-当 middleware 返回 `{ __skip: true, result }` 时，runtime 不调用真实 Tool，但仍然生成正常的 `tool_result` observation。
+将 `BeforeToolUseDecision` 定义在 `Agent` class 外。对应 host 方法的签名为 `private async _beforeToolUse(toolUse: ToolUseContent): Promise<BeforeToolUseDecision>`，方法体按下面的分支提示补齐。
+
+TODO：按 Middleware 数组顺序调用 `beforeToolUse`。无返回值时继续；返回 `{ __skip: true, result }` 时立即返回 `{ skip: true, result }`；普通 `Partial<AgentContext>` 则合并到 `this._context` 后继续。遍历结束仍未 skip 时返回 `{ skip: false }`。`__skip` 是 Middleware 的指令字段，`skip` 是 host 交给 Tool 调用方的决策字段，不要混用。
+
+当 host 返回 `{ skip: true, result }` 时，runtime 不调用真实 Tool，但仍然生成正常的 `tool_result` observation。
 
 其余实现提示：
 
 - TODO 1：`beforeAgentRun`、`beforeAgentStep`、`afterAgentStep` 和 `afterAgentRun` 的返回值只合并到 `AgentContext`；
-- TODO 2：`afterModel` 的返回值只合并到本次 `AssistantMessage`；
-- TODO 3：`beforeToolUse` 遇到第一个 `__skip` 后停止调用后续 `beforeToolUse`，但正常进入 observation；
-- TODO 4：本课程规定 `afterAgentRun` 放在外层 `finally`，成功、abort、error、maxSteps 都调用一次；
-- TODO 5：`afterAgentStep` 只在该 step 的 Tool observations 全部追加后调用，最终纯文本 step 不调用。
+- TODO 2：本课程规定 `afterAgentRun` 放在外层 `finally`，成功、abort、error、maxSteps 都调用一次；
+- TODO 3：`afterAgentStep` 只在该 step 的 Tool observations 全部追加后调用，最终纯文本 step 不调用。
 
 ### 6.4 Lifecycle recorder
 
 目标文件：`src/agent/lifecycle-recorder.ts`
+
+**示例四：`defineLifecycleRecorder()` 记录执行顺序**
 
 实现一个只记录 hook 名称的 Middleware。第一个 hook 展示标准的 async block 写法，
 其余 hook 完整给出，复制后可直接通过 Promise return type 检查。
@@ -2077,10 +2343,12 @@ type BeforeToolUseDecision =
 import type { AgentMiddleware } from "./agent-middleware";
 
 export function defineLifecycleRecorder(log: string[]): AgentMiddleware {
+  // 返回的是 hook 实现集合；此时还没有运行 Agent，也不会向 log 写入内容。
   return {
     beforeAgentRun: async () => {
-      // 标准实现示例：async hook 不返回 mutation 时自然解析为 undefined。
+      // 等 host 开始一次 run 时才执行。闭包让 hook 能写入调用方传入的 log 数组。
       log.push("beforeAgentRun");
+      // 没有 return，Promise 解析为 undefined：记录了日志，但不请求修改 AgentContext。
     },
     beforeAgentStep: async ({ step }) => {
       log.push(`beforeAgentStep:${step}`);
@@ -2092,6 +2360,7 @@ export function defineLifecycleRecorder(log: string[]): AgentMiddleware {
       log.push("afterModel");
     },
     beforeToolUse: async ({ toolUse }) => {
+      // toolUse 由 host 传入，因此同一个 hook 可以记录不同 Tool 的调用。
       log.push(`beforeToolUse:${toolUse.name}`);
     },
     afterToolUse: async ({ toolUse }) => {
@@ -2106,6 +2375,8 @@ export function defineLifecycleRecorder(log: string[]): AgentMiddleware {
   };
 }
 ```
+
+这个 recorder 在各个 hook 中向外部 `log` 数组写入名称，最后就能核对模型调用与 Tool 执行的顺序。它说明 hook 不一定要返回修改对象：记录日志也是一种用途。注意，返回 `void` 只代表不请求 host 合并上下文，并不代表函数没有副作用；这里写入日志就是副作用。
 
 目标文件：`examples/stage-06-middleware.ts`
 
@@ -2191,7 +2462,7 @@ afterModel
 afterAgentRun
 ```
 
-本课程定义：没有 Tool 的终止 step 不调用 `afterAgentStep`，与 Helixent 当前语义保持一致。你可以选择不同语义，但必须在 ADR 和测试中固定下来。
+本课程定义：没有 Tool 的终止 step 不调用 `afterAgentStep`。你可以选择不同语义，但必须在 ADR 和测试中固定下来。
 
 ### 6.5 完整测试
 
@@ -2382,8 +2653,10 @@ describe("Agent middleware", () => {
 最后执行本阶段的完整测试：
 
 ```bash
-bun test src/agent/__tests__/middleware.test.ts
+bun test src/agent/__tests__/host-hooks.test.ts src/agent/__tests__/middleware.test.ts
 ```
+
+按本章给出的测试内容，预期为 **8 pass、0 fail**：2 项 host 聚焦测试，加上 6 项 Middleware 生命周期与策略测试。
 
 ### 阶段后对照
 
@@ -2397,6 +2670,7 @@ bun test src/agent/__tests__/middleware.test.ts
 - [ ] Middleware mutation boundary 有类型约束；
 - [ ] skip 不会破坏 transcript 协议；
 - [ ] hook 顺序由测试固定；
+- [ ] `host-hooks.test.ts` 的 2 项调用次数与合并结果测试通过；
 - [ ] `ADR-007` 解释 Middleware 顺序和异常语义。
 
 ## 第二部分综合练习
