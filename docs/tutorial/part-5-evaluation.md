@@ -30,7 +30,8 @@ touch evals/tasks/fix-add/fixture/package.json evals/tasks/fix-add/fixture/src/a
 touch src/eval/types.ts src/eval/task-loader.ts src/eval/workspace-factory.ts
 touch src/eval/grader-runner.ts src/eval/artifact-store.ts src/eval/eval-runner.ts src/eval/index.ts
 touch src/eval/__tests__/task-loader.test.ts src/eval/__tests__/test-harness.ts
-touch src/eval/__tests__/eval-runner.test.ts
+touch src/eval/select-eval-tools.ts src/eval/__tests__/workspace-factory.test.ts
+touch src/eval/__tests__/select-eval-tools.test.ts src/eval/__tests__/eval-runner.test.ts
 ```
 
 命令不会替你生成 fixture 题目答案；`fixture/` 必须是 Agent 每次 trial 收到的干净项目。
@@ -54,15 +55,18 @@ evals/                               # Evaluation Harness 的任务与产物根�
 src/eval/                            # Evaluation Harness 的运行时代码
 ├── types.ts                         # 定义 task、suite、trial 与 report 类型
 ├── task-loader.ts                   # 加载并校验 task 和 suite manifest
-├── workspace-factory.ts             # 为每次 trial 创建隔离 workspace
+├── workspace-factory.ts             # 为每次 trial 复制并校验 fixture
+├── select-eval-tools.ts             # 构造实际生效的文件工具白名单
 ├── grader-runner.ts                 # 在 Agent 停止后执行 grader
 ├── artifact-store.ts                # 保存 patch、trace 与 grader output
 ├── eval-runner.ts                   # 编排 task、trial、Agent 与 grader
 ├── index.ts                         # 导出 eval 公共 API
 └── __tests__/
     ├── task-loader.test.ts          # 验证 manifest、路径与重复任务校验
-    ├── test-harness.ts              # 提供 eval 测试共用 fixture 与 fake
-    └── eval-runner.test.ts          # 验证隔离、产物与失败路径
+    ├── test-harness.ts              # 提供 eval 调度测试使用的 fake
+    ├── workspace-factory.test.ts    # 验证真实文件复制、哈希与清理
+    ├── select-eval-tools.test.ts    # 验证未授权工具无法进入 Registry
+    └── eval-runner.test.ts          # 验证调度、产物与失败路径
 ```
 
 `task.yaml`：
@@ -79,9 +83,8 @@ allowedTools:
   - grep_search
   - str_replace
   - apply_patch
-  - bash
 grader:
-  command: bun test graders/test.ts
+  command: bun test ./graders/test.ts
   timeoutMs: 20000
 ```
 
@@ -91,7 +94,7 @@ grader:
 
 ```markdown
 `src/add.ts` 中的 `add` 函数在部分输入下返回错误结果。请定位并修复问题，保留现有
-函数签名，不要引入新依赖。完成后运行项目测试。
+函数签名，不要引入新依赖。完成后说明修改原因；本任务的测试由评测器在你结束后运行。
 ```
 
 目标文件：`evals/tasks/fix-add/fixture/package.json`
@@ -149,7 +152,27 @@ tasks:
 这个 grader 是教程完整提供的隐藏测试，读者不需要补断言；Agent workspace 只收到
 `fixture/`，不会收到 `graders/`。示例输出是 grader exit code 0 和 `1 pass`。
 
-Runner 只把 `fixture/` 复制到 trial workspace，并把 Agent 的 `cwd` 限制在该目录。Grader 从 task root 运行，通过只读环境变量 `HARNESS_EVAL_WORKSPACE` 获取 trial workspace 路径；`graders/` 不复制进 Agent workspace，因此模型不能直接读取隐藏断言。
+Runner 只把 `fixture/` 复制到 trial workspace。Grader 从 task root 运行，通过环境变量
+`HARNESS_EVAL_WORKSPACE` 获取 trial workspace 路径。环境变量是进程配置，不具有“只读权限”
+或文件访问控制的含义。`./graders/test.ts` 的 `./` 不能省略：它让 Bun 把参数视为文件路径，
+而不是默认测试发现规则中的过滤字符串。
+
+这里需要区分两种保证：
+
+| 保证 | 本阶段实现 | 不包含的保证 |
+|---|---|---|
+| 干净起点 | 每个 trial 重新复制 fixture，结束后清理 | 不限制进程访问其他目录 |
+| Agent 工具访问边界 | 首个任务仅注册经过 workspace path 校验的文件 Tools | 不是操作系统 sandbox |
+
+首个任务移除了 `bash`：执行命令、加载模块和其他代码执行 Tool 都不能进入它的 Registry。
+只删除 prompt 中的工具描述无效；`EvalAgentFactory` 必须按 `allowedTools` 构造实际 Registry。
+文件 Tools 仍须拒绝路径穿越和 symlink escape，grader 目录不得挂载进 workspace。
+
+允许任意 `bash` 时，设置 `cwd` 和把 graders 放在另一个目录都无法阻止越界读取。
+这类任务需要独立的容器或操作系统访问限制，只向 Agent 暴露 fixture，并在 Agent 及其
+子进程全部停止后由评测器运行 grader。未实现这种边界时，不宣称隐藏断言对模型不可读。
+grader 会执行 Agent 修改后的代码，本地演示仅使用自己控制的 fixture；也不据此宣称能够
+安全运行不可信代码。
 
 目标文件：`src/eval/types.ts`
 
@@ -329,6 +352,124 @@ export interface EvalSuiteResult {
 ```
 
 </details>
+
+先实现 Runner 的两个关键依赖，再编排并发。这样每一步都有可执行的独立反馈。
+
+#### 14.6A 真实复制 fixture
+
+目标文件：`src/eval/workspace-factory.ts`。这是完整的本地教学实现；fixture 在 suite
+运行期间保持不变，仅接受普通文件和目录，不接受 symlink。哈希覆盖相对路径、目录结构和
+文件字节，不包含权限、mtime 或宿主机绝对路径。复制成功后再次计算目标哈希，不能填常量。
+
+```ts
+import { createHash } from "node:crypto";
+import { cp, lstat, mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { EvalTask, EvalWorkspace, EvalWorkspaceFactory } from "./types";
+
+async function hashFixture(root: string): Promise<string> {
+  if (!(await lstat(root)).isDirectory()) throw new Error("Fixture must be a directory");
+  const entries: string[][] = [];
+  async function visit(relative: string): Promise<void> {
+    const absolute = join(root, relative);
+    const stat = await lstat(absolute);
+    if (stat.isDirectory()) {
+      entries.push(["directory", relative]);
+      for (const name of (await readdir(absolute)).sort()) {
+        await visit(relative ? `${relative}/${name}` : name);
+      }
+    } else if (stat.isFile()) {
+      const bytes = new Uint8Array(await Bun.file(absolute).arrayBuffer());
+      entries.push(["file", relative, createHash("sha256").update(bytes).digest("hex")]);
+    } else {
+      throw new Error(`Unsupported fixture entry: ${relative}`);
+    }
+  }
+  await visit("");
+  return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
+
+export class LocalEvalWorkspaceFactory implements EvalWorkspaceFactory {
+  private readonly _tempRoot: string;
+
+  constructor(options: { tempRoot?: string } = {}) {
+    this._tempRoot = options.tempRoot ?? tmpdir();
+  }
+
+  async create({ task }: { task: EvalTask; trial: number }): Promise<EvalWorkspace> {
+    const initialFixtureHash = await hashFixture(task.fixturePath);
+    await mkdir(this._tempRoot, { recursive: true });
+    const path = await mkdtemp(join(this._tempRoot, "harness-eval-"));
+    const cleanup = () => rm(path, { recursive: true, force: true });
+    try {
+      await cp(task.fixturePath, path, { recursive: true, dereference: false });
+      if (await hashFixture(path) !== initialFixtureHash) {
+        throw new Error("Fixture changed while copying");
+      }
+      return { path, initialFixtureHash, cleanup };
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
+  }
+}
+```
+
+`tempRoot` 应在 fixture 外。这个工厂保证独立副本，不提供进程访问隔离。产物必须先保存，
+再在 Runner 的 `finally` 中调用 `cleanup()`；不要把 grader、答案或其他 trial 放进副本。
+
+#### 14.6B 让工具白名单实际生效
+
+目标文件：`src/eval/select-eval-tools.ts`。第一版只接受阶段 8 中经过路径校验的四个
+Tools；使用允许名单，避免将来新增一个执行代码的 Tool 时意外放行。
+
+```ts
+import type { Tool } from "@/foundation/tools";
+
+const FILE_EVAL_TOOLS = new Set(["read_file", "grep_search", "str_replace", "apply_patch"]);
+
+export function selectEvalTools(options: { tools: Tool[]; allowedTools: string[] }): Tool[] {
+  const available = new Map(options.tools.map((tool) => [tool.name, tool]));
+  if (available.size !== options.tools.length) throw new Error("Duplicate available tool");
+  if (new Set(options.allowedTools).size !== options.allowedTools.length) {
+    throw new Error("Duplicate allowed tool");
+  }
+  return options.allowedTools.map((name) => {
+    if (!FILE_EVAL_TOOLS.has(name)) throw new Error(`Unsupported local eval tool: ${name}`);
+    const tool = available.get(name);
+    if (!tool) throw new Error(`Missing eval tool: ${name}`);
+    return tool;
+  });
+}
+```
+
+在 `EvalAgentFactory.runTrial()` 的 composition 中接入，以下变量均来自该函数的参数或
+已解析的模型配置：
+
+```ts
+const tools = selectEvalTools({
+  tools: defineCodingTools({ cwd: workspacePath }),
+  allowedTools: task.allowedTools,
+});
+const agent = new Agent({ model, prompt: "Solve the supplied coding task.", tools, maxSteps: task.maxSteps });
+// TODO：将 task.prompt 包装为 UserMessage，消费 agent.stream，连接 trace、metrics 和 signal；
+// signal 中止时调用 agent.abort()，等待循环结束再返回给 Runner。
+```
+
+UserMessage 使用 `{ role: "user", content: [{ type: "text", text: task.prompt }] }`。
+Agent 内部的 `ToolRegistry` 因此只注册这些 Tools；不要在后续 composition 中又附加 `bash`
+或其他 Tools。这里的 `tools` 必须来自受控的 `defineCodingTools({ cwd: workspacePath })`，
+仅凭第三方 Tool 自报相同名称不能获得访问限制。
+
+需要运行命令的任务另建具有真实 sandbox 的 factory，不给这个 helper 增加一个可绕过限制的布尔开关。
+Grader 在 `dirname(task.fixturePath)` 运行 `task.grader.command`，继承必要的进程环境并设置
+`HARNESS_EVAL_WORKSPACE=workspacePath`。测试断言失败返回 `{ passed: false, score: 0 }`；
+启动失败、grader 超时等基础设施异常才抛出并归为 `infra_error`。单看非零 exit code
+无法区分断言失败与 grader 自身崩溃，需要保存原始输出并约定 grader 的结果协议。
+
+#### 14.6C 编排 trial
 
 目标文件：`src/eval/eval-runner.ts`
 
@@ -764,7 +905,7 @@ describe("EvalRunner", () => {
     expect(harness.maxActiveTrials()).toBe(2);
   });
 
-  test("creates a clean fixture copy for every trial", async () => {
+  test("requests a distinct workspace for every trial", async () => {
     const harness = defineEvalTestHarness({ taskCount: 1 });
     const runner = new EvalRunner({ ...harness.dependencies, concurrency: 1 });
 
@@ -847,8 +988,93 @@ describe("EvalRunner", () => {
 
 </details>
 
-这些测试固定了 schema、path boundary、干净 workspace、timeout、错误分类、并发上限、
-abort、artifact、identity 和 aggregate；没有需要读者填写的测试 TODO。
+上面的 fake 只验证 Runner 调用了 workspace factory、保留哈希并正确调度，不能证明文件
+真的被复制。以下测试直接操作临时文件并调用真实工厂，单独验证副本、内容哈希和清理。
+
+目标文件：`src/eval/__tests__/workspace-factory.test.ts`
+
+```ts
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { access, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import type { EvalTask } from "../types";
+import { LocalEvalWorkspaceFactory } from "../workspace-factory";
+
+let root: string;
+let task: EvalTask;
+let factory: LocalEvalWorkspaceFactory;
+beforeEach(async () => {
+  root = await mkdtemp(join(tmpdir(), "eval-workspace-test-"));
+  const fixturePath = join(root, "fixture");
+  await mkdir(join(fixturePath, "src"), { recursive: true });
+  await Bun.write(join(fixturePath, "src/add.ts"), "export const add = (a, b) => a - b;\n");
+  task = {
+    id: "fix-add", version: 1, prompt: "Fix add", fixturePath,
+    timeoutMs: 1000, maxSteps: 5, allowedTools: ["read_file"],
+    grader: { command: "bun test ./graders/test.ts", timeoutMs: 1000 },
+  };
+  factory = new LocalEvalWorkspaceFactory({ tempRoot: join(root, "trials") });
+});
+afterEach(async () => { await rm(root, { recursive: true, force: true }); });
+
+test("copies original bytes for each trial and cleans real directories", async () => {
+  const original = await Bun.file(join(task.fixturePath, "src/add.ts")).text();
+  const first = await factory.create({ task, trial: 0 });
+  await Bun.write(join(first.path, "src/add.ts"), "changed by trial 0");
+  const second = await factory.create({ task, trial: 1 });
+  expect(first.path).not.toBe(second.path);
+  expect(await Bun.file(join(second.path, "src/add.ts")).text()).toBe(original);
+  expect(await Bun.file(join(task.fixturePath, "src/add.ts")).text()).toBe(original);
+  expect(second.initialFixtureHash).toBe(first.initialFixtureHash);
+  await first.cleanup();
+  await second.cleanup();
+  await expect(access(first.path)).rejects.toBeDefined();
+  await expect(access(second.path)).rejects.toBeDefined();
+});
+
+test("hash changes with fixture bytes and rejects symlinks", async () => {
+  const first = await factory.create({ task, trial: 0 });
+  await Bun.write(join(task.fixturePath, "src/add.ts"), "different fixture");
+  const second = await factory.create({ task, trial: 1 });
+  expect(second.initialFixtureHash).not.toBe(first.initialFixtureHash);
+  await symlink(join(root, "trials"), join(task.fixturePath, "escape"));
+  await expect(factory.create({ task, trial: 2 })).rejects.toThrow("Unsupported fixture entry");
+});
+```
+
+目标文件：`src/eval/__tests__/select-eval-tools.test.ts`
+
+```ts
+import { expect, test } from "bun:test";
+import { z } from "zod";
+
+import { defineTool, ToolRegistry } from "@/foundation/tools";
+
+import { selectEvalTools } from "../select-eval-tools";
+
+test("unlisted tools cannot be invoked through the real registry", async () => {
+  let bashCalls = 0;
+  const tools = [
+    defineTool({ name: "read_file", description: "read", parameters: z.object({}),
+      invoke: async () => "file" }),
+    defineTool({ name: "bash", description: "execute", parameters: z.object({}),
+      invoke: async () => { bashCalls += 1; return "executed"; } }),
+  ];
+  const registry = new ToolRegistry({ tools: selectEvalTools({ tools, allowedTools: ["read_file"] }) });
+  expect(registry.list().map((tool) => tool.name)).toEqual(["read_file"]);
+  expect(await registry.invoke({ name: "bash", input: {} })).toMatchObject({
+    ok: false, code: "TOOL_NOT_FOUND",
+  });
+  expect(bashCalls).toBe(0);
+  expect(() => selectEvalTools({ tools, allowedTools: ["bash"] })).toThrow("Unsupported local eval tool");
+  expect(() => selectEvalTools({ tools, allowedTools: ["apply_patch"] })).toThrow("Missing eval tool");
+});
+```
+
+这些测试分别覆盖调度、真实文件副本和实际 Registry 白名单；路径穿越与 symlink escape
+继续由阶段 8 的文件工具测试验证。它们不证明任意进程受到操作系统隔离。
 
 最后执行本阶段的完整测试：
 
@@ -860,7 +1086,8 @@ bun test src/eval
 
 - [ ] 10 个高质量任务；
 - [ ] runtime conformance suite 完全离线；
-- [ ] capability eval 每个 trial workspace 隔离；
+- [ ] capability eval 每个 trial 使用独立副本，真实文件与哈希测试通过；
+- [ ] 实际 Registry 按 allowedTools 过滤；需要命令执行的任务有独立 sandbox；
 - [ ] 失败 trial 可通过 trace 和 patch 定位；
 - [ ] report 可以复现代码与配置；
 - [ ] baseline/candidate 只改变一个主变量；

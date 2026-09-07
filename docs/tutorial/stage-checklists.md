@@ -102,6 +102,7 @@
 
 ## 阶段 7：Provider
 
+- [ ] 按 7A invoke → 7B stream → 7C 第二个 Provider → 7D 联网验证推进；
 - [ ] OpenAI converter pure tests；
 - [ ] Anthropic converter pure tests；
 - [ ] fragmented Tool JSON 测试；
@@ -112,11 +113,13 @@
 
 ## 阶段 8：Coding tools
 
+- [ ] 先通过 read_file、str_replace、bash 小里程碑，再注册完整工具集；
 - [ ] 所有只读 Tools 有 happy/error/boundary tests；
 - [ ] 所有修改 Tools 有副作用 tests；
 - [ ] path traversal、相似前缀、symlink escape 被拒绝；
 - [ ] `str_replace` 拒绝隐式多处替换；
-- [ ] bash timeout/abort 无残留进程；
+- [ ] 替换和 patch 成功后读取磁盘断言内容，失败后断言原文件未变；
+- [ ] bash 超量输出仍被排空，运行中 timeout/abort 后子进程不能继续写文件；
 - [ ] 测试只修改临时 workspace；
 - [ ] ADR-009 完成。
 
@@ -131,9 +134,11 @@
 
 ## 阶段 10：CLI/TUI 与审批
 
+- [ ] 10A 文本客户端可离线运行，10B 最小 Ink 界面可提交和中止；
+- [ ] tsconfig 包含 JSX 与 .tsx，基础 lint 配置可执行；
 - [ ] 配置 schema 和 default model resolution 测试；
 - [ ] 配置不保存 secret value；
-- [ ] streaming、token、Todo 在 TUI 可见；
+- [ ] 忙碌状态、最终消息、token、Todo 在 TUI 可见；正文流式显示若实现则另有契约与测试；
 - [ ] Ctrl+C 中止并可开始下一轮；
 - [ ] 审批队列 FIFO 且 overflow fail closed；
 - [ ] deny 结果反馈模型；
@@ -143,6 +148,7 @@
 
 ## 阶段 11：Observability
 
+- [ ] Agent 只引用 foundation 契约，存储实现由 composition root 注入；
 - [ ] 每个 run 有稳定 runId 和单调 sequence；
 - [ ] success/failure/abort/maxSteps 都产生 `run_end`；
 - [ ] model/tool/approval spans 可关联；
@@ -158,7 +164,10 @@
 - [ ] Tool 副作用前保存 intent；
 - [ ] running crash 恢复为 unknown；
 - [ ] 已确认成功 Tool 不重复执行；
+- [ ] 已保存结果补回缺失 observation，重复结果按 tool call id 去重；
+- [ ] `continueFromStep` 是实际公开 API，不通过类型断言伪造；
 - [ ] unsafe unknown Tool 请求人工决策；
+- [ ] 真实 Agent 计数器场景通过：写入后中断、先阻塞、确认结果后续跑，最终值为 1；
 - [ ] replay 不调用 model/Tool；
 - [ ] fault injection suite 通过；
 - [ ] ADR-013 完成。
@@ -178,8 +187,9 @@
 ## 阶段 14：Evaluation
 
 - [ ] 至少 10 个覆盖不同失败模式的任务；
-- [ ] 每个 trial 使用干净 workspace；
-- [ ] grader 与 prompt 不互相泄漏；
+- [ ] 真实文件测试证明每个 trial 使用独立 fixture 副本，哈希来自实际内容；
+- [ ] allowedTools 过滤实际 Registry，首个本地任务仅使用有路径边界的文件 Tools；
+- [ ] grader 不提供给 Agent；允许命令执行的任务有实际 sandbox，不能仅依靠 cwd；
 - [ ] Agent failure 与 infra error 分开；
 - [ ] report 包含 commit/config fingerprints；
 - [ ] baseline/candidate 只改变一个主变量；

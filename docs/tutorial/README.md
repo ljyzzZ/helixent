@@ -58,6 +58,7 @@ Eval runner → fixtures → isolated workspace → agent run → graders → re
 
 最低要求：
 
+- 用任意语言写过包含函数、条件分支和文件读写的小程序；
 - 知道 JSON、HTTP API、环境变量和 Git 的基本用法；
 - 能阅读一个失败测试的错误信息。
 
@@ -75,6 +76,11 @@ Eval runner → fixtures → isolated workspace → agent run → graders → re
 
 建议投入 8～12 周、每周 6～10 小时。不要用完成天数衡量进度，以阶段验收条件为准。
 
+这个时间预算面向已有编程经验的读者。TypeScript 初学者可以按需回查第零部分；React/Ink
+会在阶段 10 从文本客户端逐步引入。阶段 7～10 内部再拆小里程碑：先一个 Provider，
+再打通 `read_file → str_replace → bash`，最后扩展其余 Tools 和 TUI。每个小里程碑运行
+对应的聚焦测试，不必等整阶段完成才获得反馈。
+
 ## 4. 阶段地图
 
 | 阶段 | 可交付程序 | 你能看到的反馈 | 推荐提交 |
@@ -89,7 +95,7 @@ Eval runner → fixtures → isolated workspace → agent run → graders → re
 | 7. Provider | 真实模型 chat | OpenAI/Anthropic 流式回复 | `feat(provider): 接入模型适配器` |
 | 8. Coding tools | workspace agent | 读取、搜索、修改临时仓库 | `feat(coding): 实现编码工具集` |
 | 9. Context 能力 | coding agent composition | Skills/Todo/项目指令生效 | `feat(coding): 组装编码智能体` |
-| 10. CLI/TUI 与审批 | 交互式 coding agent | streaming、token、审批弹窗 | `feat(cli): 完成交互式客户端` |
+| 10. CLI/TUI 与审批 | 交互式 coding agent | 进度提示、token、审批弹窗 | `feat(cli): 完成交互式客户端` |
 | 11. Observability | trace recorder/viewer | step/tool/token/latency 时间线 | `feat(trace): 记录运行轨迹` |
 | 12. Recovery | resume/replay CLI | 中断后续跑、无模型重放 | `feat(runtime): 支持断点恢复` |
 | 13. Context 与可靠性 | budgeted long session | 压缩率、retry、timeout 指标 | `feat(runtime): 管理上下文与失败` |
@@ -147,6 +153,10 @@ git switch -c course/stage-01-messages
 - `agent` 只依赖 `foundation`；
 - `coding` 组合 `agent` 和 `foundation`；
 - provider adapter 放在 `community`；
+- 阶段 11 起，通用 trace/checkpoint/恢复契约放在 `foundation/runtime`；
+- `runtime` 放存储、恢复编排、context 和 policy 的实现，可以依赖 `agent` 与 `foundation`；
+- `agent` 通过注入使用这些契约，不能反向 import `runtime` 或 `coding`；
+- `eval` 和 `cli` 负责组合具体实现；
 - `cli` 可以依赖所有层；
 - 测试与实现 co-located；
 - 每个 Tool 必须有 success 和 structured error 测试；
@@ -193,6 +203,9 @@ touch examples/stage-01-transcript.ts
 - 第一个关键分支给出标准实现，并用注释解释输入、输出和不变量；
 - 其余分支保留为练习，但每个 `TODO` 都提供独立提示、边界条件和失败语义。
 
+构造函数保存依赖不等于完成一条业务路径。进入较大的模块时，先跑通正文标出的最小路径，
+再按表格逐项扩展输入、错误和状态分支；遇到新 API 时先核对它在本阶段的定义和调用位置。
+
 实现纯逻辑、边界条件或回归点时，可以先写一个最小聚焦测试，确认它因目标行为尚未实现而失败，
 再完成实现使其转绿。这里验证的是单个不变量，不要求在建立运行时心智模型前复制并运行整套完整测试。
 
@@ -219,10 +232,15 @@ touch examples/stage-01-transcript.ts
 教程中的测试文件是完整内容，不留待填写的 `TODO`。确认示例行为后复制测试文件，再执行：
 
 ```bash
-bun test path/to/test.ts
+bun test ./path/to/example.test.ts
 ```
 
 若测试失败，先比较实际输出、阶段不变量和测试断言，修正实现后重新运行；不要修改断言来迎合实现。
+
+“完整测试文件”表示可以原样复制，不表示已经穷尽所有边界。副作用测试必须读取实际文件
+或观察进程退出；fake 用来验证调度和错误分类，不能证明真实文件复制、进程清理或恢复续跑。
+Helixent 仓库的 `bun run check` 只检查仓库内实际 `.ts/.tsx` 文件，不会执行 Markdown 中的
+代码块。练习项目仍须分别运行本阶段示例、测试和类型检查。
 
 ### 8.7 Refactor：写决策记录
 

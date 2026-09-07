@@ -28,8 +28,8 @@
 创建文件：
 
 ```bash
-mkdir -p src/runtime/trace/__tests__ src/cli/commands examples
-touch src/runtime/trace/events.ts src/runtime/trace/runtime-clock.ts
+mkdir -p src/foundation/runtime src/runtime/trace/__tests__ src/cli/commands examples
+touch src/foundation/runtime/trace-events.ts src/foundation/runtime/agent-runtime.ts
 touch src/runtime/trace/redactor.ts src/runtime/trace/jsonl-trace-store.ts
 touch src/runtime/trace/metrics.ts src/runtime/trace/index.ts
 touch src/runtime/trace/__tests__/jsonl-trace-store.test.ts
@@ -42,9 +42,10 @@ touch examples/stage-11-trace.ts
 
 ```text
 src/
+├── foundation/runtime/
+│   ├── trace-events.ts                 # 通用 trace 事件契约，不依赖 coding
+│   └── agent-runtime.ts                # clock、id generator 与 trace sink 接口
 ├── runtime/trace/
-│   ├── events.ts                       # 定义带版本的 runtime trace events
-│   ├── runtime-clock.ts                # 抽象 clock、id generator 与 trace sink
 │   ├── redactor.ts                     # 复制并脱敏敏感或过长字段
 │   ├── jsonl-trace-store.ts            # 按 run 顺序持久化和读取 JSONL trace
 │   ├── metrics.ts                      # 从事件纯函数归约运行指标
@@ -61,7 +62,12 @@ examples/
 
 ### 11.1 Trace event schema
 
-目标文件：`src/runtime/trace/events.ts`
+依赖方向保持为 `agent → foundation`。`foundation/runtime` 只定义事件、时钟和持久化
+接口；`runtime/trace`、`runtime/checkpoint` 实现这些接口，CLI/eval 在 composition root
+创建实现并注入 Agent。恢复编排可以调用 Agent，Agent 不反向导入恢复编排或文件存储。
+审批决策类型同样来自 `foundation/permissions`，避免 trace 将通用 Agent 耦合到 coding。
+
+目标文件：`src/foundation/runtime/trace-events.ts`
 
 事件 envelope：
 
@@ -79,10 +85,10 @@ export interface TraceEvent<TType extends string, TPayload> {
 定义 discriminated union：
 
 <details>
-<summary>展开完整代码：<code>events.ts</code></summary>
+<summary>展开完整代码：<code>trace-events.ts</code></summary>
 
 ```ts
-import type { ApprovalDecision } from "@/coding/permissions/approval-middleware";
+import type { ApprovalDecision } from "@/foundation/permissions/approval-decision";
 import type { NonSystemMessage, TokenUsage } from "@/foundation/messages";
 
 export interface TraceEvent<TType extends string, TPayload> {
@@ -160,10 +166,10 @@ export type RuntimeTraceEvent =
 
 为了让测试 deterministic：
 
-目标文件：`src/runtime/trace/runtime-clock.ts`
+目标文件：`src/foundation/runtime/agent-runtime.ts`
 
 ```ts
-import type { RuntimeTraceEvent } from "./events";
+import type { RuntimeTraceEvent } from "@/foundation/runtime/trace-events";
 
 export interface RuntimeClock {
   now(): Date;
@@ -193,7 +199,7 @@ Production 使用真实 clock 和 `crypto.randomUUID()`；测试使用递增 fak
 目标文件：`src/agent/agent.ts`
 
 ```ts
-import type { AgentRuntime } from "@/runtime/trace/runtime-clock";
+import type { AgentRuntime } from "@/foundation/runtime/agent-runtime";
 
 // Agent class 内：
 private readonly _runtime?: AgentRuntime;
@@ -239,9 +245,10 @@ export function createTraceRedactor(options: {
 目标文件：`src/runtime/trace/jsonl-trace-store.ts`
 
 ```ts
-import type { RuntimeTraceEvent } from "./events";
+import type { RuntimeTraceEvent } from "@/foundation/runtime/trace-events";
+import type { TraceSink } from "@/foundation/runtime/agent-runtime";
+
 import type { TraceRedactor } from "./redactor";
-import type { TraceSink } from "./runtime-clock";
 
 export class JsonlTraceStore implements TraceSink {
   private readonly _rootDir: string;
@@ -300,7 +307,7 @@ export class JsonlTraceStore implements TraceSink {
 <summary>展开完整代码：<code>metrics.ts</code></summary>
 
 ```ts
-import type { RuntimeTraceEvent } from "./events";
+import type { RuntimeTraceEvent } from "@/foundation/runtime/trace-events";
 
 export interface RunMetrics {
   steps: number;
@@ -662,7 +669,7 @@ import type { AssistantMessage, UserMessage } from "@/foundation/messages";
 import { Model, ScriptedModelProvider } from "@/foundation/models";
 import { Agent } from "@/agent/agent";
 
-import type { RuntimeTraceEvent } from "../events";
+import type { RuntimeTraceEvent } from "@/foundation/runtime/trace-events";
 
 const USER: UserMessage = {
   role: "user",
@@ -829,11 +836,14 @@ bun test src/runtime/trace
 
 ```bash
 mkdir -p src/runtime/checkpoint/__tests__ src/runtime/replay/__tests__
-touch src/runtime/checkpoint/run-state.ts src/runtime/checkpoint/checkpoint-store.ts
+touch src/foundation/runtime/run-state.ts src/foundation/runtime/checkpoint-store.ts
 touch src/runtime/checkpoint/file-checkpoint-store.ts src/runtime/checkpoint/resume-run.ts
-touch src/runtime/checkpoint/fault-injector.ts src/runtime/checkpoint/index.ts
+touch src/foundation/runtime/fault-injector.ts src/foundation/runtime/agent-checkpoint.ts
+touch src/runtime/checkpoint/index.ts
 touch src/runtime/checkpoint/__tests__/file-checkpoint-store.test.ts
 touch src/runtime/checkpoint/__tests__/resume-run.test.ts
+touch src/runtime/checkpoint/__tests__/recovery-integration.test.ts
+touch examples/recovery-scenario.ts
 touch src/runtime/replay/replay.ts src/runtime/replay/index.ts
 touch src/runtime/replay/__tests__/replay.test.ts examples/stage-12-recovery.ts
 ```
@@ -841,29 +851,33 @@ touch src/runtime/replay/__tests__/replay.test.ts examples/stage-12-recovery.ts
 执行后新增结构如下：
 
 ```text
+src/foundation/runtime/
+├── run-state.ts                       # 可恢复的 canonical state 契约
+├── checkpoint-store.ts                # checkpoint 持久化接口
+├── agent-checkpoint.ts                # Agent 接收的状态与持久化依赖
+└── fault-injector.ts                  # 可注入故障点与异常类型
 src/runtime/
 ├── checkpoint/
-│   ├── run-state.ts                    # 定义可恢复的 canonical run state
-│   ├── checkpoint-store.ts             # 定义 checkpoint 持久化接口
 │   ├── file-checkpoint-store.ts        # 原子写入并读取文件 checkpoint
 │   ├── resume-run.ts                   # 校验状态并从安全边界恢复运行
-│   ├── fault-injector.ts               # 为测试注入可重复的崩溃点
 │   ├── index.ts                        # 导出 checkpoint 公共 API
 │   └── __tests__/
 │       ├── file-checkpoint-store.test.ts # 验证原子写入与损坏文件处理
-│       └── resume-run.test.ts          # 验证恢复边界与 unknown side effect
+│       ├── resume-run.test.ts          # 验证恢复决策与 observation 对账
+│       └── recovery-integration.test.ts # 用真实 Agent 验证副作用不重复
 └── replay/
     ├── replay.ts                       # 从既有 trace 重建脱敏后的展示时间线
     ├── index.ts                        # 导出 replay 公共 API
     └── __tests__/
         └── replay.test.ts              # 验证 replay 不调用模型或重复执行 Tool
 examples/
+├── recovery-scenario.ts                # 实际执行计数器写入、中断与续跑
 └── stage-12-recovery.ts                # 演示故障注入、checkpoint 与恢复
 ```
 
 ### 12.1 RunState schema
 
-目标文件：`src/runtime/checkpoint/run-state.ts`
+目标文件：`src/foundation/runtime/run-state.ts`
 
 <details>
 <summary>展开完整代码：<code>run-state.ts</code></summary>
@@ -877,6 +891,8 @@ export interface RunState {
   status: "running" | "completed" | "failed" | "aborted";
   phase: "idle" | "thinking" | "acting";
   nextStep: number;
+  maxSteps: number;
+  toolsetFingerprint: string;
   prompt: string;
   messages: NonSystemMessage[];
   model: {
@@ -910,11 +926,18 @@ export interface ToolExecutionRecord {
 
 ### 12.2 CheckpointStore
 
-目标文件：`src/runtime/checkpoint/checkpoint-store.ts` 和 `file-checkpoint-store.ts`
+目标文件：`src/foundation/runtime/checkpoint-store.ts` 和 `file-checkpoint-store.ts`
 
-故障注入契约放在 `src/runtime/checkpoint/fault-injector.ts`：
+故障注入契约放在 `src/foundation/runtime/fault-injector.ts`：
 
 ```ts
+export class InjectedCrashError extends Error {
+  constructor({ point }: { point: string }) {
+    super(`Injected crash at ${point}`);
+    this.name = "InjectedCrashError";
+  }
+}
+
 export interface FaultInjector {
   hit(point:
     | "after_model"
@@ -928,10 +951,10 @@ export interface FaultInjector {
 
 实现应支持在第 N 次 `hit` 抛出 `InjectedCrashError`，供示例和最终恢复测试注入确定性故障。
 
-目标文件：`src/runtime/checkpoint/checkpoint-store.ts`
+目标文件：`src/foundation/runtime/checkpoint-store.ts`
 
 ```ts
-import type { RunState } from "./run-state";
+import type { RunState } from "@/foundation/runtime/run-state";
 
 export interface CheckpointStore {
   save(state: RunState): Promise<void>;
@@ -951,9 +974,9 @@ export interface RunStateSummary {
 目标文件：`src/runtime/checkpoint/file-checkpoint-store.ts`
 
 ```ts
-import type { CheckpointStore, RunStateSummary } from "./checkpoint-store";
-import type { FaultInjector } from "./fault-injector";
-import type { RunState } from "./run-state";
+import type { CheckpointStore, RunStateSummary } from "@/foundation/runtime/checkpoint-store";
+import type { FaultInjector } from "@/foundation/runtime/fault-injector";
+import type { RunState } from "@/foundation/runtime/run-state";
 
 export class FileCheckpointStore implements CheckpointStore {
   private readonly _rootDir: string;
@@ -1018,57 +1041,334 @@ Tool 执行按以下协议：
 
 对同批次并发 Tool，每个 ToolExecutionRecord 独立推进。CheckpointStore 需要串行化写入，避免后完成的旧 snapshot 覆盖新状态。可以使用单写队列或 revision compare-and-swap。
 
-### 12.4 Resume algorithm
+### 12.4 把恢复入口接回真实 Agent
 
-目标文件：`src/runtime/checkpoint/resume-run.ts`
+先完成 12A（单 Tool 的中断续跑），再做 12B（未知修改动作的人工确认），最后做 12C
+（并发批次）。不要只实现 `load()` 就把本阶段标为完成。
+
+12.1 的 `RunState.maxSteps` 和 `toolsetFingerprint` 分别固定运行预算与 Tool 配置。
+恢复沿用原始总步数上限，不能每次重启都重新获得一份预算。
+
+新建 `src/foundation/runtime/agent-checkpoint.ts`：
+
+```ts
+import type { CheckpointStore } from "./checkpoint-store";
+import type { FaultInjector } from "./fault-injector";
+import type { RunState, ToolExecutionRecord } from "./run-state";
+
+export interface AgentCheckpoint {
+  state: RunState;
+  store: CheckpointStore;
+  toolMetadata: Record<string, Pick<ToolExecutionRecord, "effect" | "idempotency">>;
+  snapshotMiddlewareState?: () => Record<string, unknown>;
+  faultInjector?: FaultInjector;
+}
+```
+
+给 `Agent` constructor options 增加 `checkpoint?: AgentCheckpoint`，复制 `checkpoint.state`。
+有 checkpoint 时，从其 `prompt/messages/maxSteps` 恢复 Agent；不要再追加用户消息。
+`middlewareState` 的恢复由 composition root 在创建各 Middleware 时完成，再把它们传给
+Agent。checkpoint 中不保存函数或具体存储实现。
+
+有状态的 Middleware 还要通过 `snapshotMiddlewareState` 提供保存出口，例如返回
+`{ todos: todoSystem.snapshot() }`。`_saveCheckpoint()` 调用它并深度复制返回值，恢复时
+composition root 再把 `state.middlewareState.todos` 交给 TodoSystem。只恢复、不更新这个
+字段，会让后续 checkpoint 永远保留初始 Todo。
+
+在 constructor 中替换对应赋值，保留已有的 Model、Registry 和 Middleware 初始化：
+
+```ts
+this._checkpoint = options.checkpoint
+  ? { ...options.checkpoint, state: structuredClone(options.checkpoint.state) }
+  : undefined;
+this.maxSteps = this._checkpoint?.state.maxSteps ?? options.maxSteps ?? 20;
+this._context = {
+  prompt: this._checkpoint?.state.prompt ?? options.prompt,
+  messages: structuredClone(this._checkpoint?.state.messages ?? options.messages ?? []),
+  tools: this._toolRegistry.list(),
+};
+```
+
+将阶段 5/6 的外层运行 guard 提取为 `_run()`，将 step 循环提取为 `_runSteps()`。
+目标文件：`src/agent/agent.ts`，下面是两个公开入口的完整实现：
+
+```ts
+async *stream(userMessage: UserMessage): AsyncGenerator<AgentEvent> {
+  yield* this._run({ userMessage, nextStep: 1 });
+}
+
+async *continueFromStep(nextStep: number): AsyncGenerator<AgentEvent> {
+  if (!this._checkpoint) throw new Error("Cannot resume without a checkpoint");
+  if (nextStep !== this._checkpoint.state.nextStep) {
+    throw new Error("Resume step does not match the checkpoint");
+  }
+  yield* this._run({ nextStep });
+}
+```
+
+这里的 `_checkpoint` 类型是 `AgentCheckpoint | undefined`。`_run()` 的参数和修改点为：
+
+```ts
+private async *_run(options: {
+  userMessage?: UserMessage;
+  nextStep: number;
+}): AsyncGenerator<AgentEvent> {
+  if (this._streaming) throw new Error("Agent is already streaming");
+  this._streaming = true;
+  this._abortController = new AbortController();
+  const signal = this._abortController.signal;
+  try {
+    if (options.userMessage) {
+      this._context.messages.push(options.userMessage);
+      await this._beforeAgentRun();
+    }
+    yield* this._runSteps(options.nextStep, signal);
+  } catch (error) {
+    if (!(error instanceof InjectedCrashError) && this._checkpoint) {
+      this._checkpoint.state.status = signal.aborted ? "aborted" : "failed";
+      await this._saveCheckpoint();
+    }
+    throw error;
+  } finally {
+    try {
+      await this._afterAgentRun();
+      // 阶段 11 的 run_end emitter 留在这里；其失败策略仍按 11.7 的约定处理。
+    } finally {
+      this._streaming = false;
+      this._abortController = null;
+    }
+  }
+}
+```
+
+该文件需导入 `AgentCheckpoint`、`InjectedCrashError`。下面给出共享循环骨架中最重要的
+恢复分支；`_planToolExecutions/_setCheckpointPhase/_saveCheckpoint` 的契约紧随其后：
+
+```ts
+private async *_runSteps(startStep: number, signal: AbortSignal): AsyncGenerator<AgentEvent> {
+  for (let step = startStep; step <= this.maxSteps; step += 1) {
+    signal.throwIfAborted();
+    let toolUses: ToolUseContent[];
+    if (this._checkpoint?.state.phase === "acting") {
+      // 已持久化的 assistant 是事实；恢复时不能再次请求模型生成同一批 Tool calls。
+      const assistant = this._context.messages.findLast((message) => message.role === "assistant");
+      if (!assistant) throw new Error("Acting checkpoint has no assistant message");
+      toolUses = this._extractToolUses(assistant);
+      if (!toolUses.length) throw new Error("Acting checkpoint has no tool calls");
+    } else {
+      await this._beforeAgentStep(step);
+      await this._setCheckpointPhase("thinking", step);
+      const assistant = yield* this._think(signal);
+      signal.throwIfAborted();
+      await this._afterModel(assistant);
+      this._context.messages.push(assistant);
+      toolUses = this._extractToolUses(assistant);
+      this._planToolExecutions(toolUses);
+      await this._setCheckpointPhase(toolUses.length ? "acting" : "idle", step,
+        toolUses.length ? "running" : "completed");
+      this._checkpoint?.faultInjector?.hit("after_model");
+      yield { type: "message", message: assistant };
+      if (!toolUses.length) return;
+    }
+    yield* this._act(toolUses, signal);
+    signal.throwIfAborted();
+    await this._afterAgentStep(step);
+    await this._setCheckpointPhase("idle", step + 1);
+  }
+  throw new MaximumStepsError({ maxSteps: this.maxSteps });
+}
+```
+
+补齐三个小方法，分别完成单一职责：
+
+| 方法 | 参数/返回值 | 实现提示 |
+|---|---|---|
+| `_planToolExecutions` | `ToolUseContent[] → void` | 无 checkpoint 时 no-op；按 id 拒绝重复，创建 `planned` record；metadata 缺失默认 `process/unknown`，不能猜成安全读取 |
+| `_setCheckpointPhase` | `(phase: RunState["phase"], nextStep: number, status: RunState["status"] = "running") → Promise<void>` | 更新三个字段，再 await `_saveCheckpoint()` |
+| `_saveCheckpoint` | `() → Promise<void>` | 无 checkpoint 时 no-op；复制当前 prompt/messages 和 state，调用可选 snapshotMiddlewareState 更新中间件状态，更新时间，await store.save；失败必须终止当前运行 |
+
+这是在阶段 11 已有循环上添加持久化位置，原来的 `message_appended` 和 span emitter 要保留，
+不能因提取循环而漏发事件。每个启用 checkpoint 的 Agent 实例承载一个 run；新 run 由
+composition root 创建新的 RunState/runId。恢复复用旧 runId；若 trace 续写同一 JSONL，
+先读最后的 sequence，再从下一个序号开始，不能重新从 1 写入。
+
+`_runSteps(startStep, signal)` 使用原来的 `_think/_act`，按这个状态表插入持久化点：
+
+| 当前状态 | 执行动作 | 必须持久化的下一状态 |
+|---|---|---|
+| `idle/thinking` | 调用 `_think`，追加最终 assistant | 有 Tool 时保存 `phase=acting`、当前 `nextStep`、整批 `planned` records；无 Tool 时保存 `completed` |
+| `acting`（包括恢复） | 从最后一条 assistant 取 Tool calls；不再调用模型生成同一批 | 每个 Tool 按 12.3 推进 record，追加缺少的 observation |
+| 全批 Tool observations 已齐 | 调用 `afterAgentStep` | `phase=idle`、`nextStep=当前 step + 1` |
+
+`after_model` 故障点放在 assistant 和 planned records 成功保存之后。`before_tool` 放在
+running record 保存之后；`after_tool` 放在实际 Tool 返回之后、result 保存之前。故障点
+必须位于 Registry 的业务错误捕获范围之外，否则模拟 crash 会被错误转换为普通 observation。
+
+为 `_invokeTool()` 增加以下明确分支；原有 hook、Registry 校验和序列化逻辑提取为
+`_executeTool()` 继续复用：
+
+```ts
+// 位于 _invokeTool 内；record 由当前批次 toolUse.id 查找，不按 Tool name 查找。
+if (record.status === "succeeded" || record.status === "failed") {
+  if (record.resultContent === undefined) throw new Error("Terminal Tool record has no result");
+  return {
+    role: "tool",
+    content: [{ type: "tool_result", tool_use_id: record.toolUseId, content: record.resultContent }],
+  } satisfies ToolMessage;
+}
+if (record.status !== "planned") throw new Error("Unresolved Tool execution");
+// TODO：record.status="running" → await save → before_tool → await _executeTool。
+// after_tool → 保存 resultContent 与 succeeded/failed → await save → 返回 ToolMessage。
+// failed 表示已有确定的错误 observation，也不能在恢复时隐式重试。
+```
+
+`_act()` 追加前按 `tool_use_id` 检查 observation 是否已经存在：存在则核对内容并跳过
+append/yield；不存在才追加、保存并输出。这样“result 已保存但 observation 尚未追加”的
+crash 可以补回消息，已经追加的消息不会出现两次。进入下一次 `_think` 前必须确认这一批
+所有 call 都有且只有一个 result。
+
+保存时复制 `{ ...state, prompt: this._context.prompt, messages: this._context.messages }`，
+不能让旧数组快照覆盖新 transcript。12C 再保留并发 `_act`：record 更新和 save 的入队顺序
+固定，save 队列不得吞掉失败。模拟 crash 后设置共享停止标志、abort 并等待同批任务清理，
+停止后禁止其他任务再写 checkpoint；真正的进程崩溃测试则由外部进程终止。
+
+#### 恢复决策与 observation 对账
+
+目标文件：`src/runtime/checkpoint/resume-run.ts`。这段实现先处理未知动作，全部可继续后
+才创建真实 Agent。`Pick<Agent, "continueFromStep">` 直接引用上一节新增的公开 API；单测
+可以实现同一接口，集成示例会传入真正的 Agent。
 
 ```ts
 import type { Agent } from "@/agent/agent";
+import type { AgentEvent } from "@/agent/agent-event";
+import type { CheckpointStore } from "@/foundation/runtime/checkpoint-store";
+import type { RunState, ToolExecutionRecord } from "@/foundation/runtime/run-state";
 
-import type { CheckpointStore } from "./checkpoint-store";
-import type { RunState, ToolExecutionRecord } from "./run-state";
+export type UnknownToolResolution =
+  | { action: "retry" }
+  | { action: "record_result"; content: string }
+  | { action: "skip"; reason: string }
+  | { action: "ask_user" };
 
-export type UnknownToolResolution = "retry" | "skip" | "ask_user";
+export type UnknownToolResolver = (record: ToolExecutionRecord) => Promise<UnknownToolResolution>;
+export type ResumeResult =
+  | { status: "completed" }
+  | { status: "needs_input"; toolUseIds: string[] };
 
-export type UnknownToolResolver = (
-  record: ToolExecutionRecord,
-) => Promise<UnknownToolResolution>;
+export function reconcileToolObservations(state: RunState): RunState {
+  const next = structuredClone(state);
+  const calls = new Set<string>();
+  const results = new Map<string, string>();
+  for (const message of next.messages) {
+    for (const content of message.content) {
+      if (content.type === "tool_use") {
+        if (calls.has(content.id)) throw new Error(`Duplicate tool_use ${content.id}`);
+        calls.add(content.id);
+      } else if (content.type === "tool_result") {
+        if (!calls.has(content.tool_use_id) || results.has(content.tool_use_id)) {
+          throw new Error(`Invalid tool_result ${content.tool_use_id}`);
+        }
+        results.set(content.tool_use_id, content.content);
+      }
+    }
+  }
+  for (const record of next.toolExecutions) {
+    if (!calls.has(record.toolUseId)) throw new Error(`Missing tool_use ${record.toolUseId}`);
+    if (record.status !== "succeeded" && record.status !== "failed") continue;
+    if (record.resultContent === undefined) throw new Error(`Missing result ${record.toolUseId}`);
+    if (results.has(record.toolUseId)) {
+      if (results.get(record.toolUseId) !== record.resultContent) {
+        throw new Error(`Conflicting result ${record.toolUseId}`);
+      }
+      continue;
+    }
+    next.messages.push({ role: "tool", content: [{
+      type: "tool_result", tool_use_id: record.toolUseId, content: record.resultContent,
+    }] });
+    results.set(record.toolUseId, record.resultContent);
+  }
+  return next;
+}
 
 export async function resumeRun(options: {
   runId: string;
   checkpointStore: CheckpointStore;
-  defineAgentFromState: (state: RunState) => Promise<Agent>;
-  resolveUnknownTool: UnknownToolResolver;
+  defineAgentFromState: (state: RunState) => Promise<Pick<Agent, "continueFromStep">>;
+  resolveUnknownTool?: UnknownToolResolver;
+  onEvent?: (event: AgentEvent) => void | Promise<void>;
   expected?: {
     cwd: string;
     projectFingerprint: string;
     modelOptionsFingerprint: string;
+    toolsetFingerprint: string;
   };
-}): Promise<void> {
-  const state = await options.checkpointStore.load(options.runId);
-  // 标准实现示例：completed run 是稳定终态，必须在创建 Agent 前拒绝。
-  if (state.status === "completed") {
-    throw new Error(`Run ${options.runId} is already completed`);
+}): Promise<ResumeResult> {
+  let state = structuredClone(await options.checkpointStore.load(options.runId));
+  if (state.schemaVersion !== 1) throw new Error("Unsupported schemaVersion");
+  if (state.status === "completed") throw new Error(`Run ${options.runId} is already completed`);
+  if (options.expected) {
+    const actual = {
+      cwd: state.cwd, projectFingerprint: state.projectFingerprint,
+      modelOptionsFingerprint: state.model.optionsFingerprint,
+      toolsetFingerprint: state.toolsetFingerprint,
+    };
+    const keys = Object.keys(actual) as Array<keyof typeof actual>;
+    const mismatches = keys.filter((key) => actual[key] !== options.expected![key]);
+    if (mismatches.length) throw new Error(`Fingerprint mismatch: ${mismatches.join(", ")}`);
   }
 
-  // TODO 1：按 schemaVersion migrate；未知新版拒绝读取，不能猜字段。
-  // TODO 2：校验 cwd/project/model/tool registry fingerprint，列出每项差异。
-  // TODO 3：恢复 transcript 和显式可序列化的 middleware state。
-  // TODO 4：planned 可取消；running 在 crash 后先转 unknown，再调用 resolver。
-  // TODO 5：只自动重试 resolver 判定 safe 的动作，然后从 nextStep 继续。
+  for (const record of state.toolExecutions) {
+    if (record.status === "running") record.status = "unknown";
+  }
+  // 在询问用户前持久化 unknown；关闭窗口后重试仍会询问同一条 record。
+  await options.checkpointStore.save(state);
+  const pending: string[] = [];
+  for (const record of state.toolExecutions) {
+    if (record.status !== "unknown") continue;
+    const safeRead = record.effect === "read" && record.idempotency === "safe";
+    const decision = options.resolveUnknownTool
+      ? await options.resolveUnknownTool(structuredClone(record))
+      : { action: safeRead ? "retry" : "ask_user" } as const;
+    switch (decision.action) {
+      case "retry":
+        // 本阶段只自动重试纯只读动作；写操作即使宣称幂等，也需另做前后置条件校验。
+        if (!safeRead) throw new Error(`Unsafe retry: ${record.toolUseId}`);
+        record.status = "planned";
+        delete record.resultContent;
+        break;
+      case "record_result":
+        record.status = "succeeded";
+        record.resultContent = decision.content;
+        break;
+      case "skip":
+        record.status = "failed";
+        record.errorCode = "RECOVERY_SKIPPED";
+        record.resultContent = JSON.stringify({ ok: false, code: record.errorCode, error: decision.reason });
+        break;
+      case "ask_user":
+        pending.push(record.toolUseId);
+        break;
+    }
+  }
+  state = reconcileToolObservations(state);
+  await options.checkpointStore.save(state);
+  if (pending.length) return { status: "needs_input", toolUseIds: pending };
+
+  const agent = await options.defineAgentFromState(state);
+  for await (const event of agent.continueFromStep(state.nextStep)) {
+    await options.onEvent?.(event);
+  }
+  return { status: "completed" };
 }
 ```
 
-Unknown Tool resolver 的默认规则：
+`record_result` 必须来自用户检查真实副作用后的确认，例如读取目标文件验证内容后提交
+对应 observation。`skip` 也产生明确错误 observation，不能直接删掉 Tool call。
+CLI 收到 `needs_input` 时显示 call id、input 和未知原因；收集决定后再次调用 `resumeRun`，
+不能在尚有 unknown 时提前调用模型。`expected` 由 CLI 按当前项目和配置提供。
 
-| Effect / idempotency | 默认恢复动作 |
-|---|---|
-| read + safe | 自动重试 |
-| write + safe | 校验前置/后置条件后重试 |
-| write/process + unsafe | 停止并询问用户 |
-| network + unknown | 停止并询问用户 |
+先运行 12.8 的纯对账/决策测试，再完成 Agent 持久化接线并运行真实 Agent 集成示例。
 
-例如 `mkdir` 在 `recursive: true` 时可以设计为幂等；任意 `bash` 默认不是。
 
 ### 12.5 Replay
 
@@ -1092,7 +1392,7 @@ Replay 按 sequence 消费 `message_appended` 和 lifecycle events。它展示�
 目标文件：`src/runtime/replay/replay.ts`
 
 ```ts
-import type { RuntimeTraceEvent } from "@/runtime/trace/events";
+import type { RuntimeTraceEvent } from "@/foundation/runtime/trace-events";
 
 export async function replayTrace(options: {
   events: RuntimeTraceEvent[];
@@ -1139,9 +1439,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { FileCheckpointStore } from "@/runtime/checkpoint/file-checkpoint-store";
-import type { RunState } from "@/runtime/checkpoint/run-state";
+import type { RunState } from "@/foundation/runtime/run-state";
 import { replayTrace } from "@/runtime/replay/replay";
-import type { RuntimeTraceEvent } from "@/runtime/trace/events";
+import type { RuntimeTraceEvent } from "@/foundation/runtime/trace-events";
 
 function defineState(root: string, nextStep: number): RunState {
   const timestamp = new Date().toISOString();
@@ -1151,6 +1451,8 @@ function defineState(root: string, nextStep: number): RunState {
     status: "running",
     phase: "idle",
     nextStep,
+    maxSteps: 20,
+    toolsetFingerprint: "tools-v1",
     prompt: "recovery demo",
     messages: [],
     model: {
@@ -1230,6 +1532,159 @@ try {
 bun run examples/stage-12-recovery.ts
 ```
 
+#### 运行真正的中断续跑场景
+
+上面的文件替换演示只验证存储原子性。下面补上另一条独立路径，使用本课程已实现的
+`Agent`、Registry 和文件 Tool，验证副作用发生后中断的恢复行为。
+
+目标文件：`examples/recovery-scenario.ts`。示例返回可断言的证据，供 CLI 和集成测试复用：
+
+```ts
+import { join } from "node:path";
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import type { AssistantMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
+import { defineTool } from "@/foundation/tools";
+import { InjectedCrashError } from "@/foundation/runtime/fault-injector";
+import type { AgentCheckpoint } from "@/foundation/runtime/agent-checkpoint";
+import type { RunState } from "@/foundation/runtime/run-state";
+import { FileCheckpointStore } from "@/runtime/checkpoint/file-checkpoint-store";
+import { resumeRun } from "@/runtime/checkpoint/resume-run";
+
+export async function runRecoveryScenario(root: string) {
+  const path = join(root, "counter.txt");
+  await Bun.write(path, "0");
+  let readCalls = 0;
+  let writeCalls = 0;
+  let modelCalls = 0;
+  const tools = [
+    defineTool({
+      name: "read_once", description: "Read the fixture counter",
+      parameters: z.object({ description: z.string() }),
+      invoke: async () => {
+        readCalls += 1;
+        return { ok: true, data: { value: Number(await Bun.file(path).text()) } };
+      },
+    }),
+    defineTool({
+      name: "increment_once", description: "Increment the fixture counter",
+      parameters: z.object({ description: z.string() }),
+      invoke: async () => {
+        writeCalls += 1;
+        const value = Number(await Bun.file(path).text()) + 1;
+        await Bun.write(path, String(value));
+        return { ok: true, data: { value } };
+      },
+    }),
+  ];
+  function response(params: ModelProviderInvokeParams): AssistantMessage {
+    const observations = params.messages.flatMap((message) =>
+      message.role === "tool" ? message.content.map((item) => item.tool_use_id) : [],
+    );
+    if (observations.includes("write-1")) {
+      return { role: "assistant", content: [{ type: "text", text: "completed" }] };
+    }
+    const readDone = observations.includes("read-1");
+    return { role: "assistant", content: [{
+      type: "tool_use", id: readDone ? "write-1" : "read-1",
+      name: readDone ? "increment_once" : "read_once", input: { description: "fixture action" },
+    }] };
+  }
+  const provider: ModelProvider = {
+    invoke: async (params) => { modelCalls += 1; return response(params); },
+    stream: async function* (params) {
+      params.signal?.throwIfAborted();
+      modelCalls += 1;
+      yield response(params);
+    },
+  };
+  const model = new Model({ name: "recovery-scripted", provider });
+  const store = new FileCheckpointStore({ rootDir: root });
+  const now = new Date().toISOString();
+  const initial: RunState = {
+    schemaVersion: 1, runId: "recovery-integration", status: "running", phase: "idle",
+    nextStep: 1, maxSteps: 4, toolsetFingerprint: "read-increment-v1", prompt: "", messages: [],
+    model: { name: model.name, provider: "scripted", optionsFingerprint: "model-v1" },
+    cwd: root, projectFingerprint: "fixture-v1", toolExecutions: [], middlewareState: {},
+    createdAt: now, updatedAt: now,
+  };
+  const toolMetadata: AgentCheckpoint["toolMetadata"] = {
+    read_once: { effect: "read", idempotency: "safe" },
+    increment_once: { effect: "write", idempotency: "unsafe" },
+  };
+  let finishedTools = 0;
+  const first = new Agent({ model, prompt: "", tools, checkpoint: {
+    state: initial, store, toolMetadata,
+    faultInjector: { hit: (point) => {
+      if (point === "after_tool" && ++finishedTools === 2) {
+        throw new InjectedCrashError({ point });
+      }
+    } },
+  } });
+  let crashed = false;
+  try {
+    for await (const _event of first.stream({
+      role: "user", content: [{ type: "text", text: "Read and increment the counter once" }],
+    })) { /* consume */ }
+  } catch (error) {
+    if (!(error instanceof InjectedCrashError)) throw error;
+    crashed = true;
+  }
+  if (!crashed) throw new Error("Expected an injected crash after the write");
+  const atCrash = await store.load(initial.runId);
+  const callsAtCrash = modelCalls;
+  let resumedAgents = 0;
+  const defineAgentFromState = async (state: RunState) => {
+    resumedAgents += 1;
+    return new Agent({ model, prompt: state.prompt, tools, checkpoint: { state, store, toolMetadata } });
+  };
+  const options = {
+    runId: initial.runId, checkpointStore: store, defineAgentFromState,
+    expected: {
+      cwd: root, projectFingerprint: "fixture-v1", modelOptionsFingerprint: "model-v1",
+      toolsetFingerprint: "read-increment-v1",
+    },
+  };
+  const blocked = await resumeRun(options);
+  if (blocked.status !== "needs_input" || resumedAgents !== 0 || modelCalls !== callsAtCrash) {
+    throw new Error("Unknown write must block before constructing or running an Agent");
+  }
+  // 模拟用户检查磁盘后确认结果。没有确认前绝不自动再次执行 increment_once。
+  const confirmedValue = Number(await Bun.file(path).text());
+  if (confirmedValue !== 1) throw new Error("Unexpected side effect at the crash boundary");
+  await resumeRun({ ...options, resolveUnknownTool: async () => ({
+    action: "record_result", content: JSON.stringify({ ok: true, data: { value: confirmedValue } }),
+  }) });
+  const final = await store.load(initial.runId);
+  const resultIds = final.messages.flatMap((message) =>
+    message.role === "tool" ? message.content.map((item) => item.tool_use_id) : [],
+  );
+  return {
+    readCalls, writeCalls, modelCallsAfterCrash: modelCalls - callsAtCrash,
+    phaseAtCrash: atCrash.phase, stepAtCrash: atCrash.nextStep,
+    blockedToolUseIds: blocked.toolUseIds,
+    finalValue: Number(await Bun.file(path).text()), status: final.status, resultIds,
+    finalMessage: final.messages.at(-1),
+  };
+}
+```
+
+在 `examples/stage-12-recovery.ts` 顶部导入 `runRecoveryScenario`（`./recovery-scenario`），
+并在已有 `try` 内、删除临时目录之前增加：
+
+```ts
+console.log(JSON.stringify(await runRecoveryScenario(root), null, 2));
+```
+
+预期关键输出：`readCalls=1`、`writeCalls=1`、`modelCallsAfterCrash=1`、
+`phaseAtCrash="acting"`、`stepAtCrash=2`、`finalValue=1`、`status="completed"`，
+`resultIds` 恰好是 `["read-1", "write-1"]`。计数器若变成 2，说明恢复重复执行了副作用；
+若没有最后的 assistant，则只完成了状态加载，没有真正续跑。
+
+
 ### 12.8 完整恢复测试
 
 目标文件：
@@ -1244,7 +1699,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import type { RunState } from "../run-state";
+import type { RunState } from "@/foundation/runtime/run-state";
 import { FileCheckpointStore } from "../file-checkpoint-store";
 
 let root: string | undefined;
@@ -1261,6 +1716,8 @@ function state(nextStep: number): RunState {
     status: "running",
     phase: "idle",
     nextStep,
+    maxSteps: 20,
+    toolsetFingerprint: "tools-v1",
     prompt: "test",
     messages: [],
     model: { name: "test", provider: "scripted", optionsFingerprint: "model-v1" },
@@ -1320,104 +1777,158 @@ describe("FileCheckpointStore", () => {
 
 目标文件：`src/runtime/checkpoint/__tests__/resume-run.test.ts`
 
-<details>
-<summary>展开完整代码：<code>resume-run.test.ts</code></summary>
-
 ```ts
 import { describe, expect, test } from "bun:test";
 
-import type { RunState, ToolExecutionRecord } from "../run-state";
-import { resumeRun } from "../resume-run";
+import type { AgentEvent } from "@/agent/agent-event";
+import type { CheckpointStore } from "@/foundation/runtime/checkpoint-store";
+import type { RunState } from "@/foundation/runtime/run-state";
 
-function tool(status: ToolExecutionRecord["status"], effect: ToolExecutionRecord["effect"])
-  : ToolExecutionRecord {
-  return {
-    toolUseId: `call-${status}-${effect}`,
-    toolName: effect === "read" ? "read_file" : "write_file",
-    input: {},
-    effect,
-    idempotency: effect === "read" ? "safe" : "unsafe",
-    status,
-  };
-}
+import { reconcileToolObservations, resumeRun } from "../resume-run";
 
-function state(overrides: Partial<RunState> = {}): RunState {
+function state(): RunState {
   return {
-    schemaVersion: 1,
-    runId: "run-1",
-    status: "running",
-    phase: "acting",
-    nextStep: 2,
-    prompt: "test",
-    messages: [],
+    schemaVersion: 1, runId: "run-1", status: "running", phase: "acting", nextStep: 2,
+    maxSteps: 4, toolsetFingerprint: "tools-v1", prompt: "test",
+    messages: [{ role: "assistant", content: [{
+      type: "tool_use", id: "call-1", name: "write_file", input: {},
+    }] }],
     model: { name: "test", provider: "scripted", optionsFingerprint: "model-v1" },
-    cwd: "/fixture",
-    projectFingerprint: "project-v1",
-    toolExecutions: [],
-    middlewareState: { todos: [] },
-    createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: "2026-01-01T00:00:00.000Z",
-    ...overrides,
+    cwd: "/fixture", projectFingerprint: "project-v1", middlewareState: {},
+    toolExecutions: [{
+      toolUseId: "call-1", toolName: "write_file", input: {}, effect: "write",
+      idempotency: "unsafe", status: "running",
+    }],
+    createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
   };
 }
 
-function dependencies(saved: RunState) {
-  const resolved: string[] = [];
+function dependencies(initial: RunState) {
+  let saved = structuredClone(initial);
   let definedWith: RunState | undefined;
-  return {
-    resolved,
-    definedWith: () => definedWith,
-    options: {
-      runId: saved.runId,
-      checkpointStore: {
-        load: async () => structuredClone(saved),
-        save: async () => undefined,
-        list: async () => [],
-      },
-      defineAgentFromState: async (value: RunState) => {
-        definedWith = structuredClone(value);
-        return { continueFromStep: async () => undefined } as never;
-      },
-      resolveUnknownTool: async (record: ToolExecutionRecord) => {
-        resolved.push(record.toolUseId);
-        return record.idempotency === "safe" ? "retry" : "ask_user";
-      },
+  const continued: number[] = [];
+  const checkpointStore: CheckpointStore = {
+    save: async (value) => { saved = structuredClone(value); },
+    load: async () => structuredClone(saved),
+    list: async () => [],
+  };
+  const options: Parameters<typeof resumeRun>[0] = {
+    runId: initial.runId, checkpointStore,
+    defineAgentFromState: async (value) => {
+      definedWith = structuredClone(value);
+      return { continueFromStep: async function* (step): AsyncGenerator<AgentEvent> {
+        continued.push(step);
+        yield* []; // 这个 fake 只记录调用，真实执行由下一份集成测试覆盖。
+      } };
     },
   };
+  return { options, continued, saved: () => saved, definedWith: () => definedWith };
 }
 
 describe("resumeRun", () => {
   test("rejects a completed run before constructing an Agent", async () => {
-    const fixture = dependencies(state({ status: "completed" }));
+    const fixture = dependencies({ ...state(), status: "completed" });
     await expect(resumeRun(fixture.options)).rejects.toThrow("already completed");
     expect(fixture.definedWith()).toBeUndefined();
   });
 
-  test("does not revisit succeeded tools and resolves crash-time running tools", async () => {
-    const fixture = dependencies(state({
-      toolExecutions: [tool("succeeded", "write"), tool("running", "read"), tool("running", "write")],
-    }));
-    await resumeRun(fixture.options);
+  test("persists unknown and blocks unsafe effects before Agent construction", async () => {
+    const fixture = dependencies(state());
+    expect(await resumeRun(fixture.options)).toEqual({ status: "needs_input", toolUseIds: ["call-1"] });
+    expect(fixture.saved().toolExecutions[0]?.status).toBe("unknown");
+    expect(fixture.definedWith()).toBeUndefined();
+    expect(fixture.continued).toEqual([]);
+  });
 
-    expect(fixture.resolved).toEqual(["call-running-read", "call-running-write"]);
+  test("only retries safe reads and preserves the saved step", async () => {
+    const input = state();
+    input.toolExecutions[0]!.effect = "read";
+    input.toolExecutions[0]!.idempotency = "safe";
+    const fixture = dependencies(input);
+    await resumeRun(fixture.options);
+    expect(fixture.definedWith()?.toolExecutions[0]?.status).toBe("planned");
+    expect(fixture.continued).toEqual([2]);
+    expect(fixture.definedWith()?.messages).toHaveLength(1);
+  });
+
+  test("rejects an unsafe automatic retry even when a resolver requests it", async () => {
+    const fixture = dependencies(state());
+    await expect(resumeRun({ ...fixture.options, resolveUnknownTool: async () => ({ action: "retry" }) }))
+      .rejects.toThrow("Unsafe retry");
+    expect(fixture.continued).toEqual([]);
+  });
+
+  test("reconciles a saved result without duplicating observations", async () => {
+    const input = state();
+    input.toolExecutions[0]!.status = "succeeded";
+    input.toolExecutions[0]!.resultContent = "saved output";
+    const repaired = reconcileToolObservations(input);
+    expect(repaired.messages).toHaveLength(2);
+    expect(input.messages).toHaveLength(1);
+    expect(reconcileToolObservations(repaired)).toEqual(repaired);
+    const fixture = dependencies(repaired);
+    await resumeRun(fixture.options);
     expect(fixture.definedWith()?.toolExecutions[0]?.status).toBe("succeeded");
+    expect(fixture.definedWith()?.messages).toHaveLength(2);
+    expect(fixture.continued).toEqual([2]);
+  });
+
+  test("user confirmation and skip both leave a paired observation", async () => {
+    const confirmed = dependencies(state());
+    await resumeRun({ ...confirmed.options, resolveUnknownTool: async () => ({
+      action: "record_result", content: "verified on disk",
+    }) });
+    expect(confirmed.definedWith()?.messages.at(-1)).toEqual({ role: "tool", content: [{
+      type: "tool_result", tool_use_id: "call-1", content: "verified on disk",
+    }] });
+    const skipped = dependencies(state());
+    await resumeRun({ ...skipped.options, resolveUnknownTool: async () => ({
+      action: "skip", reason: "user declined to retry",
+    }) });
+    expect(JSON.stringify(skipped.definedWith()?.messages)).toContain("RECOVERY_SKIPPED");
   });
 
   test("reports every fingerprint mismatch together", async () => {
     const fixture = dependencies(state());
-    await expect(resumeRun({
-      ...fixture.options,
-      expected: {
-        cwd: "/other",
-        projectFingerprint: "project-v2",
-        modelOptionsFingerprint: "model-v2",
-      },
-    })).rejects.toThrow(/cwd.*projectFingerprint.*modelOptionsFingerprint/s);
+    await expect(resumeRun({ ...fixture.options, expected: {
+      cwd: "/other", projectFingerprint: "project-v2", modelOptionsFingerprint: "model-v2",
+      toolsetFingerprint: "tools-v2",
+    } })).rejects.toThrow(/cwd.*projectFingerprint.*modelOptionsFingerprint.*toolsetFingerprint/s);
   });
 });
 ```
 
-</details>
+这些单测只证明恢复决策和对账，不证明 Agent 已经执行。下面的集成测试复用真实 Agent
+场景，不能用返回空对象或空 `continueFromStep()` 的 fake 替换。
+
+目标文件：`src/runtime/checkpoint/__tests__/recovery-integration.test.ts`
+
+```ts
+import { afterEach, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+import { runRecoveryScenario } from "../../../../examples/recovery-scenario";
+
+let root: string | undefined;
+afterEach(async () => {
+  if (root) await rm(root, { recursive: true, force: true });
+  root = undefined;
+});
+
+test("resumes a real Agent after an unknown write without repeating completed effects", async () => {
+  root = await mkdtemp(join(tmpdir(), "harness-recovery-integration-"));
+  const result = await runRecoveryScenario(root);
+  expect(result).toMatchObject({
+    readCalls: 1, writeCalls: 1, modelCallsAfterCrash: 1,
+    phaseAtCrash: "acting", stepAtCrash: 2, blockedToolUseIds: ["write-1"],
+    finalValue: 1, status: "completed", resultIds: ["read-1", "write-1"],
+    finalMessage: { role: "assistant", content: [{ type: "text", text: "completed" }] },
+  });
+});
+```
+
 
 目标文件：`src/runtime/replay/__tests__/replay.test.ts`
 
@@ -1473,8 +1984,8 @@ describe("replayTrace", () => {
 </details>
 
 示例故障演练还应手工覆盖 model 后/Tool 前、read/write Tool 中途和并发批次崩溃；上面
-三个完整文件固定了最容易被实现错误破坏的自动化不变量：原子保存、unknown 分类、成功
-动作不重访、完成态拒绝和 replay 只读。
+这些测试分别覆盖存储原子性、决策/对账、真实 Agent 续跑和 replay。它们不替代并发批次、
+真实进程被终止或磁盘写入失败的故障演练；这些场景仍需按 12C 的停止与持久化规则验证。
 
 最后执行本阶段的完整测试：
 

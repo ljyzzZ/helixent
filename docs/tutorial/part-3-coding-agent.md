@@ -22,6 +22,20 @@
 
 Adapter 的职责是吸收这些差异，让 Agent runtime 只看到 canonical Message。
 
+### 7.0 按四个小里程碑实现
+
+不要同时调试两个 SDK。阅读本章时，按下面的顺序往返对应小节：
+
+| 里程碑 | 本次只增加什么 | 可以停止并检查的证据 |
+|---|---|---|
+| 7A | OpenAI 的纯消息转换与 `invoke` | 7.5 的 OpenAI converter tests、7.4 的 fake client test |
+| 7B | OpenAI streaming 与 Tool JSON fragments | 7.3 的 accumulator tests；无 key 也能完成 |
+| 7C | 复用同一契约实现 Anthropic | Anthropic converter/accumulator tests |
+| 7D | 接入真实 endpoint | 7.4 示例；这是可选 smoke，不替代前面测试 |
+
+先画出 `Message[] → request → SDK response → AssistantMessage`，每次只实现一个箭头。
+不要在 7A 运行尚未实现的 Anthropic 测试。7C 完成后再运行本阶段完整测试套件。
+
 ### 7.1 安装 SDK
 
 ```bash
@@ -88,10 +102,28 @@ import type { Tool } from "@/foundation/tools";
 export function convertToOpenAIMessages(
   messages: Message[],
 ): OpenAI.ChatCompletionMessageParam[] {
-  // TODO 1：system/user text 直接转换；image_url 只允许出现在 user。
-  // TODO 2：assistant 的 text 与 tool_use 合并为一条 wire message。
-  // TODO 3：每个 ToolResultContent 转成带 tool_call_id 的 tool role message。
-  throw new Error("TODO: implement convertToOpenAIMessages");
+  const result: OpenAI.ChatCompletionMessageParam[] = [];
+  for (const message of messages) {
+    switch (message.role) {
+      case "system":
+        // 标准路径：逐条转换，结果只写入新数组，不修改 canonical transcript。
+        result.push({ role: "system", content: message.content.map((item) => item.text).join("\n") });
+        break;
+      case "user":
+        // TODO 1：map 每个 text/image_url block；保持数组顺序，图片保留 URL/detail。
+        throw new Error("TODO: convert user content");
+      case "assistant":
+        // TODO 2：text 合并为 content，tool_use 合并为同一 wire message 的 tool_calls。
+        // arguments 是 JSON.stringify(input)；只有 Tool call 时 content 可为 null。
+        // thinking 的回传规则由 endpoint 决定，不能冒充用户文本。
+        throw new Error("TODO: convert assistant content");
+      case "tool":
+        // TODO 3：一条 canonical ToolMessage 可生成多条 wire tool message；
+        // 每条使用 tool_call_id=tool_use_id。不要用 map 生成嵌套数组。
+        throw new Error("TODO: convert tool results");
+    }
+  }
+  return result;
 }
 
 export function convertToOpenAITools(
@@ -816,10 +848,10 @@ bun test src/community/openai src/community/anthropic
 
 - `src/community/openai/model-provider.ts`
 - `src/community/openai/utils.ts`
-- `src/community/openai/stream-accumulator.ts`
+- `src/community/openai/stream-utils.ts`（练习项目将对应文件命名为 `stream-accumulator.ts`）
 - `src/community/anthropic/model-provider.ts`
 - `src/community/anthropic/utils.ts`
-- `src/community/anthropic/stream-accumulator.ts`
+- `src/community/anthropic/stream-utils.ts`（练习项目将对应文件命名为 `stream-accumulator.ts`）
 
 ### 验收
 
@@ -838,12 +870,19 @@ bun test src/community/openai src/community/anthropic
 
 Coding Agent 的能力不来自“更长的 prompt”，而来自高质量的环境接口。Tool 应窄、可组合、有明确 error code，并回显模型下一步决策需要的信息。
 
-按风险分两批实现：
+先按依赖跑通一条最小路径，再扩展到完整工具集：
 
-| 批次 | Tools | 副作用 |
+| 小里程碑 | Tools | 完成后立即观察 |
 |---|---|---|
-| A：只读 | `file_info`、`list_files`、`glob_search`、`grep_search`、`read_file` | 无 |
-| B：修改 | `mkdir`、`write_file`、`str_replace`、`apply_patch`、`move_path`、`bash` | 有 |
+| 8A | 路径校验 + `read_file` | 读取一份临时文件；范围和越界测试通过 |
+| 8B | `str_replace` | 读出旧值 → 唯一替换 → 再读出新值；失败时文件不变 |
+| 8C | `bash` | 执行 fixture 的检查命令；捕获输出、超时和运行中 abort |
+| 8D | `file_info`、`list_files`、`glob_search`、`grep_search` | 搜索结果的路径、行号和截断状态正确 |
+| 8E | `mkdir`、`write_file`、`apply_patch`、`move_path` | 在磁盘上检查新增、修改、移动结果 |
+
+8A～8C 的 playground 直接 import 当前 Tool factory，只注册已实现的 Tool。8E 完成后才填充
+8.5 的 `defineCodingTools()`，再运行依赖完整工具集的示例和 8.6 contract tests。这样未完成的
+空文件不会阻塞第一个读写闭环。
 
 不要一开始实现一个万能 `filesystem` Tool。窄 Tool 更容易描述、审批、测试、统计和限制权限。
 
@@ -959,6 +998,8 @@ import { z } from "zod";
 
 import { defineTool } from "@/foundation/tools";
 
+import { resolveWorkspacePath } from "./tool-utils";
+
 export function defineReadFileTool(options: { cwd: string; maxCharacters?: number }) {
   return defineTool({
     name: "read_file",
@@ -971,18 +1012,30 @@ export function defineReadFileTool(options: { cwd: string; maxCharacters?: numbe
     }),
     invoke: async (input, signal) => {
       signal?.throwIfAborted();
-      // 标准实现示例：中止检查必须发生在文件系统访问之前。
+      const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+      if (!resolved.ok) return { ...resolved, summary: resolved.error };
 
-      // TODO 1：resolveWorkspacePath；失败时原样返回稳定 code。
-      // TODO 2：检查存在且为普通文件；分别返回 FILE_NOT_FOUND / NOT_A_FILE。
-      // TODO 3：startLine/endLine 必须成对满足 1 <= start <= end <= lineCount。
-      // TODO 4：全文件读取返回原文；范围读取返回带 1-based 行号的文本。
-      // TODO 5：应用字符上限并在截断时添加明确 marker。
+      // 标准路径：边界通过后才读取；不存在的文件是业务失败，不是路径越界。
+      const file = Bun.file(resolved.path);
+      if (!(await file.exists())) {
+        return { ok: false, summary: "File not found", code: "FILE_NOT_FOUND", error: input.path };
+      }
+      // TODO 1：用 stat 检查普通文件；目录返回 NOT_A_FILE，其他 I/O 错误规范化。
+      // TODO 2：读取 UTF-8 文本；把 text.split("\n") 的末尾空项排除出 lineCount，
+      // 但无范围时必须返回原始 text，保留末尾换行。
+      // TODO 3：有且仅有一个范围端点，或 start > end 时返回 INVALID_LINE_RANGE；
+      // start 超过 lineCount 返回 START_LINE_OUT_OF_RANGE，end 越界返回 INVALID_LINE_RANGE。
+      // TODO 4：范围输出固定为 `${lineNumber}: ${lineText}`，以换行连接。
+      // TODO 5：maxCharacters 限制保留的正文字符数，超限追加 "\n[truncated]"；
+      // 返回 { ok: true, summary, data: { path: resolved.path, content, truncated } }。
       throw new Error("TODO: implement read_file");
     },
   });
 }
 ```
+
+补齐 TODO 时再导入所选的 `stat` API。
+先实现全文件读取，再补范围和截断，按 8.6 中的 `read_file` 用例逐个转绿。
 
 建议稳定 error codes：
 
@@ -1013,6 +1066,28 @@ ABORTED
 
 这能阻止模型的局部意图意外变成全局修改。
 
+在 `src/coding/tools/str-replace.ts` 的 `invoke` 中，按下面的骨架补齐。输入 schema 使用
+`description/path/oldText/newText`，其中 `oldText` 必须非空，`newText` 可以为空：
+
+```ts
+// 此段位于 invoke 内；先完成路径校验、文件存在性检查和 signal 检查。
+const matches = original.split(input.oldText).length - 1;
+if (matches !== 1) {
+  return {
+    ok: false,
+    summary: "Replacement requires exactly one match",
+    error: `Found ${matches} matches`,
+    code: matches === 0 ? "PATTERN_NOT_FOUND" : "AMBIGUOUS_REPLACEMENT",
+  };
+}
+const updated = original.replace(input.oldText, () => input.newText);
+// TODO：写入前再检查 signal，然后写 updated；成功后返回修改路径与 replacements: 1。
+// 使用 callback 返回 newText，避免 $&、$1 等被 String.replace 当成替换表达式。
+```
+
+`original` 来自通过校验后的文件内容；0/多匹配分支必须发生在任何写入之前。
+先在临时文件上手动跑通“读 → 替换 → 再读”，再测试失败时文件的字节内容保持不变。
+
 ### 8.4 `bash` 的边界
 
 `bash` Tool 负责进程执行和结果捕获，不负责自行决定是否安全。审批由阶段 10 的 Policy Middleware 完成。
@@ -1028,6 +1103,31 @@ ABORTED
 
 不要把 command 插入另一层未转义的 shell string。若契约接收完整 shell command，应明确这是 intentional shell execution，并把原始 command 展示在审批界面。
 
+本课程的 `bash` 示例面向 macOS/Linux。先实现普通命令，再增加下面这些资源所有权：
+
+| 资源 | 创建位置 | 结束条件 |
+|---|---|---|
+| 子进程及进程组 | `Bun.spawn(["bash", "-c", command], { cwd, detached: true, ... })` | 正常退出，或 timeout/abort 后终止整个进程组 |
+| stdout/stderr reader | spawn 后立即并发消费 | 读到 EOF；达到保留上限后继续 drain，丢弃多余正文 |
+| timeout timer | spawn 后 | 所有退出路径 `clearTimeout` |
+| abort listener | spawn 前检查，spawn 后注册并再检查一次 | `finally` 移除 |
+
+在 `src/coding/tools/bash.ts` 的 `invoke` 中依次完成这些块：
+
+```ts
+// 这是 invoke 内的执行顺序骨架；变量和结果类型使用本文件的 Tool contract。
+// TODO 1：若 signal.aborted，直接返回 structured ABORTED，不能 spawn。
+// TODO 2：spawn 一个独立进程组，固定 cwd，同时开始读取 stdout 和 stderr。
+// TODO 3：把结束原因保存为 "exit" | "timeout" | "abort"，第一次原因生效后不可覆盖。
+// TODO 4：timeout/abort 先向进程组发 SIGTERM，宽限期后仍未退出则发 SIGKILL。
+// POSIX 进程组使用 process.kill(-child.pid, signal)；ESRCH 表示已经退出，可忽略。
+// TODO 5：等待 child.exited 和两个 reader 完成，再返回结果；finally 清理所有 timer/listener。
+// TODO 6：成功 data 包含 stdout/stderr/exitCode/truncated；超时和 abort 使用不同 code。
+```
+
+只调用 `child.kill()` 可能留下 shell 启动的孙进程。8.6 会启动一个延迟写文件的孙进程，
+检查取消后它没有继续产生副作用。不要用 `Promise.race` 返回超时后就丢弃仍在运行的进程。
+
 ### 8.5 组装 Coding Tools
 
 目标文件：`src/coding/tools/index.ts`
@@ -1041,6 +1141,7 @@ export interface DefineCodingToolsOptions {
   cwd: string;
   bashTimeoutMs?: number;
   maxOutputCharacters?: number;
+  maxResults?: number;
 }
 
 export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
@@ -1050,6 +1151,21 @@ export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
   throw new Error("TODO: implement defineCodingTools");
 }
 ```
+
+8D/8E 的输出字段固定如下，便于测试内容而不是只测试 `ok`：
+
+| Tool | success `data` 的必要字段 |
+|---|---|
+| `file_info` | `path`（绝对路径）、`type`（`file`/`directory`）、`size` |
+| `list_files` | `entries`（相对请求目录的名称，排序）、`truncated` |
+| `glob_search` | `paths`（相对 cwd 的路径，排序）、`truncated` |
+| `grep_search` | `matches: { path, line, text }[]`，path 相对 cwd、line 从 1 开始；`truncated` |
+| `read_file` | `path`、`content`、`truncated` |
+| 修改型 Tools | 被修改的路径；测试另从磁盘读取最终结果 |
+| `bash` | `stdout`、`stderr`、`exitCode`、`truncated` |
+
+`maxResults` 控制 list/glob/grep 的条数；`maxOutputCharacters` 转发为 read_file 的
+`maxCharacters`，并控制 bash 保留的输出正文。上限由 composition 配置，不能由模型放大。
 
 参数规则：所有 Tool input 的首字段都是 `description`；文件路径相对固定 `cwd`；
 `startLine/endLine` 为 1-based 且必须成对出现；bash timeout 来自 composition 配置而非模型。
@@ -1232,7 +1348,7 @@ describe("resolveWorkspacePath", () => {
 
 ```ts
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -1249,8 +1365,13 @@ afterEach(async () => {
   await rm(workspace, { recursive: true, force: true });
 });
 
-async function invoke(name: string, input: Record<string, unknown>, signal?: AbortSignal) {
-  const tool = defineCodingTools({ cwd: workspace, bashTimeoutMs: 50 })
+async function invoke(
+  name: string,
+  input: Record<string, unknown>,
+  signal?: AbortSignal,
+  limits: { maxOutputCharacters?: number; maxResults?: number; bashTimeoutMs?: number } = {},
+) {
+  const tool = defineCodingTools({ cwd: workspace, bashTimeoutMs: 100, ...limits })
     .find((candidate) => candidate.name === name);
   if (!tool) throw new Error(`Missing test Tool: ${name}`);
   return tool.invoke({ description: `test ${name}`, ...input } as never, signal);
@@ -1258,17 +1379,46 @@ async function invoke(name: string, input: Record<string, unknown>, signal?: Abo
 
 describe("read-only coding tools", () => {
   test("file_info, list_files, glob_search and grep_search expose bounded data", async () => {
-    expect(await invoke("file_info", { path: "input.ts" })).toMatchObject({ ok: true });
-    expect(await invoke("list_files", { path: "." })).toMatchObject({ ok: true });
+    expect(await invoke("file_info", { path: "input.ts" })).toMatchObject({
+      ok: true, data: { type: "file", size: new TextEncoder().encode("const value = 1;\n").length },
+    });
+    expect(await invoke("list_files", { path: "." })).toMatchObject({
+      ok: true, data: { entries: ["input.ts"], truncated: false },
+    });
     expect(await invoke("glob_search", { path: ".", pattern: "**/*.ts" }))
-      .toMatchObject({ ok: true });
+      .toMatchObject({ ok: true, data: { paths: ["input.ts"], truncated: false } });
     expect(await invoke("grep_search", { path: ".", pattern: "value" }))
-      .toMatchObject({ ok: true });
+      .toMatchObject({ ok: true, data: {
+        matches: [{ path: "input.ts", line: 1, text: "const value = 1;" }], truncated: false,
+      } });
+    for (const name of ["file_info", "list_files", "glob_search", "grep_search"]) {
+      expect(await invoke(name, { path: "missing", pattern: "value" }))
+        .toMatchObject({ ok: false, code: "FILE_NOT_FOUND" });
+    }
+  });
+
+  test("limits search results and marks truncated output", async () => {
+    await writeFile(join(workspace, "second.ts"), "const value = 2;\n", "utf8");
+    const limits = { maxResults: 1 };
+    expect(await invoke("list_files", { path: "." }, undefined, limits))
+      .toMatchObject({ data: { entries: ["input.ts"], truncated: true } });
+    expect(await invoke("glob_search", { path: ".", pattern: "**/*.ts" }, undefined, limits))
+      .toMatchObject({ data: { paths: ["input.ts"], truncated: true } });
+    expect(await invoke("grep_search", { path: ".", pattern: "value" }, undefined, limits))
+      .toMatchObject({ data: {
+        matches: [{ path: "input.ts", line: 1, text: "const value = 1;" }], truncated: true,
+      } });
   });
 
   test("read_file validates ranges and rejects traversal", async () => {
     expect(await invoke("read_file", { path: "input.ts", startLine: 1, endLine: 1 }))
-      .toMatchObject({ ok: true });
+      .toMatchObject({ ok: true, data: { content: "1: const value = 1;", truncated: false } });
+    expect(await invoke("read_file", { path: "input.ts" }))
+      .toMatchObject({ data: { content: "const value = 1;\n", truncated: false } });
+    expect(await invoke("read_file", { path: "input.ts" }, undefined, { maxOutputCharacters: 5 }))
+      .toMatchObject({ data: { content: "const\n[truncated]", truncated: true } });
+    expect(await invoke("read_file", { path: "input.ts", startLine: 1 }))
+      .toMatchObject({ ok: false, code: "INVALID_LINE_RANGE" });
     expect(await invoke("read_file", { path: "input.ts", startLine: 2, endLine: 1 }))
       .toMatchObject({ ok: false, code: "INVALID_LINE_RANGE" });
     expect(await invoke("read_file", { path: "../outside.ts" }))
@@ -1284,6 +1434,11 @@ describe("mutating coding tools", () => {
     expect(await invoke("move_path", { from: "src/a.ts", to: "src/b.ts" }))
       .toMatchObject({ ok: true });
     expect(await readFile(join(workspace, "src/b.ts"), "utf8")).toBe("export {};\n");
+    await expect(access(join(workspace, "src/a.ts"))).rejects.toBeDefined();
+    expect(await invoke("move_path", { from: "missing.ts", to: "unused.ts" }))
+      .toMatchObject({ ok: false, code: "FILE_NOT_FOUND" });
+    expect(await invoke("write_file", { path: "../outside.ts", content: "bad" }))
+      .toMatchObject({ ok: false, code: "PATH_OUTSIDE_WORKSPACE" });
   });
 
   test("str_replace refuses zero and ambiguous matches", async () => {
@@ -1293,6 +1448,13 @@ describe("mutating coding tools", () => {
       .toMatchObject({ ok: false, code: "PATTERN_NOT_FOUND" });
     expect(await invoke("str_replace", { path: "input.ts", oldText: "same", newText: "x" }))
       .toMatchObject({ ok: false, code: "AMBIGUOUS_REPLACEMENT" });
+    expect(await readFile(join(workspace, "input.ts"), "utf8")).toBe("same\nsame\n");
+  });
+
+  test("str_replace writes exactly the requested literal replacement", async () => {
+    expect(await invoke("str_replace", { path: "input.ts", oldText: "1", newText: "$&" }))
+      .toMatchObject({ ok: true });
+    expect(await readFile(join(workspace, "input.ts"), "utf8")).toBe("const value = $&;\n");
   });
 
   test("apply_patch applies a valid patch and diagnoses an invalid one", async () => {
@@ -1306,14 +1468,17 @@ describe("mutating coding tools", () => {
     ].join("\n");
 
     expect(await invoke("apply_patch", { patch })).toMatchObject({ ok: true });
+    expect(await readFile(join(workspace, "input.ts"), "utf8")).toBe("const value = 2;\n");
     expect(await invoke("apply_patch", { patch: "not a patch" }))
       .toMatchObject({ ok: false, code: "PATCH_APPLY_FAILED" });
+    expect(await readFile(join(workspace, "input.ts"), "utf8")).toBe("const value = 2;\n");
   });
 });
 
 describe("bash", () => {
   test("captures success and non-zero exit", async () => {
-    expect(await invoke("bash", { command: "printf ok" })).toMatchObject({ ok: true });
+    expect(await invoke("bash", { command: "printf ok; printf err >&2" }))
+      .toMatchObject({ ok: true, data: { stdout: "ok", stderr: "err", exitCode: 0 } });
     expect(await invoke("bash", { command: "exit 7" }))
       .toMatchObject({ ok: false, code: "COMMAND_FAILED" });
   });
@@ -1326,6 +1491,36 @@ describe("bash", () => {
     controller.abort();
     expect(await invoke("bash", { command: "printf unexpected" }, controller.signal))
       .toMatchObject({ ok: false, code: "ABORTED" });
+  });
+
+  test("drains large process output while retaining only a bounded prefix", async () => {
+    expect(await invoke("bash", { command: "printf '%1048576s' '' | tr ' ' x" }, undefined, {
+      maxOutputCharacters: 8, bashTimeoutMs: 2000,
+    })).toMatchObject({ ok: true, data: { stdout: "xxxxxxxx\n[truncated]", truncated: true } });
+  });
+
+  test("abort and timeout stop a running descendant before it writes", async () => {
+    for (const reason of ["abort", "timeout"] as const) {
+      const controller = new AbortController();
+      const command = `touch ready-${reason}; (sleep 0.4; printf unexpected > late-${reason}) & wait`;
+      const result = invoke("bash", { command }, controller.signal, { bashTimeoutMs: 200 });
+      // 等真实进程启动，避免把运行中中止退化成 pre-aborted 测试。
+      const deadline = performance.now() + 1000;
+      while (!(await Bun.file(join(workspace, `ready-${reason}`)).exists())) {
+        if (performance.now() > deadline) {
+          controller.abort();
+          await result;
+          throw new Error("bash did not start within the test deadline");
+        }
+        await Bun.sleep(5);
+      }
+      if (reason === "abort") controller.abort();
+      expect(await result).toMatchObject({
+        ok: false, code: reason === "abort" ? "ABORTED" : "COMMAND_TIMED_OUT",
+      });
+      await Bun.sleep(450);
+      expect(await Bun.file(join(workspace, `late-${reason}`)).exists()).toBe(false);
+    }
   });
 });
 ```
@@ -2016,11 +2211,26 @@ bun test src/agent/skills src/agent/todos src/coding/agents src/coding/tools/__t
 
 把 runtime 变成真正可用的终端产品，同时建立人工审批边界。完成后打 `v0.1.0` tag，表示基础复刻结束。
 
+本阶段再分四步，不要求第一次就写出七个组件：
+
+| 小里程碑 | 范围 | 反馈 |
+|---|---|---|
+| 10A | 配置解析 + 文本客户端 | 输入一行，消费一次 Agent stream，显示结果 |
+| 10B | reducer + 最小 Ink 界面 | 输入、忙碌提示、消息历史；沿用同一 Agent |
+| 10C | 审批和 Ask user | 等待、允许、拒绝、取消都能结束；并发请求不会覆盖 |
+| 10D | Todo、token、slash commands 和组件拆分 | 完成本节手工验收，最后执行完整 gate |
+
+配置和文本客户端先独立运行，确认 provider、Tools、Agent 都正常之后再排查 React 状态。
+
 创建新增目录和主要文件：
 
 ```bash
 mkdir -p src/cli/config/__tests__ src/cli/tui/components src/cli/tui/hooks src/cli/tui/__tests__
 mkdir -p src/coding/permissions/__tests__ docs
+mkdir -p src/foundation/permissions
+touch src/foundation/permissions/approval-decision.ts src/foundation/permissions/index.ts
+touch src/cli/run-agent-turn.ts examples/stage-10-text-client.ts
+touch src/cli/tui/hooks/use-agent-loop.ts
 touch src/cli/config/schema.ts src/cli/config/model-factory.ts src/cli/config/index.ts
 touch src/cli/config/__tests__/schema.test.ts
 touch src/cli/tui/app.tsx src/cli/tui/state.ts src/cli/tui/token-usage.ts
@@ -2033,7 +2243,11 @@ touch src/coding/permissions/__tests__/approval-middleware.test.ts docs/manual-t
 
 ```text
 src/
+├── foundation/permissions/
+│   ├── approval-decision.ts            # 通用审批决策类型
+│   └── index.ts                        # 导出通用权限契约
 ├── cli/
+│   ├── run-agent-turn.ts               # 消费一轮 Agent stream，供文本与 Ink 共用
 │   ├── config/
 │   │   ├── schema.ts                   # 校验模型、Provider 与运行参数配置
 │   │   ├── model-factory.ts            # 根据配置实例化对应 ModelProvider
@@ -2045,7 +2259,8 @@ src/
 │       ├── state.ts                    # 维护消息、状态和用户输入 reducer
 │       ├── token-usage.ts              # 汇总并格式化 token usage
 │       ├── components/                 # 放置可复用的 TUI 展示组件
-│       ├── hooks/                      # 放置 Agent 交互相关 React hooks
+│       ├── hooks/
+│       │   └── use-agent-loop.ts       # 连接 reducer、Agent stream 与取消操作
 │       └── __tests__/
 │           ├── state.test.ts           # 验证 reducer 状态迁移
 │           └── token-usage.test.ts     # 验证 token 统计与缺省字段
@@ -2056,16 +2271,59 @@ src/
         └── approval-middleware.test.ts # 验证允许、拒绝与中止路径
 docs/
 └── manual-test.md                      # 固化真实终端中的人工验收步骤
+examples/
+└── stage-10-text-client.ts             # 离线验证一次文本交互
 ```
 
 ### 10.1 安装交互依赖
 
 ```bash
-bun add commander ink react yaml
+bun add commander ink ink-text-input react yaml
 bun add -d @types/react eslint typescript-eslint
 ```
 
-把 ESLint 加入 `bun run check`。不要在这一阶段做全仓库风格重构，只约束新增项目。
+阶段 0 的配置只覆盖 `.ts`。现在修改练习项目的 `tsconfig.json`：在 `compilerOptions` 中
+加入 `"jsx": "react-jsx"`，并将 `include` 替换为下面的列表，其余字段保留：
+
+```json
+{
+  "compilerOptions": { "jsx": "react-jsx" },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "examples/**/*.ts", "examples/**/*.tsx"]
+}
+```
+
+这是需要合并的字段，不是完整配置。JSX 是 `<Text>hello</Text>` 这样的表达式，`.tsx`
+让 TypeScript 解析它，`jsx` 决定如何转换为 React 调用。Bun 能运行 JSX 不代表 `tsc` 已配置。
+
+创建 `eslint.config.js`，先采用能够发现错误的最小配置：
+
+```js
+import tseslint from "typescript-eslint";
+
+export default tseslint.config(
+  { ignores: ["dist/**", "node_modules/**", "evals/**", "**/.harness/**"] },
+  ...tseslint.configs.recommended,
+  { rules: { "@typescript-eslint/no-unused-vars": "off" } },
+);
+```
+
+配置文件的 default export 是 ESLint 的入口要求；课程实现模块仍使用 named exports。
+将 `package.json` 的 scripts 合并为：
+
+```json
+{
+  "scripts": {
+    "dev": "bun run src/cli/index.ts",
+    "check:types": "tsc --noEmit",
+    "test": "bun test",
+    "lint": "eslint src examples",
+    "check": "bun run check:types && bun run lint && bun test"
+  }
+}
+```
+
+先运行 `bun run check:types`。若看到 `--jsx is not set`，检查正在使用的是否为练习仓库的
+tsconfig；若出现新增文件未检查，检查 `include`，不要用类型断言屏蔽错误。
 
 ### 10.2 配置模型
 
@@ -2133,6 +2391,67 @@ harness-lab config model set-default <name>
 
 ### 10.3 最小 TUI 状态
 
+先实现不依赖 React 的一轮交互。目标文件：`src/cli/run-agent-turn.ts`：
+
+```ts
+import type { Agent } from "@/agent/agent";
+import type { AgentEvent } from "@/agent/agent-event";
+
+export async function runAgentTurn(options: {
+  agent: Agent;
+  text: string;
+  onEvent: (event: AgentEvent) => void | Promise<void>;
+}): Promise<void> {
+  if (!options.text.trim()) return;
+  for await (const event of options.agent.stream({
+    role: "user", content: [{ type: "text", text: options.text }],
+  })) {
+    await options.onEvent(event);
+  }
+}
+```
+
+目标文件：`examples/stage-10-text-client.ts`。这条离线路径无需 API key 或 TUI：
+
+```ts
+import { Agent } from "@/agent/agent";
+import { Model, ScriptedModelProvider } from "@/foundation/models";
+import { formatTranscript } from "@/foundation/messages";
+import { runAgentTurn } from "@/cli/run-agent-turn";
+
+const agent = new Agent({
+  prompt: "", tools: [],
+  model: new Model({ name: "scripted", provider: new ScriptedModelProvider({ responses: [
+    { role: "assistant", content: [{ type: "text", text: "client ready" }] },
+  ] }) }),
+});
+const onInterrupt = () => agent.abort();
+process.on("SIGINT", onInterrupt);
+try {
+  await runAgentTurn({ agent, text: "hello", onEvent: (event) => {
+    if (event.type === "message") console.log(formatTranscript([event.message]));
+  } });
+} finally {
+  process.off("SIGINT", onInterrupt);
+}
+```
+
+运行 `bun run examples/stage-10-text-client.ts`，应看到 `assistant: client ready`。
+下一步将同一个 `runAgentTurn` 接入 Ink，不复制 Agent loop。真实命令行入口负责加载
+配置、创建 Provider 和 Coding Agent，最后调用 `render(<App agent={agent} />)`；入口若
+需要 JSX，可将 render 调用放进 `app.tsx` 导出的 `mountApp()`，保留原 `src/cli/index.ts`。
+
+理解 TUI 前只需要四个 React 概念：
+
+| 概念 | 在这里的职责 |
+|---|---|
+| component/props | 用函数描述界面，通过 props 接收 Agent；不要在 render 中重新创建 Agent |
+| `useReducer` | 根据事件计算下一份 state；不能直接修改旧数组 |
+| `useRef` | 同步保存 busy 标志，避免 React 更新提交前连续 Enter 触发两次 run |
+| `useEffect` cleanup | 组件卸载时 abort 并移除监听，防止后台 run 留存 |
+
+先完成下面的 reducer，再填充 hook 和界面骨架；无需同时学习复杂 React 优化。
+
 目标文件：`src/cli/tui/state.ts`
 
 先实现状态，再做视觉：
@@ -2145,6 +2464,8 @@ import type { AgentEvent } from "@/agent/agent-event";
 import type { TodoItem } from "@/agent/todos/todo-system";
 import type { ApprovalRequest } from "@/coding/permissions/approval-middleware";
 import type { NonSystemMessage } from "@/foundation/messages";
+
+import { calculateTokenUsage } from "./token-usage";
 
 export interface AgentLoopViewState {
   messages: NonSystemMessage[];
@@ -2164,6 +2485,9 @@ export interface SlashCommand {
 
 export type AgentLoopEvent =
   | AgentEvent
+  | { type: "user_submitted"; text: string }
+  | { type: "cleared" }
+  | { type: "todos_updated"; items: TodoItem[] }
   | { type: "run_start" }
   | { type: "run_end"; status?: "completed" | "failed" | "aborted" }
   | { type: "approval_requested"; request: ApprovalRequest };
@@ -2188,15 +2512,110 @@ export function reduceAgentEvent(
   state: AgentLoopViewState,
   event: AgentLoopEvent,
 ): AgentLoopViewState {
-  // TODO 3：以 immutable reducer 更新 messages/streaming/approval/tokenUsage/todos。
-  // 提示：run_end（包括 aborted）必须复位 streaming，不能修改传入 state。
+  if (event.type === "message") {
+    // 标准路径：模型的累计 progress 不进历史；仅在最终 message 到来时追加一次。
+    const messages = [...state.messages, event.message];
+    return { ...state, messages, tokenUsage: calculateTokenUsage(messages) };
+  }
+  // TODO 3：user_submitted 追加 user message；run_start 设置 streaming=true。
+  // TODO 4：run_end（包括 aborted）设置 streaming=false，清空 pendingApproval。
+  // TODO 5：approval_requested 只替换 pendingApproval；todos_updated 深度复制 items。
+  // TODO 6：cleared 返回 initialAgentLoopViewState；先通过 Agent.clearMessages 清除事实记录。
+  // TODO 7：progress 可更新忙碌提示，不向 messages 塞入不完整 assistant message。
   throw new Error("TODO: implement reduceAgentEvent");
 }
 ```
 
 </details>
 
-UI 通过消费 `AgentEvent` 更新状态。不要让 UI 读取 `Agent` 私有字段或重新调用模型。
+`Agent` 增加公开方法
+`clearMessages(): void`：运行中拒绝清除，空闲时把 `_context.messages` 置为空数组。
+hook 先调用这个方法，成功后再 dispatch `cleared`，避免 UI 与 transcript 不一致。
+
+目标文件：`src/cli/tui/hooks/use-agent-loop.ts`：
+
+```ts
+import { useEffect, useReducer, useRef } from "react";
+
+import type { Agent } from "@/agent/agent";
+import { runAgentTurn } from "@/cli/run-agent-turn";
+
+import { initialAgentLoopViewState, reduceAgentEvent } from "../state";
+
+export function useAgentLoop(agent: Agent) {
+  const [state, dispatch] = useReducer(reduceAgentEvent, undefined, initialAgentLoopViewState);
+  const busy = useRef(false);
+  useEffect(() => () => agent.abort(), [agent]);
+
+  async function submit(text: string): Promise<void> {
+    if (busy.current || !text.trim()) return;
+    busy.current = true;
+    dispatch({ type: "user_submitted", text });
+    dispatch({ type: "run_start" });
+    try {
+      await runAgentTurn({ agent, text, onEvent: (event) => dispatch(event) });
+    } catch (error) {
+      // TODO：区分 abort 与普通 API 错误，显示错误提示；错误提示不冒充模型回复写回 Agent。
+    } finally {
+      busy.current = false;
+      dispatch({ type: "run_end" });
+    }
+  }
+
+  // TODO：加入 clear、审批桥接、Todo store 订阅；卸载时清理订阅并取消待处理的人类输入。
+  return { state, submit, abort: () => agent.abort() };
+}
+```
+
+10B 的 `App` 先只渲染 `state.messages`、`state.streaming` 和输入框。输入文本用
+`useState` 保存；Enter 调 `submit(text)`，忙碌时禁用普通输入，Ctrl+C 调 `abort()`。
+10C 再让审批/问题输入优先于普通聊天输入；10D 最后拆分以下组件。
+
+目标文件：`src/cli/tui/app.tsx`。下面先打通 10B；`TextInput` 管理光标和退格，无需自己
+处理每个字符。`exitOnCtrlC: false` 让应用先中止 Agent，空闲时才退出。
+
+```tsx
+import { Box, Text, render, useApp, useInput } from "ink";
+import TextInput from "ink-text-input";
+import { memo, useState } from "react";
+
+import type { Agent } from "@/agent/agent";
+import { formatTranscript } from "@/foundation/messages";
+
+import { useAgentLoop } from "./hooks/use-agent-loop";
+
+export const App = memo(function App({ agent }: { agent: Agent }) {
+  const { state, submit, abort } = useAgentLoop(agent);
+  const [input, setInput] = useState("");
+  const { exit } = useApp();
+  useInput((keyInput, key) => {
+    if (key.ctrl && keyInput === "c") {
+      if (agent.streaming) abort();
+      else exit();
+    }
+  });
+  return (
+    <Box flexDirection="column">
+      <Text>{formatTranscript(state.messages)}</Text>
+      <Text>{state.streaming ? "Working…" : "Ready"}</Text>
+      <TextInput value={input} onChange={setInput} focus={!state.streaming}
+        onSubmit={(text) => { setInput(""); void submit(text); }} />
+    </Box>
+  );
+});
+
+export function mountApp(agent: Agent) {
+  return render(<App agent={agent} />, { exitOnCtrlC: false });
+}
+```
+
+运行前先完成 reducer 中的 `user_submitted/run_start/run_end/progress` 分支。
+这个最小界面还没有审批和 slash command；进入 10C 时，在 `submit` 调模型之前解析 slash
+command，审批弹出时将 `TextInput` 的 focus 关闭，并用单独的状态显示 API error。
+
+当前 `AgentEvent.progress` 提供生成状态及 Tool 参数提示，不包含正文增量；因此先做
+忙碌指示和最终消息展示。若要正文逐字输出，需要显式扩展 progress snapshot 契约及测试，
+不能让 UI 读取 Agent 私有状态。不要把“进度提示”描述成已经实现了正文流式渲染。
 
 最低组件：
 
@@ -2214,9 +2633,18 @@ UI 通过消费 `AgentEvent` 更新状态。不要让 UI 读取 `Agent` 私有�
 - Ctrl+C 中止当前 run，再次 Ctrl+C 退出；
 - `/clear`、`/help`、`/exit`；
 - 模型输出期间禁止重复提交；
-- 普通 API error 渲染为 assistant error message，不使 TUI 崩溃。
+- 普通 API error 显示在 UI 错误区域，不写成模型回复或使 TUI 崩溃。
 
 ### 10.4 审批 Middleware
+
+审批决策是通用类型。目标文件：`src/foundation/permissions/approval-decision.ts`：
+
+```ts
+export type ApprovalDecision = "allow_once" | "allow_always_project" | "deny";
+```
+
+在 `src/foundation/permissions/index.ts` 中 re-export 该类型。`coding` 负责审批界面与
+持久化策略，后续 trace 直接使用 foundation 的契约，不能反向依赖 coding。
 
 基础版本按 Tool 风险分类：
 
@@ -2238,11 +2666,9 @@ const TOOLS_REQUIRING_APPROVAL = [
 ```ts
 import type { AgentMiddleware } from "@/agent/agent-middleware";
 import type { ToolUseContent } from "@/foundation/messages";
+import type { ApprovalDecision } from "@/foundation/permissions/approval-decision";
 
-export type ApprovalDecision =
-  | "allow_once"
-  | "allow_always_project"
-  | "deny";
+export type { ApprovalDecision } from "@/foundation/permissions/approval-decision";
 
 export interface ApprovalRequest {
   id: string;
@@ -2289,11 +2715,11 @@ export function defineApprovalMiddleware(options: {
 只从 assistant message 的 provider-reported usage 聚合：
 
 ```ts
-import type { NonSystemMessage } from "@/foundation/messages";
+import type { AssistantMessage, NonSystemMessage } from "@/foundation/messages";
 
 export function calculateTokenUsage(messages: NonSystemMessage[]) {
   const assistantWithUsage = messages.filter(
-    (message) => message.role === "assistant" && message.usage,
+    (message): message is AssistantMessage => message.role === "assistant" && message.usage !== undefined,
   );
 
   // 标准实现示例：session total 是所有已报告 totalTokens 的和。
@@ -2302,8 +2728,8 @@ export function calculateTokenUsage(messages: NonSystemMessage[]) {
     0,
   );
 
-  // TODO：latestInputTokens 读取最后一条有 usage 的 promptTokens；没有时为 0。
-  return { latestInputTokens: 0, sessionTotalTokens };
+  const latestInputTokens = assistantWithUsage.at(-1)?.usage?.promptTokens ?? 0;
+  return { latestInputTokens, sessionTotalTokens };
 }
 ```
 
