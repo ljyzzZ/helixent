@@ -1,6 +1,6 @@
 # 第三部分：Coding Agent 与交互客户端
 
-这一部分完成阶段 7～10。阶段 10 结束时，你会得到一个与 Helixent 核心能力功能等价的 v1：能接真实模型、读写代码、加载项目指令和 Skills、管理 Todo、流式交互，并在副作用 Tool 前请求人工审批。
+这一部分完成阶段 7～10。阶段 10 结束时，你会得到一个实现了基础 coding 能力的 v1 coding agent：能接真实模型、读写代码、加载项目指令和 Skills、管理 Todo、流式交互，并在副作用 Tool 前请求人工审批。
 
 真实 API 验证始终是 optional integration test。核心测试继续使用 fake provider，避免网络波动、费用和模型随机性破坏质量门。
 
@@ -22,73 +22,69 @@
 
 Adapter 的职责是吸收这些差异，让 Agent runtime 只看到 canonical Message。
 
-### 7.0 按四个小里程碑实现
+### 7.0 阅读路线
 
-不要同时调试两个 SDK。阅读本章时，按下面的顺序往返对应小节：
+先完成 OpenAI，再独立实现 Anthropic，最后按需接入真实 API。下面四个里程碑与正文顺序
+一致；每个实现后面紧跟对应测试和运行命令，读完并通过当前检查后，再进入下一节。
 
-| 里程碑 | 本次只增加什么 | 可以停止并检查的证据 |
-|---|---|---|
-| 7A | OpenAI 的纯消息转换与 `invoke` | 7.5 的 OpenAI converter tests、7.4 的 fake client test |
-| 7B | OpenAI streaming 与 Tool JSON fragments | 7.3 的 accumulator tests；无 key 也能完成 |
-| 7C | 复用同一契约实现 Anthropic | Anthropic converter/accumulator tests |
-| 7D | 接入真实 endpoint | 7.4 示例；这是可选 smoke，不替代前面测试 |
+| 里程碑 | 对应章节 | 本次完成什么 | 可以停止并检查的证据 |
+|---|---|---|---|
+| 7A | [7.1 OpenAI 非流式调用](#stage-7a) | 消息与 Tool schema 转换、`invoke` | converter tests、fake client test |
+| 7B | [7.2 OpenAI streaming](#stage-7b) | 累计 snapshot、Tool JSON fragments、`stream` | accumulator tests、fake stream test |
+| 7C | [7.3 Anthropic Adapter](#stage-7c) | 在独立章节复用同一 canonical 契约 | Anthropic converter、accumulator、fake client tests |
+| 7D | [7.4 真实 API 验证](#stage-7d) | 配置 endpoint 并观察真实响应 | 可选 smoke example，不替代离线测试 |
 
 先画出 `Message[] → request → SDK response → AssistantMessage`，每次只实现一个箭头。
-不要在 7A 运行尚未实现的 Anthropic 测试。7C 完成后再运行本阶段完整测试套件。
+7A～7C 均不需要 API key；只运行当前小节列出的测试，7C 完成后再运行两个 Provider 的完整测试。
 
-### 7.1 安装 SDK
+### 7.1 OpenAI：消息转换与 invoke（7A） {#stage-7a}
+
+这一节先跑通 `Message[] → OpenAI request → SDK response → AssistantMessage` 的非流式路径。
+所有工作都在 `src/community/openai/` 内完成。
+
+#### 7.1.1 安装 SDK 并创建文件
 
 ```bash
-bun add openai @anthropic-ai/sdk
-```
-
-一键创建目录和文件：
-
-```bash
-mkdir -p src/community/openai/__tests__ src/community/anthropic/__tests__ examples
-touch src/community/openai/model-provider.ts src/community/openai/stream-accumulator.ts
-touch src/community/openai/utils.ts src/community/openai/index.ts
+bun add openai
+mkdir -p src/community/openai/__tests__
+touch src/community/openai/utils.ts src/community/openai/model-provider.ts
+touch src/community/openai/index.ts
 touch src/community/openai/__tests__/utils.test.ts
-touch src/community/openai/__tests__/stream-accumulator.test.ts
 touch src/community/openai/__tests__/model-provider.test.ts
-touch src/community/anthropic/model-provider.ts src/community/anthropic/stream-accumulator.ts
-touch src/community/anthropic/utils.ts src/community/anthropic/index.ts
-touch src/community/anthropic/__tests__/utils.test.ts
-touch src/community/anthropic/__tests__/stream-accumulator.test.ts
-touch examples/stage-07-real-model.ts
 ```
 
 执行后目录应为：
 
 ```text
-src/community/                      # 第三方模型 Provider adapters
-├── openai/                         # OpenAI-compatible adapter
-│   ├── model-provider.ts           # 调用 SDK 并实现 ModelProvider
-│   ├── stream-accumulator.ts       # 将 OpenAI chunks 累积为 canonical snapshot
-│   ├── utils.ts                    # 转换 canonical 与 OpenAI wire types
-│   ├── index.ts                    # 导出 OpenAI adapter 公共 API
-│   └── __tests__/                  # OpenAI adapter 的协议测试
-│       ├── utils.test.ts           # 验证消息和 Tool schema 双向转换
-│       ├── stream-accumulator.test.ts # 验证交错 chunk 的稳定累积
-│       └── model-provider.test.ts  # 验证 SDK 请求参数、stream 与 abort 边界
-└── anthropic/                      # Anthropic adapter
-    ├── model-provider.ts           # 调用 SDK 并实现 ModelProvider
-    ├── stream-accumulator.ts       # 将 Anthropic events 累积为 canonical snapshot
-    ├── utils.ts                    # 转换 canonical 与 Anthropic wire types
-    ├── index.ts                    # 导出 Anthropic adapter 公共 API
-    └── __tests__/                  # Anthropic adapter 的协议测试
-        ├── utils.test.ts           # 验证 system、消息与 Tool schema 转换
-        └── stream-accumulator.test.ts # 验证按 block index 累积事件
-examples/
-└── stage-07-real-model.ts          # 通过配置切换并调用真实模型 Provider
+src/community/openai/
+├── utils.ts                       # canonical 与 OpenAI wire types 的转换
+├── model-provider.ts              # 先实现 invoke，保留 stream 接口
+├── index.ts                       # 导出 OpenAIModelProvider
+└── __tests__/
+    ├── utils.test.ts              # 消息转换测试
+    └── model-provider.test.ts     # fake client 请求与响应测试
 ```
 
-### 7.2 先写纯转换函数
+#### 7.1.2 实现纯转换函数，并运行转换测试
+
+Agent 使用统一的 `Message` 类型记录对话，OpenAI SDK 则使用自己的请求与响应格式。
+这一节用三个纯函数连接两种协议：
+
+| 函数 | 输入 | 输出 |
+|---|---|---|
+| `convertToOpenAIMessages` | canonical `Message[]` | SDK 请求中的消息数组 |
+| `convertToOpenAITools` | `Tool[]` | SDK 的 function Tool definitions |
+| `parseOpenAIAssistantMessage` | SDK assistant response 与 usage | canonical `AssistantMessage` |
+
+消息转换保留对话顺序，并将 assistant 的正文、思考内容和工具调用分别映射到 `content`、
+`reasoning_content` 和 `tool_calls`。本节的 adapter 支持 `reasoning_content` 扩展字段：
+接收响应时将它解析为 canonical `thinking`，发送历史消息时再写回该字段。下面的扩展类型
+用于声明这项 endpoint 协议。
 
 目标文件：`src/community/openai/utils.ts`
 
-OpenAI adapter 至少拆成以下函数。`convertToOpenAITools()` 是标准实现示例；其余 TODO
-按 content variant 分支完成，未知 variant 必须走 `assertNever`。
+从已给出的 `system` 分支开始，按 TODO 完成其余转换。`convertToOpenAITools()` 提供完整
+实现；`assertNever` 用于穷尽检查，新增消息或内容类型时会提示尚未处理的分支。
 
 <details>
 <summary>展开完整代码：<code>utils.ts</code></summary>
@@ -99,28 +95,78 @@ import OpenAI from "openai";
 import type { AssistantMessage, Message, TokenUsage } from "@/foundation/messages";
 import type { Tool } from "@/foundation/tools";
 
+interface OpenAIReasoningFields {
+  reasoning_content?: string | null;
+}
+
+export type OpenAIAssistantMessageParam =
+  OpenAI.ChatCompletionAssistantMessageParam & OpenAIReasoningFields;
+
+export type OpenAIChatCompletionMessageParam =
+  OpenAI.ChatCompletionMessageParam | OpenAIAssistantMessageParam;
+
+export type OpenAIChatCompletionMessage =
+  OpenAI.ChatCompletionMessage & OpenAIReasoningFields;
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected variant: ${JSON.stringify(value)}`);
+}
+
 export function convertToOpenAIMessages(
   messages: Message[],
-): OpenAI.ChatCompletionMessageParam[] {
-  const result: OpenAI.ChatCompletionMessageParam[] = [];
+): OpenAIChatCompletionMessageParam[] {
+  const result: OpenAIChatCompletionMessageParam[] = [];
   for (const message of messages) {
     switch (message.role) {
       case "system":
-        // 标准路径：逐条转换，结果只写入新数组，不修改 canonical transcript。
+        // system 文本合并为一个请求字段。
         result.push({ role: "system", content: message.content.map((item) => item.text).join("\n") });
         break;
       case "user":
-        // TODO 1：map 每个 text/image_url block；保持数组顺序，图片保留 URL/detail。
-        throw new Error("TODO: convert user content");
-      case "assistant":
-        // TODO 2：text 合并为 content，tool_use 合并为同一 wire message 的 tool_calls。
-        // arguments 是 JSON.stringify(input)；只有 Tool call 时 content 可为 null。
-        // thinking 的回传规则由 endpoint 决定，不能冒充用户文本。
-        throw new Error("TODO: convert assistant content");
+        result.push({
+          role: "user",
+          content: message.content.map((item): OpenAI.ChatCompletionContentPart => {
+            // TODO 1：逐项构造新的 content block，保留数组顺序。
+            switch (item.type) {
+              case "text":
+                // 保留 type 和 text。
+                throw new Error("TODO: convert user text");
+              case "image_url":
+                // 保留 type、image_url.url 和可选 detail。
+                throw new Error("TODO: convert user image");
+              default:
+                return assertNever(item);
+            }
+          }),
+        });
+        break;
+      case "assistant": {
+        const converted: OpenAIAssistantMessageParam = { role: "assistant", content: [] };
+        for (const item of message.content) {
+          switch (item.type) {
+            case "text":
+              // TODO 2：正文写入 converted.content，保留文本顺序。
+              throw new Error("TODO: convert assistant text");
+            case "thinking":
+              // TODO 3：将 item.thinking 赋给 converted.reasoning_content。
+              throw new Error("TODO: preserve historical reasoning_content");
+            case "tool_use":
+              // TODO 4：追加到 converted.tool_calls，type 为 function，保留 id/name；
+              // function.arguments 使用 JSON.stringify(item.input)。
+              throw new Error("TODO: convert assistant tool call");
+            default:
+              assertNever(item);
+          }
+        }
+        result.push(converted);
+        break;
+      }
       case "tool":
-        // TODO 3：一条 canonical ToolMessage 可生成多条 wire tool message；
-        // 每条使用 tool_call_id=tool_use_id。不要用 map 生成嵌套数组。
+        // TODO 5：为每个 Tool result 生成一条 wire tool message，
+        // 使用 tool_call_id=tool_use_id 关联调用。
         throw new Error("TODO: convert tool results");
+      default:
+        assertNever(message);
     }
   }
   return result;
@@ -141,54 +187,375 @@ export function convertToOpenAITools(
 }
 
 export function parseOpenAIAssistantMessage(
-  message: OpenAI.ChatCompletionMessage,
+  message: OpenAIChatCompletionMessage,
   usage?: TokenUsage,
 ): AssistantMessage {
-  // TODO 4：content 转为 text；reasoning_content 转为 thinking（若 endpoint 提供）。
-  // TODO 5：tool_calls arguments 用 JSON.parse；最终仍非法时抛出带 call id 的转换错误。
-  // TODO 6：usage 缺省时不要伪造 0，保持 AssistantMessage.usage 为 undefined。
+  // TODO 6：reasoning_content 为字符串时先添加 thinking block，保持其原文。
+  // TODO 7：仅在 content 为字符串时添加 text block，包括空字符串。
+  // TODO 8：tool_calls arguments 用 JSON.parse；最终仍非法时抛出带 call id 的转换错误。
+  // TODO 9：原样传递 usage，缺省时保留 undefined。
   throw new Error("TODO: implement parseOpenAIAssistantMessage");
 }
 ```
 
 </details>
 
-目标文件：`src/community/anthropic/utils.ts`
+转换函数只根据输入构造结果，保持原始消息不变。使用下面的固定输入验证转换结果。
 
-实现 Anthropic 协议转换函数：
+**对应测试**
+
+目标文件：`src/community/openai/__tests__/utils.test.ts`
+
+将下面的完整测试保存到该文件。测试中的 `as never` 用于适配省略了无关 SDK 字段的 fixture。
+
+<details>
+<summary>展开完整代码：<code>utils.test.ts</code></summary>
 
 ```ts
-import Anthropic from "@anthropic-ai/sdk";
+import { describe, expect, test } from "bun:test";
 
-import type { AssistantMessage, Message } from "@/foundation/messages";
-import type { Tool } from "@/foundation/tools";
+import type { Message } from "@/foundation/messages";
 
-export function extractSystemPrompt(messages: Message[]): string | undefined {
-  // TODO 1：只收集 system text，并用两个换行连接；没有 system 时返回 undefined。
-  // 参数规则：不得修改 messages，也不得把非 system 内容混入 prompt。
-  throw new Error("TODO: implement extractSystemPrompt");
-}
+import {
+  convertToOpenAIMessages,
+  parseOpenAIAssistantMessage,
+} from "../utils";
 
-export function convertToAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
-  // TODO 2：排除 system message，并把 Tool result 转成 user-role content。
-  // 参数规则：保持原始消息及 content block 顺序，不修改 canonical messages。
-  throw new Error("TODO: implement convertToAnthropicMessages");
-}
+describe("OpenAI protocol conversion", () => {
+  test("preserves user text/image block order, URLs and optional image detail", () => {
+    const messages: Message[] = [
+      { role: "system", content: [{ type: "text", text: "Be concise" }] },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "inspect the first image" },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.test/a.png", detail: "high" },
+          },
+          { type: "text", text: "then compare the second image" },
+          { type: "image_url", image_url: { url: "https://example.test/b.png" } },
+        ],
+      },
+    ];
+    const originalMessages = structuredClone(messages);
 
-export function convertToAnthropicTools(tools: Tool[]): Anthropic.Tool[] {
-  // TODO 3：使用 input_schema，不要复用 OpenAI wire type。
-  throw new Error("TODO: implement convertToAnthropicTools");
-}
+    expect(convertToOpenAIMessages(messages)).toEqual([
+      { role: "system", content: "Be concise" },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "inspect the first image" },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.test/a.png", detail: "high" },
+          },
+          { type: "text", text: "then compare the second image" },
+          { type: "image_url", image_url: { url: "https://example.test/b.png" } },
+        ],
+      },
+    ]);
+    expect(messages).toEqual(originalMessages);
+  });
 
-export function parseAnthropicAssistantMessage(message: Anthropic.Message): AssistantMessage {
-  // TODO 4：解析 text、thinking、tool_use，并原样保存 Tool id 和 provider usage。
-  throw new Error("TODO: implement parseAnthropicAssistantMessage");
+  test("does not turn assistant thinking into visible text and preserves tool calls", () => {
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "private plan: inspect the file first" },
+          { type: "text", text: "I will inspect the file" },
+          { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+        ],
+      },
+    ];
+    const originalMessages = structuredClone(messages);
+    const result = convertToOpenAIMessages(messages);
+
+    expect(result).toHaveLength(1);
+    const assistant = result[0];
+    if (assistant?.role !== "assistant") {
+      throw new Error("Expected an assistant message");
+    }
+
+    // SDK accepts either a string or text blocks; neither may contain thinking.
+    const visibleText = typeof assistant.content === "string"
+      ? assistant.content
+      : (assistant.content ?? [])
+          .map((part) => part.type === "text" ? part.text : "")
+          .join("");
+
+    expect(visibleText).toBe("I will inspect the file");
+    expect(assistant.tool_calls).toEqual([
+      {
+        type: "function",
+        id: "call-1",
+        function: { name: "read_file", arguments: '{"path":"a.ts"}' },
+      },
+    ]);
+    expect(messages).toEqual(originalMessages);
+  });
+
+  test("preserves historical thinking in the reasoning_content field", () => {
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "inspect first" },
+          { type: "text", text: "I will inspect the file" },
+          { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+        ],
+      },
+    ];
+    const originalMessages = structuredClone(messages);
+    const result = convertToOpenAIMessages(messages);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      role: "assistant",
+      reasoning_content: "inspect first",
+      tool_calls: [
+        { id: "call-1", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+      ],
+    });
+    expect(messages).toEqual(originalMessages);
+  });
+
+  test("keeps text and multiple tool calls in one assistant message", () => {
+    const result = convertToOpenAIMessages([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "I will inspect both files" },
+          { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+          { type: "tool_use", id: "call-2", name: "read_file", input: { path: "b.ts" } },
+        ],
+      },
+    ]);
+
+    expect(result[0]).toMatchObject({
+      role: "assistant",
+      tool_calls: [
+        { id: "call-1", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
+        { id: "call-2", function: { name: "read_file", arguments: '{"path":"b.ts"}' } },
+      ],
+    });
+  });
+
+  test("expands tool results and preserves their call ids", () => {
+    const result = convertToOpenAIMessages([
+      {
+        role: "tool",
+        content: [
+          { type: "tool_result", tool_use_id: "call-1", content: "A" },
+          { type: "tool_result", tool_use_id: "call-2", content: "B" },
+        ],
+      },
+    ]);
+
+    expect(result).toMatchObject([
+      { role: "tool", tool_call_id: "call-1", content: "A" },
+      { role: "tool", tool_call_id: "call-2", content: "B" },
+    ]);
+  });
+
+  test("parses reasoning, empty text and tool arguments", () => {
+    const result = parseOpenAIAssistantMessage({
+      role: "assistant",
+      content: "",
+      reasoning_content: "inspect first",
+      tool_calls: [
+        {
+          type: "function",
+          id: "call-1",
+          function: { name: "read_file", arguments: '{"path":"a.ts"}' },
+        },
+      ],
+    } as never);
+
+    expect(result.content).toEqual([
+      { type: "thinking", thinking: "inspect first" },
+      { type: "text", text: "" },
+      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+    ]);
+    expect(result.usage).toBeUndefined();
+  });
+
+  test("does not create an empty text block for null content with a tool call", () => {
+    const result = parseOpenAIAssistantMessage({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          type: "function",
+          id: "call-1",
+          function: { name: "read_file", arguments: '{"path":"a.ts"}' },
+        },
+      ],
+    } as never);
+
+    expect(result.content).toEqual([
+      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+    ]);
+  });
+
+  test("reports malformed final tool arguments with the call id", () => {
+    expect(() =>
+      parseOpenAIAssistantMessage({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            type: "function",
+            id: "broken-call",
+            function: { name: "read_file", arguments: '{"path"' },
+          },
+        ],
+      } as never),
+    ).toThrow("broken-call");
+  });
+});
+```
+
+</details>
+
+完成实现后，运行转换测试：
+
+```bash
+bun test src/community/openai/__tests__/utils.test.ts
+```
+
+测试通过后，进入下一节，将这些转换函数接入 `Provider.invoke`。
+
+#### 7.1.3 实现 Provider.invoke，并用 fake client 验证
+
+目标文件：`src/community/openai/model-provider.ts`
+
+```ts
+import OpenAI from "openai";
+
+import type { AssistantMessage } from "@/foundation/messages";
+import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
+
+export class OpenAIModelProvider implements ModelProvider {
+  private readonly _client: OpenAI;
+
+  constructor(options: { baseURL?: string; apiKey?: string; client?: OpenAI } = {}) {
+    // 标准实现示例：允许测试注入 fake client；production 才创建真实 SDK client。
+    this._client = options.client ?? new OpenAI({
+      baseURL: options.baseURL,
+      apiKey: options.apiKey,
+    });
+  }
+
+  async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
+    // TODO 1：构造 request → client.chat.completions.create → parse；透传 signal。
+    throw new Error("TODO: implement OpenAIModelProvider.invoke");
+  }
+
+  async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
+    // 7A 先保留接口；7B 再接入 StreamAccumulator 并实现累计 snapshot。
+    throw new Error("TODO: implement OpenAIModelProvider.stream in 7B");
+  }
 }
 ```
 
-这些函数必须是纯函数。先用固定 fixture 测完，再调用 SDK。
+默认使用确定性更强的 provider options，并允许调用方最后覆盖：
 
-### 7.3 StreamAccumulator
+```ts
+return {
+  model,
+  messages: convertToOpenAIMessages(messages),
+  tools: tools ? convertToOpenAITools(tools) : undefined,
+  temperature: 0,
+  top_p: 0,
+  ...options,
+};
+```
+
+不要在日志、trace 或测试 snapshot 中记录 API key。
+
+本小节只完成 `invoke`。`stream` 保留显式报错的占位实现，进入 7B 后再补齐；
+`index.ts` 导出 `OpenAIModelProvider`。
+
+**对应测试**
+
+目标文件：`src/community/openai/__tests__/model-provider.test.ts`
+
+<details>
+<summary>展开完整代码：<code>model-provider.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import { OpenAIModelProvider } from "../model-provider";
+
+describe("OpenAIModelProvider", () => {
+  test("passes signal, tools and caller overrides to the SDK", async () => {
+    let request: Record<string, unknown> | undefined;
+    let sdkSignal: AbortSignal | undefined;
+    const client = {
+      chat: {
+        completions: {
+          create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
+            request = body;
+            sdkSignal = options.signal;
+            return {
+              choices: [{ message: { role: "assistant", content: "ok" } }],
+              usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+            };
+          },
+        },
+      },
+    };
+    const controller = new AbortController();
+    const provider = new OpenAIModelProvider({ client: client as never });
+
+    const result = await provider.invoke({
+      model: "test-model",
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      tools: [],
+      options: { temperature: 0.25 },
+      signal: controller.signal,
+    });
+
+    expect(request).toMatchObject({
+      model: "test-model",
+      temperature: 0.25,
+      top_p: 0,
+    });
+    expect(sdkSignal).toBe(controller.signal);
+    expect(result).toMatchObject({
+      role: "assistant",
+      content: [{ type: "text", text: "ok" }],
+      usage: { totalTokens: 4 },
+    });
+  });
+});
+```
+
+</details>
+
+SDK `create` 的第二个参数承载 `signal`；不要把 signal 混进 JSON request body。
+测试通过构造函数注入 fake client，不创建真实 SDK client，也不需要 API key。
+
+```bash
+bun test src/community/openai/__tests__/model-provider.test.ts
+```
+
+**7A 完成检查**：转换测试和 fake client test 通过，`invoke` 返回 canonical
+`AssistantMessage`，调用方 options 能覆盖默认值，`signal` 已透传到 SDK。
+
+### 7.2 OpenAI：streaming 与 Tool 参数片段（7B） {#stage-7b}
+
+在已通过测试的 OpenAI 非流式路径上增加 streaming。本节继续只修改 OpenAI adapter。
+
+```bash
+touch src/community/openai/stream-accumulator.ts
+touch src/community/openai/__tests__/stream-accumulator.test.ts
+```
+
+#### 7.2.1 实现 StreamAccumulator，并验证累计状态
 
 目标文件：`src/community/openai/stream-accumulator.ts`
 
@@ -243,37 +610,11 @@ export class StreamAccumulator {
 
 </details>
 
-目标文件：`src/community/anthropic/stream-accumulator.ts`
+这里的 `ProviderChunk` 是 OpenAI adapter 内部的 normalized chunk。`index` 在一次响应内
+稳定，`argumentsDelta` 按同一 Tool call index 拼接，usage 只在 provider 明确报告时出现。
+SDK chunk 到这个类型的转换留在 `model-provider.ts`，不要让 SDK type 进入 Agent。
 
-Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
-event type 泄漏到 Agent：
-
-```ts
-import type { AssistantMessage } from "@/foundation/messages";
-
-export type ProviderChunk =
-  | { type: "text_delta"; index: number; text: string }
-  | { type: "thinking_delta"; index: number; thinking: string }
-  | { type: "tool_start"; index: number; id: string; name: string }
-  | { type: "input_json_delta"; index: number; partialJson: string }
-  | { type: "message_start"; inputTokens: number }
-  | { type: "message_end"; outputTokens: number };
-
-export class StreamAccumulator {
-  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态。
-  // TODO 2：分别保存 input/output usage，message_end 后产生完整 TokenUsage。
-
-  push(chunk: ProviderChunk): void {
-    // TODO 3：按 chunk.type 分派；同一 index 的 partialJson 只能追加到同一 Tool。
-    throw new Error("TODO: implement Anthropic StreamAccumulator.push");
-  }
-
-  snapshot(): AssistantMessage {
-    // TODO 4：按 index 排序输出新 content 数组；不完整 Tool input 暂时使用 {}。
-    throw new Error("TODO: implement Anthropic StreamAccumulator.snapshot");
-  }
-}
-```
+**对应测试**
 
 目标文件：`src/community/openai/__tests__/stream-accumulator.test.ts`
 
@@ -335,6 +676,296 @@ describe("OpenAI StreamAccumulator", () => {
 
 </details>
 
+```bash
+bun test src/community/openai/__tests__/stream-accumulator.test.ts
+```
+
+通过后应能观察到：旧 snapshot 不随后续 delta 改变；两个交错的 Tool call 不串线；
+调用方修改 snapshot 不会污染 accumulator。
+
+#### 7.2.2 接入 Provider.stream，并用 fake stream 验证
+
+目标文件：`src/community/openai/model-provider.ts`。补齐 7A 留下的 `stream` 方法：
+
+1. 复用 `invoke` 的请求转换，调用 `chat.completions.create` 时设置 `stream: true`，
+   并通过第二个参数传入 `signal`。
+2. 为每次调用创建独立的 `StreamAccumulator`，把 SDK chunk 中的 text、thinking、Tool
+   fragments 和 usage 转成 `ProviderChunk`，依次 `push`。
+3. 每次 `yield` 返回累计 snapshot。即使 chunk 的 `choices` 为空，也要处理其中的 usage。
+4. 流结束前确认 Tool arguments 已完整；最终仍非法时抛出带 call id 的错误，不能把临时
+   `{}` 当成最终 Tool input。最终 snapshot 与 `invoke` 的返回语义一致，不带临时 streaming 标记。
+
+**对应测试**
+
+目标文件：`src/community/openai/__tests__/model-provider.test.ts`。保留 7A 的测试，
+在文件末尾追加下面的完整用例；沿用已有的 `test` 和 `OpenAIModelProvider` imports。
+
+```ts
+test("streams cumulative snapshots and keeps usage-only chunks", async () => {
+  let request: Record<string, unknown> | undefined;
+  let sdkSignal: AbortSignal | undefined;
+  const client = {
+    chat: {
+      completions: {
+        create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
+          request = body;
+          sdkSignal = options.signal;
+          return (async function* () {
+            yield { choices: [{ index: 0, delta: { role: "assistant", content: "hel" } }] };
+            yield { choices: [{ index: 0, delta: { content: "lo" } }] };
+            yield { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
+            yield {
+              choices: [],
+              usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+            };
+          })();
+        },
+      },
+    },
+  };
+  const controller = new AbortController();
+  const provider = new OpenAIModelProvider({ client: client as never });
+  const snapshots = [];
+
+  for await (const snapshot of provider.stream({
+    model: "test-model",
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    signal: controller.signal,
+  })) {
+    snapshots.push(snapshot);
+  }
+
+  expect(request).toMatchObject({ model: "test-model", stream: true });
+  expect(sdkSignal).toBe(controller.signal);
+  expect(snapshots[0]?.content).toEqual([{ type: "text", text: "hel" }]);
+  expect(snapshots.at(-1)).toMatchObject({
+    role: "assistant",
+    content: [{ type: "text", text: "hello" }],
+    usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+  });
+});
+```
+
+```bash
+bun test src/community/openai
+```
+
+**7B 完成检查**：OpenAI converter、accumulator 和 Provider tests 全部通过；非流式路径
+仍正常，streaming 能输出独立的累计 snapshot，并保留末尾单独报告的 usage。到这里再开始第二个 Provider。
+
+### 7.3 Anthropic：独立实现第二个 Adapter（7C） {#stage-7c}
+
+本章集中完成 Anthropic 的安装、转换、streaming 和 Provider 验证。复用的是
+`ModelProvider` 与 canonical `Message` 契约，转换函数和 accumulator 都放在独立的
+`src/community/anthropic/` 目录中。
+
+#### 7.3.1 安装 SDK 并创建文件
+
+```bash
+bun add @anthropic-ai/sdk
+mkdir -p src/community/anthropic/__tests__
+touch src/community/anthropic/utils.ts src/community/anthropic/stream-accumulator.ts
+touch src/community/anthropic/model-provider.ts src/community/anthropic/index.ts
+touch src/community/anthropic/__tests__/utils.test.ts
+touch src/community/anthropic/__tests__/stream-accumulator.test.ts
+touch src/community/anthropic/__tests__/model-provider.test.ts
+```
+
+执行后新增目录为：
+
+```text
+src/community/anthropic/
+├── utils.ts                       # system、消息、Tool schema 与响应转换
+├── stream-accumulator.ts           # 按 block index 累积事件
+├── model-provider.ts              # 实现 invoke 与 stream
+├── index.ts                       # 导出 AnthropicModelProvider
+└── __tests__/
+    ├── utils.test.ts              # Anthropic 协议转换测试
+    ├── stream-accumulator.test.ts  # 内容顺序与 usage 测试
+    └── model-provider.test.ts     # fake client 请求与响应测试
+```
+
+#### 7.3.2 实现纯转换函数，并运行转换测试
+
+目标文件：`src/community/anthropic/utils.ts`
+
+实现 Anthropic 协议转换函数：
+
+```ts
+import Anthropic from "@anthropic-ai/sdk";
+
+import type { AssistantMessage, Message } from "@/foundation/messages";
+import type { Tool } from "@/foundation/tools";
+
+export function extractSystemPrompt(messages: Message[]): string | undefined {
+  // TODO 1：只收集 system text，并用两个换行连接；没有 system 时返回 undefined。
+  // 参数规则：不得修改 messages，也不得把非 system 内容混入 prompt。
+  throw new Error("TODO: implement extractSystemPrompt");
+}
+
+export function convertToAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
+  // TODO 2：排除 system message，并把 Tool result 转成 user-role content。
+  // 参数规则：保持原始消息及 content block 顺序，不修改 canonical messages。
+  throw new Error("TODO: implement convertToAnthropicMessages");
+}
+
+export function convertToAnthropicTools(tools: Tool[]): Anthropic.Tool[] {
+  // TODO 3：使用 input_schema，不要复用 OpenAI wire type。
+  throw new Error("TODO: implement convertToAnthropicTools");
+}
+
+export function parseAnthropicAssistantMessage(message: Anthropic.Message): AssistantMessage {
+  // TODO 4：解析 text、thinking、tool_use，并原样保存 Tool id 和 provider usage。
+  throw new Error("TODO: implement parseAnthropicAssistantMessage");
+}
+```
+
+这些函数必须是纯函数。先用固定 fixture 测完，再调用 SDK。
+
+**对应测试**
+
+目标文件：`src/community/anthropic/__tests__/utils.test.ts`
+
+<details>
+<summary>展开完整代码：<code>utils.test.ts</code></summary>
+
+```ts
+import { describe, expect, test } from "bun:test";
+
+import type { Message } from "@/foundation/messages";
+
+import {
+  convertToAnthropicMessages,
+  extractSystemPrompt,
+  parseAnthropicAssistantMessage,
+} from "../utils";
+
+describe("Anthropic protocol conversion", () => {
+  test("extracts system text separately and excludes it from messages", () => {
+    const messages: Message[] = [
+      { role: "system", content: [{ type: "text", text: "Rule A" }] },
+      { role: "system", content: [{ type: "text", text: "Rule B" }] },
+      { role: "user", content: [{ type: "text", text: "Hello" }] },
+    ];
+
+    expect(extractSystemPrompt(messages)).toBe("Rule A\n\nRule B");
+    expect(convertToAnthropicMessages(messages)).toMatchObject([
+      { role: "user", content: [{ type: "text", text: "Hello" }] },
+    ]);
+  });
+
+  test("keeps assistant text, thinking and multiple tool ids", () => {
+    const result = convertToAnthropicMessages([
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "plan" },
+          { type: "text", text: "running" },
+          { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+          { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+        ],
+      },
+    ]);
+
+    expect(result[0]).toMatchObject({
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "plan" },
+        { type: "text", text: "running" },
+        { type: "tool_use", id: "a" },
+        { type: "tool_use", id: "b" },
+      ],
+    });
+  });
+
+  test("converts tool results into user-role content", () => {
+    expect(convertToAnthropicMessages([
+      {
+        role: "tool",
+        content: [{ type: "tool_result", tool_use_id: "a", content: "result" }],
+      },
+    ])).toMatchObject([
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "a", content: "result" }],
+      },
+    ]);
+  });
+
+  test("parses text, thinking, tool use and usage", () => {
+    const result = parseAnthropicAssistantMessage({
+      id: "message-1",
+      type: "message",
+      role: "assistant",
+      model: "test-model",
+      stop_reason: "tool_use",
+      content: [
+        { type: "thinking", thinking: "plan", signature: "signature" },
+        { type: "text", text: "running" },
+        { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+      ],
+      usage: { input_tokens: 8, output_tokens: 5 },
+    } as never);
+
+    expect(result.content).toMatchObject([
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "running" },
+      { type: "tool_use", id: "a", input: { path: "a.ts" } },
+    ]);
+    expect(result.usage).toEqual({ promptTokens: 8, completionTokens: 5, totalTokens: 13 });
+  });
+});
+```
+
+</details>
+
+```bash
+bun test src/community/anthropic/__tests__/utils.test.ts
+```
+
+通过后应确认：system 从消息中单独提取；Tool result 转成 user-role content；
+text、thinking、Tool id 与 usage 在转换中保留。
+
+#### 7.3.3 实现 StreamAccumulator，并运行事件累积测试
+
+目标文件：`src/community/anthropic/stream-accumulator.ts`
+
+Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
+event type 泄漏到 Agent：
+
+```ts
+import type { AssistantMessage } from "@/foundation/messages";
+
+export type ProviderChunk =
+  | { type: "text_delta"; index: number; text: string }
+  | { type: "thinking_delta"; index: number; thinking: string }
+  | { type: "tool_start"; index: number; id: string; name: string }
+  | { type: "input_json_delta"; index: number; partialJson: string }
+  | { type: "message_start"; inputTokens: number }
+  | { type: "message_end"; outputTokens: number };
+
+export class StreamAccumulator {
+  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态。
+  // TODO 2：分别保存 input/output usage，message_end 后产生完整 TokenUsage。
+
+  push(chunk: ProviderChunk): void {
+    // TODO 3：按 chunk.type 分派；同一 index 的 partialJson 只能追加到同一 Tool。
+    throw new Error("TODO: implement Anthropic StreamAccumulator.push");
+  }
+
+  snapshot(): AssistantMessage {
+    // TODO 4：按 index 排序输出新 content 数组；不完整 Tool input 暂时使用 {}。
+    throw new Error("TODO: implement Anthropic StreamAccumulator.snapshot");
+  }
+}
+```
+
+这里的 `index` 表示一次响应内的 content block index。`partialJson` 只能追加到同一
+index 的 Tool；usage 只在 provider 明确报告时出现。SDK event 先在 `model-provider.ts`
+中转换为上面的 union，再交给 accumulator。
+
+**对应测试**
+
 目标文件：`src/community/anthropic/__tests__/stream-accumulator.test.ts`
 
 <details>
@@ -382,59 +1013,59 @@ describe("Anthropic StreamAccumulator", () => {
 
 </details>
 
-这里的 chunk 是教程规定的 provider-local normalized chunk；参数规则是：`index` 在一次
-响应内稳定、`argumentsDelta`/`partialJson` 必须按同一 index 拼接、usage 只在 provider
-明确报告时出现。若你直接消费 SDK event，可先在 `model-provider.ts` 做一次窄转换。
+```bash
+bun test src/community/anthropic/__tests__/stream-accumulator.test.ts
+```
 
-### 7.4 Provider class
+通过后应确认：thinking、text 和 Tool 按 block index 输出，JSON fragments 正确拼接，
+输入与输出 tokens 合并为 canonical `TokenUsage`。
 
-目标文件：`src/community/openai/model-provider.ts`
+#### 7.3.4 实现 Provider.invoke，并用 fake client 验证
+
+目标文件：`src/community/anthropic/model-provider.ts`
 
 ```ts
-import OpenAI from "openai";
+import Anthropic from "@anthropic-ai/sdk";
 
 import type { AssistantMessage } from "@/foundation/messages";
 import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
 
-export class OpenAIModelProvider implements ModelProvider {
-  private readonly _client: OpenAI;
+export class AnthropicModelProvider implements ModelProvider {
+  private readonly _client: Anthropic;
 
-  constructor(options: { baseURL?: string; apiKey?: string; client?: OpenAI } = {}) {
-    // 标准实现示例：允许测试注入 fake client；production 才创建真实 SDK client。
-    this._client = options.client ?? new OpenAI({
+  constructor(options: { baseURL?: string; apiKey?: string; client?: Anthropic } = {}) {
+    this._client = options.client ?? new Anthropic({
       baseURL: options.baseURL,
       apiKey: options.apiKey,
     });
   }
 
   async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
-    // TODO 1：构造 request → client.chat.completions.create → parse；透传 signal。
-    throw new Error("TODO: implement OpenAIModelProvider.invoke");
+    // TODO 1：提取 system，转换 messages/tools，并设置 max_tokens 默认值。
+    // TODO 2：合并调用方 options，调用 messages.create，第二个参数透传 signal。
+    // TODO 3：用 parseAnthropicAssistantMessage 将响应和 usage 转回 canonical 消息。
+    throw new Error("TODO: implement AnthropicModelProvider.invoke");
   }
 
   async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
-    // TODO 2：设置 stream=true；每个 SDK chunk 依次 push，再 yield 累计 snapshot。
-    // TODO 3：结束前确认最后 snapshot 是完整消息，且不带临时 streaming 标记。
+    // TODO 4：复用请求转换，设置 stream=true，并透传 signal。
+    // TODO 5：把 SDK events 转成 ProviderChunk，逐个 push，再 yield 累计 snapshot。
+    // TODO 6：流结束时校验 Tool JSON 完整性，保留最终 usage。
+    throw new Error("TODO: implement AnthropicModelProvider.stream");
   }
 }
 ```
 
-默认使用确定性更强的 provider options，并允许调用方最后覆盖：
+请求中 `system` 与 `messages` 分开传入，Tool schema 使用 `input_schema`；
+`max_tokens` 可先默认设为 `8192`，再由调用方 `options` 覆盖。`signal` 放在 SDK
+`messages.create` 的第二个参数中。通过构造函数注入 fake client，测试无需 key。
 
-```ts
-return {
-  model,
-  messages: convertToOpenAIMessages(messages),
-  tools: tools ? convertToOpenAITools(tools) : undefined,
-  temperature: 0,
-  top_p: 0,
-  ...options,
-};
-```
+先实现 `invoke` 并通过下面的测试，再连接本章已验证的 accumulator 实现 `stream`。
+`index.ts` 导出 `AnthropicModelProvider`，API key 不进入日志、trace 或测试 snapshot。
 
-不要在日志、trace 或测试 snapshot 中记录 API key。
+**对应测试**
 
-目标文件：`src/community/openai/__tests__/model-provider.test.ts`
+目标文件：`src/community/anthropic/__tests__/model-provider.test.ts`
 
 <details>
 <summary>展开完整代码：<code>model-provider.test.ts</code></summary>
@@ -442,47 +1073,55 @@ return {
 ```ts
 import { describe, expect, test } from "bun:test";
 
-import { OpenAIModelProvider } from "../model-provider";
+import { AnthropicModelProvider } from "../model-provider";
 
-describe("OpenAIModelProvider", () => {
-  test("passes signal, tools and caller overrides to the SDK", async () => {
+describe("AnthropicModelProvider", () => {
+  test("separates system and passes caller options and signal to the SDK", async () => {
     let request: Record<string, unknown> | undefined;
     let sdkSignal: AbortSignal | undefined;
     const client = {
-      chat: {
-        completions: {
-          create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
-            request = body;
-            sdkSignal = options.signal;
-            return {
-              choices: [{ message: { role: "assistant", content: "ok" } }],
-              usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
-            };
-          },
+      messages: {
+        create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
+          request = body;
+          sdkSignal = options.signal;
+          return {
+            id: "message-1",
+            type: "message",
+            role: "assistant",
+            model: "test-model",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            usage: { input_tokens: 3, output_tokens: 1 },
+          };
         },
       },
     };
     const controller = new AbortController();
-    const provider = new OpenAIModelProvider({ client: client as never });
+    const provider = new AnthropicModelProvider({ client: client as never });
 
     const result = await provider.invoke({
       model: "test-model",
-      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
-      tools: [],
-      options: { temperature: 0.25 },
+      messages: [
+        { role: "system", content: [{ type: "text", text: "Be concise" }] },
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+      ],
+      options: { max_tokens: 256 },
       signal: controller.signal,
     });
 
     expect(request).toMatchObject({
       model: "test-model",
-      temperature: 0.25,
-      top_p: 0,
+      system: "Be concise",
+      messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+      max_tokens: 256,
     });
+    expect(request).not.toHaveProperty("signal");
     expect(sdkSignal).toBe(controller.signal);
     expect(result).toMatchObject({
       role: "assistant",
       content: [{ type: "text", text: "ok" }],
-      usage: { totalTokens: 4 },
+      usage: { promptTokens: 3, completionTokens: 1, totalTokens: 4 },
     });
   });
 });
@@ -490,8 +1129,119 @@ describe("OpenAIModelProvider", () => {
 
 </details>
 
-SDK `create` 的第二个参数承载 `signal`；不要把 signal 混进 JSON request body。Anthropic
-provider 使用相同注入方式和断言结构，其 wire 转换差异已由 7.5 的完整测试固定。
+```bash
+bun test src/community/anthropic/__tests__/model-provider.test.ts
+```
+
+#### 7.3.5 接入 Provider.stream，并用 fake stream 验证
+
+目标文件：`src/community/anthropic/model-provider.ts`。现在补齐 `stream`，把 SDK 的
+text/thinking delta、Tool block start、JSON delta 和 usage
+事件转换为本章的 `ProviderChunk`。每次调用使用独立 accumulator；最终 Tool JSON 非法时
+抛出带 call id 的错误。流中暂时不完整的 input 可以是 `{}`，最终结果不能静默保留这个占位值。
+
+**对应测试**
+
+目标文件：`src/community/anthropic/__tests__/model-provider.test.ts`。保留上一小节的测试，
+在文件末尾追加下面的完整用例；沿用已有的 `test` 和 `AnthropicModelProvider` imports。
+
+<details>
+<summary>展开追加用例：Anthropic fake stream</summary>
+
+```ts
+test("streams Anthropic events into cumulative text and final usage", async () => {
+  let request: Record<string, unknown> | undefined;
+  let sdkSignal: AbortSignal | undefined;
+  const client = {
+    messages: {
+      create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
+        request = body;
+        sdkSignal = options.signal;
+        return (async function* () {
+          yield {
+            type: "message_start",
+            message: {
+              id: "message-1", type: "message", role: "assistant", model: "test-model",
+              content: [], stop_reason: null, stop_sequence: null,
+              usage: { input_tokens: 3, output_tokens: 0 },
+            },
+          };
+          yield {
+            type: "content_block_start", index: 0,
+            content_block: { type: "text", text: "" },
+          };
+          yield {
+            type: "content_block_delta", index: 0,
+            delta: { type: "text_delta", text: "hel" },
+          };
+          yield {
+            type: "content_block_delta", index: 0,
+            delta: { type: "text_delta", text: "lo" },
+          };
+          yield { type: "content_block_stop", index: 0 };
+          yield {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: 2 },
+          };
+          yield { type: "message_stop" };
+        })();
+      },
+    },
+  };
+  const controller = new AbortController();
+  const provider = new AnthropicModelProvider({ client: client as never });
+  const snapshots = [];
+
+  for await (const snapshot of provider.stream({
+    model: "test-model",
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    signal: controller.signal,
+  })) {
+    snapshots.push(snapshot);
+  }
+
+  expect(request).toMatchObject({ model: "test-model", stream: true });
+  expect(sdkSignal).toBe(controller.signal);
+  expect(snapshots.some((snapshot) =>
+    snapshot.content.some((item) => item.type === "text" && item.text === "hel"),
+  )).toBe(true);
+  expect(snapshots.at(-1)).toMatchObject({
+    role: "assistant",
+    content: [{ type: "text", text: "hello" }],
+    usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+  });
+});
+```
+
+</details>
+
+用例中的 SDK `message_delta.usage.output_tokens` 应映射到 normalized `message_end`；
+`message_stop` 自身没有 usage，不能因此把已累计的 tokens 清零。
+
+完成本章后运行：
+
+```bash
+bun test src/community/anthropic
+```
+
+**7C 完成检查**：Anthropic converter、accumulator 和 fake client tests 通过；
+`invoke` 和 `stream` 都返回 canonical `AssistantMessage`，Agent 无需分支判断厂商。
+此时两个 Adapter 的实现都已完成，可以进入可选联网验证，也可以直接执行 7.5 的完整检查。
+
+### 7.4 真实 API 验证（7D，可选） {#stage-7d}
+
+前面的小节用 fake client 和固定 fixtures 验证契约。现在才接入真实 endpoint，观察
+SDK、鉴权、模型配置与 streaming 是否能一起工作。没有 API key 可以跳过本节。
+
+#### 7.4.1 创建真实模型示例
+
+```bash
+mkdir -p examples
+touch examples/stage-07-real-model.ts
+```
+
+示例通过参数选择 Provider；因为同时导入两个 Adapter，请先完成 7C。
 
 目标文件：`examples/stage-07-real-model.ts`
 
@@ -596,7 +1346,7 @@ await main();
 
 </details>
 
-### 运行与观察
+#### 7.4.2 运行与观察
 
 OpenAI-compatible endpoint：
 
@@ -620,231 +1370,22 @@ ANTHROPIC_API_KEY=... bun run examples/stage-07-real-model.ts anthropic
 
 如果没有 key，示例给出配置提示后 exit 0；测试套件不能因此失败。
 
-### 7.5 完整协议测试
+**7D 完成检查（可选）**：配置有效 key 后，所选 Provider 能返回真实回答，并打印
+canonical message、provider 报告的 token usage 与耗时。网络或鉴权失败在本节排查，
+不把联网请求加入核心测试套件。
 
-目标文件：`src/community/openai/__tests__/utils.test.ts`
+### 7.5 完整测试与阶段验收
 
-下面是可直接复制的完整 OpenAI 转换测试。测试中的 `as never` 只把精简 fixture
-适配成 SDK 的庞大 wire type；生产代码不得借此跳过 canonical type 检查。
-
-<details>
-<summary>展开完整代码：<code>utils.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import type { Message } from "@/foundation/messages";
-
-import {
-  convertToOpenAIMessages,
-  parseOpenAIAssistantMessage,
-} from "../utils";
-
-describe("OpenAI protocol conversion", () => {
-  test("converts system and user content without losing order", () => {
-    const messages: Message[] = [
-      { role: "system", content: [{ type: "text", text: "Be concise" }] },
-      {
-        role: "user",
-        content: [
-          { type: "text", text: "inspect" },
-          { type: "image_url", image_url: { url: "https://example.test/a.png" } },
-        ],
-      },
-    ];
-
-    expect(convertToOpenAIMessages(messages)).toMatchObject([
-      { role: "system" },
-      { role: "user" },
-    ]);
-  });
-
-  test("keeps text and multiple tool calls in one assistant message", () => {
-    const result = convertToOpenAIMessages([
-      {
-        role: "assistant",
-        content: [
-          { type: "text", text: "I will inspect both files" },
-          { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
-          { type: "tool_use", id: "call-2", name: "read_file", input: { path: "b.ts" } },
-        ],
-      },
-    ]);
-
-    expect(result[0]).toMatchObject({
-      role: "assistant",
-      tool_calls: [
-        { id: "call-1", function: { name: "read_file", arguments: '{"path":"a.ts"}' } },
-        { id: "call-2", function: { name: "read_file", arguments: '{"path":"b.ts"}' } },
-      ],
-    });
-  });
-
-  test("expands tool results and preserves their call ids", () => {
-    const result = convertToOpenAIMessages([
-      {
-        role: "tool",
-        content: [
-          { type: "tool_result", tool_use_id: "call-1", content: "A" },
-          { type: "tool_result", tool_use_id: "call-2", content: "B" },
-        ],
-      },
-    ]);
-
-    expect(result).toMatchObject([
-      { role: "tool", tool_call_id: "call-1", content: "A" },
-      { role: "tool", tool_call_id: "call-2", content: "B" },
-    ]);
-  });
-
-  test("parses reasoning, empty text and tool arguments", () => {
-    const result = parseOpenAIAssistantMessage({
-      role: "assistant",
-      content: "",
-      reasoning_content: "inspect first",
-      tool_calls: [
-        {
-          type: "function",
-          id: "call-1",
-          function: { name: "read_file", arguments: '{"path":"a.ts"}' },
-        },
-      ],
-    } as never);
-
-    expect(result.content).toEqual([
-      { type: "thinking", thinking: "inspect first" },
-      { type: "text", text: "" },
-      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
-    ]);
-    expect(result.usage).toBeUndefined();
-  });
-
-  test("reports malformed final tool arguments with the call id", () => {
-    expect(() =>
-      parseOpenAIAssistantMessage({
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            type: "function",
-            id: "broken-call",
-            function: { name: "read_file", arguments: '{"path"' },
-          },
-        ],
-      } as never),
-    ).toThrow("broken-call");
-  });
-});
-```
-
-</details>
-
-目标文件：`src/community/anthropic/__tests__/utils.test.ts`
-
-<details>
-<summary>展开完整代码：<code>utils.test.ts</code></summary>
-
-```ts
-import { describe, expect, test } from "bun:test";
-
-import type { Message } from "@/foundation/messages";
-
-import {
-  convertToAnthropicMessages,
-  extractSystemPrompt,
-  parseAnthropicAssistantMessage,
-} from "../utils";
-
-describe("Anthropic protocol conversion", () => {
-  test("extracts system text separately and excludes it from messages", () => {
-    const messages: Message[] = [
-      { role: "system", content: [{ type: "text", text: "Rule A" }] },
-      { role: "system", content: [{ type: "text", text: "Rule B" }] },
-      { role: "user", content: [{ type: "text", text: "Hello" }] },
-    ];
-
-    expect(extractSystemPrompt(messages)).toBe("Rule A\n\nRule B");
-    expect(convertToAnthropicMessages(messages)).toMatchObject([
-      { role: "user", content: [{ type: "text", text: "Hello" }] },
-    ]);
-  });
-
-  test("keeps assistant text, thinking and multiple tool ids", () => {
-    const result = convertToAnthropicMessages([
-      {
-        role: "assistant",
-        content: [
-          { type: "thinking", thinking: "plan" },
-          { type: "text", text: "running" },
-          { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
-          { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
-        ],
-      },
-    ]);
-
-    expect(result[0]).toMatchObject({
-      role: "assistant",
-      content: [
-        { type: "thinking", thinking: "plan" },
-        { type: "text", text: "running" },
-        { type: "tool_use", id: "a" },
-        { type: "tool_use", id: "b" },
-      ],
-    });
-  });
-
-  test("converts tool results into user-role content", () => {
-    expect(convertToAnthropicMessages([
-      {
-        role: "tool",
-        content: [{ type: "tool_result", tool_use_id: "a", content: "result" }],
-      },
-    ])).toMatchObject([
-      {
-        role: "user",
-        content: [{ type: "tool_result", tool_use_id: "a", content: "result" }],
-      },
-    ]);
-  });
-
-  test("parses text, thinking, tool use and usage", () => {
-    const result = parseAnthropicAssistantMessage({
-      id: "message-1",
-      type: "message",
-      role: "assistant",
-      model: "test-model",
-      stop_reason: "tool_use",
-      content: [
-        { type: "thinking", thinking: "plan", signature: "signature" },
-        { type: "text", text: "running" },
-        { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
-      ],
-      usage: { input_tokens: 8, output_tokens: 5 },
-    } as never);
-
-    expect(result.content).toMatchObject([
-      { type: "thinking", thinking: "plan" },
-      { type: "text", text: "running" },
-      { type: "tool_use", id: "a", input: { path: "a.ts" } },
-    ]);
-    expect(result.usage).toEqual({ promptTokens: 8, completionTokens: 5, totalTokens: 13 });
-  });
-});
-```
-
-</details>
-
-这两个文件已经覆盖 user/system/assistant、混合内容、多 Tool call、call id、空文本、
-thinking、缺少 usage 和 malformed arguments。Malformed arguments 在最终非流式响应中必须
-抛出带 call id 的诊断错误；流式 fragment 的规则由前文 7.3 的 accumulator 测试固定。
-
-最后执行本阶段的完整测试：
+两个 Provider 的实现和各自测试完成后，统一执行：
 
 ```bash
 bun test src/community/openai src/community/anthropic
+bun run check
 ```
 
-### 阶段后对照
+这里汇总前面已运行的离线测试，不再引入新的测试文件，也不依赖 7D 的真实 API 配置。
+
+#### 阶段后对照
 
 - `src/community/openai/model-provider.ts`
 - `src/community/openai/utils.ts`
@@ -853,7 +1394,7 @@ bun test src/community/openai src/community/anthropic
 - `src/community/anthropic/utils.ts`
 - `src/community/anthropic/stream-utils.ts`（练习项目将对应文件命名为 `stream-accumulator.ts`）
 
-### 验收
+#### 验收
 
 - [ ] provider SDK type 不进入 `agent`；
 - [ ] converter tests 不访问网络；
