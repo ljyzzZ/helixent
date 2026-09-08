@@ -93,6 +93,10 @@
 
 ## 阶段 6：Middleware
 
+- [ ] host 与 Middleware 两份测试共 24 项通过；
+- [ ] progress 接收及 yield 恢复后响应取消，不多拉取或发布 snapshot；
+- [ ] 单个已完成 Tool 结果在取消时保留，实际 ABORTED 与普通 failure 分开；
+- [ ] ADR-007 记录并发取消的剩余边界，并关联阶段 12.0 前置任务；
 - [ ] lifecycle 顺序有测试；
 - [ ] Middleware 串行顺序固定；
 - [ ] `AgentContext` 与 `ModelContext` mutation boundary 明确；
@@ -159,6 +163,10 @@
 
 ## 阶段 12：Recovery
 
+- [ ] 写 checkpoint/resume 前完成 12.0：已完成结果回收、未完成任务退出、迟到 hook 隔离三项回归；
+- [ ] 并发取消时已交付结果恰好记录一次，关闭后迟到任务不能再修改状态；
+- [ ] 取消 checkpoint 后 resume，两个并发写入计数器各保持 1，observations 不重复；
+- [ ] 阶段 6 的 24 项测试持续通过；
 - [ ] checkpoint schema versioned；
 - [ ] atomic temp-write + rename；
 - [ ] Tool 副作用前保存 intent；

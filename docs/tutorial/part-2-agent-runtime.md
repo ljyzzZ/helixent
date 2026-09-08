@@ -2145,20 +2145,54 @@ TODO：在阶段 5 的 `stream()` 中，取得 `_think()` 返回的完整回复�
 
 ```ts
 const assistantMessage = yield* this._think(signal);
+// 若模型生成期间已取消，就不再开始处理最终回复。
 signal.throwIfAborted();
 await this._afterModel(assistantMessage);
-// hook 可能等待异步操作，等待期间用户也可能 abort。
+// 若等待 hook 期间发生取消，就不再追加、发布最终回复或进入 Tool 执行。
 signal.throwIfAborted();
 this._context.messages.push(assistantMessage);
 yield { type: "message", message: assistantMessage };
 // 后续再从 assistantMessage 提取 Tool calls，沿用已有的执行与终止逻辑。
 ```
 
+#### 为什么在 hook 前后检查 signal
+
+这里的 `signal.throwIfAborted()` 是**在执行到这一行时检查中止状态**，不会注册监听器，也不会自动打断中间的 Promise：已中止就抛出 `signal.reason`，未中止就继续。这是 [AbortSignal 标准定义的检查点行为](https://dom.spec.whatwg.org/#dom-abortsignal-throwifaborted)。
+
+前后两次检查分别保护不同的边界：
+
+1. **进入 hook 前**：`_think()` 已结束，但期间可能收到了取消请求。先检查，避免继续执行不再需要的回复处理。
+2. **hook 完成后**：`await` 期间可能发生取消。即使进入 hook 前没有取消，恢复执行时也需要重新检查，避免把结果追加到 transcript、发出最终消息或继续执行 Tool。
+
+例如：第一次检查通过 → hook 等待一个耗时操作 → 用户按 Ctrl+C → 耗时操作返回 → 第二次检查抛错 → 跳到外层 `finally` 收尾。如果没有第二次检查，就可能在用户取消后继续发布正常回复。
+
+但前后检查只能在边界上阻止流程继续。当前 `_afterModel(message)` 没有接收 signal，里面的 Middleware 仍可能执行完并合并返回值；外部检查不会撤销这些修改。如果某个 hook 一直不结束，执行也就一直到不了第二次检查。
+
+**判断其他 hook 是否需要检查，要看“接下来是否还要推进任务”，以及“当前是否承担必须完成的收尾”。** 以下按本章契约处理，可在实现全部 host 方法后再来回顾插入位置：
+
+| hook | 建议的中止检查位置 | 原因 |
+|---|---|---|
+| `beforeAgentRun`、`beforeAgentStep` | 开始新工作前检查；等待 hook 后、继续模型流程前再检查 | 取消后不再启动 run/step 的后续工作 |
+| `beforeModel` | 进入前检查；等待结束后、真正调用 model 前再检查 | hook 等待期间也可能取消，不能继续发起模型请求 |
+| `afterModel` | 如上例，在进入前和等待结束后检查 | 取消后停止最终回复发布及后续 Tool 流程 |
+| `beforeToolUse` | 进入前检查；等待结束后、真正执行 Tool 前再检查 | 用户可能在等待审批时取消，避免随后继续执行写文件或命令 |
+| `afterToolUse` | 保留契约要求的结果处理和 observation 记录，在继续推进任务前检查 | Tool 可能已完成或产生副作用，取消不能被当作“什么也没发生” |
+| `afterAgentStep` | 符合调用条件时完成 step 收尾，在进入下一 step 前检查 | 本章要求先追加全部 Tool observations，再调用此 hook；终止纯文本 step 不调用 |
+| `afterAgentRun` | 放在外层 `finally`，不要在它前面用已取消的 run signal 抛错来跳过收尾 | 本章要求成功、失败、abort、maxSteps 都调用一次 |
+
+这不是要求在每个方法前后机械地复制两行检查。如果上一行已经检查过，且中间没有 `await`、`yield` 或可能触发取消的回调，就可以共用同一个检查点。反过来，`yield` 也会把控制权交给调用方：例如发出 assistant 消息后，恢复执行、准备调用 Tool 时，也应重新检查 signal。
+
+> 如果希望 hook **在等待期间就能响应取消**，还需要把本次 signal 显式传给它使用的异步操作。例如，`beforeModel` 已能读取 `modelContext.signal`；其他 hook 若需要这个能力，应扩展参数契约，并由 host 传入本次 run 的 signal，再交给支持取消的 `fetch` 或审批等待函数。只给外层加 `throwIfAborted()`，或只用 `Promise.race` 提前结束等待，都不会自动停止底层操作。
+>
+> 如果希望取消后连“后续 Middleware 执行”和“返回值合并”也停止，可以进一步让可中止的 host 接收 signal，在每次调用 Middleware 前，以及 `await` 返回后、`Object.assign` 前检查。用于必要收尾的 hooks 应单独处理，不能套用同一条取消规则；即使 `afterAgentRun` 抛错，也应通过嵌套 `finally` 保证 `_streaming` 和 `_abortController` 得到复位。
+>
+> 本阶段暂不实现上述 host 内部取消与迟到更新隔离；阶段 12.0 在接入 checkpoint/resume 前补齐需要的关闭边界。
+
 #### 小阶段自查
 
 目标文件：`src/agent/__tests__/host-hooks.test.ts`。
 
-这份文件用于你的练习项目，可在接入上述 host 方法后运行，不依赖后面的 lifecycle recorder。它通过公开的 `Agent.stream()` 验证行为，不直接调用私有方法。测试内的 fake provider 每次请求只返回一个完整回复，便于把注意力集中在 host 上；累计快照和 progress 仍由阶段 5 的测试覆盖。
+这份文件用于你的练习项目，可在接入上述示例 host 方法后运行。它通过公开的 `Agent.stream()` 验证行为，不直接调用私有方法。测试内的 fake provider 每次请求只返回一个完整回复，便于把注意力集中在 host 上；累计快照和 progress 仍由阶段 5 的测试覆盖。
 
 <details>
 <summary>展开完整代码：<code>host-hooks.test.ts</code></summary>
@@ -2304,7 +2338,7 @@ describe("Agent host hooks", () => {
 bun test src/agent/__tests__/host-hooks.test.ts
 ```
 
-两个 host 接入正确后，预期为 **2 pass、0 fail**。如果第一个测试多出 `beforeAgentRun`，检查它是否误放进 step 循环；如果第二个 hook 仍看到 `done`，检查是否等待了前一个 hook 并将返回值合并到 `message`；如果消息事件仍是旧内容，检查 `_afterModel()` 是否放在最终 `message` 事件发出之前。
+示例 host 接入正确后，预期为 **2 pass、0 fail**。如果第一个测试多出 `beforeAgentRun`，检查它是否误放进 step 循环；如果第二个 hook 仍看到 `done`，检查是否等待了前一个 hook 并将返回值合并到 `message`；如果消息事件仍是旧内容，检查 `_afterModel()` 是否放在最终 `message` 事件发出之前。
 
 测试中的 `structuredClone` 用于固定观察时刻。只保存对象引用，可能会因为对象在之后被修改而误通过，从而漏掉“先发事件、后执行 hook”的错误。
 
@@ -2464,9 +2498,37 @@ afterAgentRun
 
 本课程定义：没有 Tool 的终止 step 不调用 `afterAgentStep`。你可以选择不同语义，但必须在 ADR 和测试中固定下来。
 
+#### 阶段边界：与参考实现对照后，还需要补什么
+
+本阶段要求：取消后不再启动新工作；单个 Tool 已取得的结果先完成 `afterToolUse` 和 observation 记录；所有退出路径执行必要收尾。通过这些测试，可以继续阶段 7。
+
+但这还不等于“并发取消时绝不丢结果”。考虑两个 Tool 都已完成，消费者收到第一条 Tool 消息后取消：阶段 5 的 pending-set 循环若在下一轮开头立即 `throwIfAborted()`，第二条已经准备好的消息仍可能没有写入 transcript。
+
+**我们目前先不做处理，在实现 checkpoint/resume 前完成[阶段 12.0：先补齐并发取消边界](./part-4-production-runtime.md)。** 改动主要集中在 `_act()` 的结果收集和退出流程，不需要重写 Model 或四层架构：需要区分已完成结果队列与未完成任务，取消时先保存前者，并阻止 run 关闭后的迟到任务继续修改状态。这项保证暂不计入阶段 6 的通过条件，但阶段 12 不能带着这个缺口开始恢复功能。
+
 ### 6.5 完整测试
 
 目标文件：`src/agent/__tests__/middleware.test.ts`
+
+>提示：本文件测试用例覆盖：
+>
+>| 场景 | 必须观察到的结果 |
+>|---|---|
+>| 等待 `beforeAgentRun`、`beforeAgentStep`、`beforeModel` 时取消 | 不再发起模型调用 |
+>| 等待 `afterModel` 时取消 | 不追加或发布最终 assistant 消息 |
+>| 等待 `beforeToolUse` 或从消息 `yield` 恢复前取消 | 不执行真实 Tool，不进入下一轮模型 |
+>| 模型返回前已经取消 | 不再进入 `afterModel` |
+>| 收到 progress 后取消，或取消后 provider 才返回 snapshot | 不再拉取下一条 snapshot，也不输出迟到的 progress |
+>| Tool 返回成功结果时已取消 | 仍执行 `afterToolUse` 并记录单个已完成结果 |
+>| Tool 确实因 signal 中止而失败 | 传播 `AbortError`，不把它伪装成普通 Tool failure observation |
+>| 等待 `afterToolUse`、`afterAgentStep` 时取消 | 保留已完成 Tool 的 observation，不开始下一轮模型 |
+>| 初始化 hook 或模型抛错、取消、收尾 hook 自身抛错 | 按契约调用 `afterAgentRun`，并复位 `streaming` |
+
+测试用可手动放行的 Promise 控制 hook：先确认进入 hook，再调用 `agent.abort()`，最后允许 hook 返回。
+
+这里进一步明确阶段 6 的结果记录规则：阶段 5.2 中“发现取消立即退出”的检查，不能丢弃已经取得、正在交给 `afterToolUse` 处理的结果。实现时应区分“完成已有结果的记录”和“启动下一项工作”。
+
+实现时同时检查两处：`_invokeTool()` 中不能用 `afterToolUse` 前后的取消检查丢弃普通已完成结果；`_act()` 中不能在取得 `ToolMessage` 后、写入 transcript 前抛错。真正的 Registry `ABORTED` 则仍需传播取消。在 `_think()` 中，收到 snapshot 时和每次 progress `yield` 恢复后都检查 signal；仅在整个模型流结束后检查，会继续拉取并输出多余的 progress。
 
 <details>
 <summary>展开完整代码：<code>middleware.test.ts</code></summary>
@@ -2477,6 +2539,7 @@ import { z } from "zod";
 
 import type { AssistantMessage, UserMessage } from "@/foundation/messages";
 import { Model, ScriptedModelProvider } from "@/foundation/models";
+import type { ModelProvider } from "@/foundation/models/model-provider";
 import { defineTool } from "@/foundation/tools";
 
 import { Agent } from "../agent";
@@ -2511,26 +2574,91 @@ async function drain(agent: Agent): Promise<void> {
 
 function defineAgent(options: {
   middlewares: AgentMiddleware[];
-  invoke?: () => Promise<unknown>;
+  invoke?: (signal?: AbortSignal) => Promise<unknown>;
   responses?: AssistantMessage[];
+  provider?: ModelProvider;
   maxSteps?: number;
 }): Agent {
   const tool = defineTool({
     name: "work",
     description: "Test work",
     parameters: z.object({ description: z.string() }),
-    invoke: options.invoke ?? (async () => "ok"),
+    invoke: async (_input, signal) => options.invoke ? options.invoke(signal) : "ok",
   });
   return new Agent({
     model: new Model({
       name: "scripted",
-      provider: new ScriptedModelProvider({ responses: options.responses ?? [TOOL_CALL, FINAL] }),
+      provider: options.provider ?? new ScriptedModelProvider({ responses: options.responses ?? [TOOL_CALL, FINAL] }),
     }),
     prompt: "test",
     tools: [tool],
     middlewares: options.middlewares,
     maxSteps: options.maxSteps,
   });
+}
+
+// 手动控制“hook 已进入”和“允许 hook 返回”，不依赖计时。
+function defineHookGate() {
+  const entered = Promise.withResolvers<void>();
+  const released = Promise.withResolvers<void>();
+  return {
+    entered: entered.promise,
+    release: () => released.resolve(),
+    wait: async () => {
+      entered.resolve();
+      await released.promise;
+    },
+  };
+}
+
+// 故意不处理 signal，确保测试能发现 host 取消后仍调用 provider 的错误。
+function defineProbeProvider(responses: AssistantMessage[]) {
+  let calls = 0;
+  const provider: ModelProvider = {
+    async invoke() {
+      const response = responses[calls++];
+      if (!response) throw new Error("No probe response left");
+      return structuredClone(response);
+    },
+    async *stream(params) {
+      yield await this.invoke(params);
+    },
+  };
+  return { provider, callCount: () => calls };
+}
+
+async function abortWhileHookWaits(
+  agent: Agent,
+  gate: Pick<ReturnType<typeof defineHookGate>, "entered" | "release">,
+): Promise<AssistantMessage[]> {
+  const emitted: AssistantMessage[] = [];
+  // 立刻接上 rejection handler，避免取消时出现未处理的 Promise rejection。
+  const outcome = (async () => {
+    for await (const event of agent.stream(structuredClone(USER))) {
+      if (event.type === "message" && event.message.role === "assistant") {
+        emitted.push(structuredClone(event.message));
+      }
+    }
+  })().then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+
+  try {
+    await Promise.race([
+      gate.entered,
+      outcome.then(() => { throw new Error("Run ended before reaching the hook"); }),
+    ]);
+    agent.abort();
+  } finally {
+    // 即使断言或前置操作失败，也不要让测试创建的等待永久悬挂。
+    gate.release();
+    await outcome;
+  }
+
+  expect(await outcome).toMatchObject({ ok: false, error: { name: "AbortError" } });
+  expect(agent.streaming).toBe(false);
+  return emitted;
 }
 
 describe("Agent middleware", () => {
@@ -2642,13 +2770,323 @@ describe("Agent middleware", () => {
     await expect(drain(agent)).rejects.toBeDefined();
     expect(afterRunCount).toBe(1);
   });
+  // 5 个用例：逐个验证正常推进任务的 hook 的等待边界。
+  for (const [hook, expectedModelCalls, expectedMessages] of [
+    ["beforeAgentRun", 0, 0],
+    ["beforeAgentStep", 0, 0],
+    ["beforeModel", 0, 0],
+    ["afterModel", 1, 0],
+    ["beforeToolUse", 1, 1],
+  ] as const) {
+    test(`stops work when aborted during ${hook}`, async () => {
+      const gate = defineHookGate();
+      const probe = defineProbeProvider([TOOL_CALL, FINAL]);
+      let toolCalls = 0;
+      let afterRunCount = 0;
+      const middleware: AgentMiddleware = {
+        afterAgentRun: async () => { afterRunCount += 1; },
+      };
+      middleware[hook] = gate.wait;
+      const agent = defineAgent({
+        provider: probe.provider,
+        middlewares: [middleware],
+        invoke: async () => { toolCalls += 1; return "ok"; },
+      });
+
+      const emitted = await abortWhileHookWaits(agent, gate);
+      expect(probe.callCount()).toBe(expectedModelCalls);
+      expect(toolCalls).toBe(0);
+      expect(afterRunCount).toBe(1);
+      expect(emitted).toHaveLength(expectedMessages);
+      expect(agent.messages.filter((message) => message.role === "assistant"))
+        .toHaveLength(expectedMessages);
+    });
+  }
+
+  test("does not enter afterModel if the model finishes after cancellation", async () => {
+    const entered = Promise.withResolvers<void>();
+    const released = Promise.withResolvers<void>();
+    let afterModelCount = 0;
+    let afterRunCount = 0;
+    const provider: ModelProvider = {
+      async invoke() {
+        entered.resolve();
+        await released.promise;
+        // 模拟不响应 signal、取消后仍返回结果的 provider。
+        return structuredClone(FINAL);
+      },
+      async *stream(params) { yield await this.invoke(params); },
+    };
+    const agent = defineAgent({
+      provider,
+      middlewares: [{
+        afterModel: async () => { afterModelCount += 1; },
+        afterAgentRun: async () => { afterRunCount += 1; },
+      }],
+    });
+
+    const emitted = await abortWhileHookWaits(agent, {
+      entered: entered.promise,
+      release: () => released.resolve(),
+    });
+    expect(afterModelCount).toBe(0);
+    expect(afterRunCount).toBe(1);
+    expect(emitted).toEqual([]);
+    expect(agent.messages).toEqual([USER]);
+  });
+
+  test("does not execute tools after cancellation at a message yield", async () => {
+    const probe = defineProbeProvider([TOOL_CALL, FINAL]);
+    let toolCalls = 0;
+    let afterRunCount = 0;
+    let assistantEvents = 0;
+    const agent = defineAgent({
+      provider: probe.provider,
+      middlewares: [{ afterAgentRun: async () => { afterRunCount += 1; } }],
+      invoke: async () => { toolCalls += 1; return "ok"; },
+    });
+    const run = (async () => {
+      for await (const event of agent.stream(structuredClone(USER))) {
+        if (event.type === "message" && event.message.role === "assistant") {
+          assistantEvents += 1;
+          // 此刻生成器停在 yield，下一轮 next() 才会恢复执行。
+          agent.abort();
+        }
+      }
+    })();
+
+    await expect(run).rejects.toMatchObject({ name: "AbortError" });
+    expect(assistantEvents).toBe(1);
+    expect(toolCalls).toBe(0);
+    expect(probe.callCount()).toBe(1);
+    expect(afterRunCount).toBe(1);
+    expect(agent.streaming).toBe(false);
+  });
+
+  // 2 个用例：收尾保留已经发生的事实，但不能因此开启下一轮工作。
+  for (const hook of ["afterToolUse", "afterAgentStep"] as const) {
+    test(`keeps the completed tool observation when aborted during ${hook}`, async () => {
+      const gate = defineHookGate();
+      const probe = defineProbeProvider([TOOL_CALL, FINAL]);
+      let toolCalls = 0;
+      let afterRunCount = 0;
+      const middleware: AgentMiddleware = {
+        afterAgentRun: async () => { afterRunCount += 1; },
+      };
+      middleware[hook] = gate.wait;
+      const agent = defineAgent({
+        provider: probe.provider,
+        middlewares: [middleware],
+        invoke: async () => { toolCalls += 1; return "completed-work"; },
+      });
+
+      const emitted = await abortWhileHookWaits(agent, gate);
+      expect(toolCalls).toBe(1);
+      expect(probe.callCount()).toBe(1);
+      expect(afterRunCount).toBe(1);
+      expect(emitted).toHaveLength(1);
+      expect(agent.messages.map((message) => message.role)).toEqual([
+        "user", "assistant", "tool",
+      ]);
+      const observation = agent.messages.find((message) => message.role === "tool");
+      expect(observation?.content[0]?.tool_use_id).toBe("call-1");
+      expect(observation?.content[0]?.content).toContain("completed-work");
+    });
+  }
+
+  test("runs cleanup and resets state if beforeAgentRun throws", async () => {
+    const failure = new Error("before run failed");
+    const probe = defineProbeProvider([FINAL]);
+    let afterRunCount = 0;
+    const agent = defineAgent({
+      provider: probe.provider,
+      middlewares: [{
+        beforeAgentRun: async () => { throw failure; },
+        afterAgentRun: async () => { afterRunCount += 1; },
+      }],
+    });
+
+    await expect(drain(agent)).rejects.toBe(failure);
+    expect(probe.callCount()).toBe(0);
+    expect(afterRunCount).toBe(1);
+    expect(agent.streaming).toBe(false);
+  });
+
+  test("runs cleanup and resets state if the model throws", async () => {
+    const failure = new Error("model failed");
+    let afterRunCount = 0;
+    const provider: ModelProvider = {
+      async invoke() { throw failure; },
+      async *stream(params) { yield await this.invoke(params); },
+    };
+    const agent = defineAgent({
+      provider,
+      middlewares: [{ afterAgentRun: async () => { afterRunCount += 1; } }],
+    });
+
+    await expect(drain(agent)).rejects.toBe(failure);
+    expect(afterRunCount).toBe(1);
+    expect(agent.streaming).toBe(false);
+  });
+
+  test("resets state even if afterAgentRun itself throws", async () => {
+    const failure = new Error("cleanup failed");
+    let afterRunCount = 0;
+    const agent = defineAgent({
+      responses: [FINAL],
+      middlewares: [{
+        afterAgentRun: async () => { afterRunCount += 1; throw failure; },
+      }],
+    });
+
+    await expect(drain(agent)).rejects.toBe(failure);
+    expect(afterRunCount).toBe(1);
+    expect(agent.streaming).toBe(false);
+  });
+
+  test("stops pulling snapshots after cancellation at a progress yield", async () => {
+    let snapshots = 0;
+    let progressEvents = 0;
+    let afterModelCount = 0;
+    let afterRunCount = 0;
+    const provider: ModelProvider = {
+      async invoke() { return structuredClone(FINAL); },
+      async *stream() {
+        // 故意不检查 signal，验证 runtime 在 yield 恢复后的检查点。
+        for (const text of ["d", "do", "done"]) {
+          snapshots += 1;
+          yield { role: "assistant", content: [{ type: "text", text }] } as AssistantMessage;
+        }
+      },
+    };
+    const agent = defineAgent({
+      provider,
+      middlewares: [{
+        afterModel: async () => { afterModelCount += 1; },
+        afterAgentRun: async () => { afterRunCount += 1; },
+      }],
+    });
+    const run = (async () => {
+      for await (const event of agent.stream(structuredClone(USER))) {
+        if (event.type === "progress") { progressEvents += 1; agent.abort(); }
+      }
+    })();
+
+    await expect(run).rejects.toMatchObject({ name: "AbortError" });
+    expect(snapshots).toBe(1);
+    expect(progressEvents).toBe(1);
+    expect(afterModelCount).toBe(0);
+    expect(afterRunCount).toBe(1);
+    expect(agent.messages).toEqual([USER]);
+    expect(agent.streaming).toBe(false);
+  });
+
+  test("does not publish a snapshot delivered after cancellation", async () => {
+    const gate = defineHookGate();
+    let progressEvents = 0;
+    let afterModelCount = 0;
+    let afterRunCount = 0;
+    const provider: ModelProvider = {
+      async invoke() { await gate.wait(); return structuredClone(FINAL); },
+      async *stream(params) { yield await this.invoke(params); },
+    };
+    const agent = defineAgent({
+      provider,
+      middlewares: [{
+        afterModel: async () => { afterModelCount += 1; },
+        afterAgentRun: async () => { afterRunCount += 1; },
+      }],
+    });
+    const outcome = (async () => {
+      for await (const event of agent.stream(structuredClone(USER))) {
+        if (event.type === "progress") progressEvents += 1;
+      }
+    })().then(() => null, (error: unknown) => error);
+    try {
+      await Promise.race([
+        gate.entered,
+        outcome.then(() => { throw new Error("Run ended before the provider started"); }),
+      ]);
+      agent.abort();
+    } finally {
+      gate.release();
+      await outcome;
+    }
+
+    expect(await outcome).toMatchObject({ name: "AbortError" });
+    expect(progressEvents).toBe(0);
+    expect(afterModelCount).toBe(0);
+    expect(afterRunCount).toBe(1);
+    expect(agent.messages).toEqual([USER]);
+    expect(agent.streaming).toBe(false);
+  });
+
+  test("records a successful tool result even if cancellation precedes afterToolUse", async () => {
+    const probe = defineProbeProvider([TOOL_CALL, FINAL]);
+    let toolCalls = 0;
+    const hookResults: unknown[] = [];
+    let afterRunCount = 0;
+    const agent = defineAgent({
+      provider: probe.provider,
+      middlewares: [{
+        afterToolUse: async ({ toolResult }) => { hookResults.push(toolResult); },
+        afterAgentRun: async () => { afterRunCount += 1; },
+      }],
+      invoke: async () => {
+        toolCalls += 1;
+        // 模拟副作用已完成，取消请求恰好发生在返回成功结果之前。
+        agent.abort();
+        return "completed-before-cancel";
+      },
+    });
+
+    await expect(drain(agent)).rejects.toMatchObject({ name: "AbortError" });
+    expect(toolCalls).toBe(1);
+    expect(probe.callCount()).toBe(1);
+    expect(hookResults).toEqual(["completed-before-cancel"]);
+    expect(afterRunCount).toBe(1);
+    expect(agent.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+    const observation = agent.messages.find((message) => message.role === "tool");
+    expect(observation?.content[0]?.tool_use_id).toBe("call-1");
+    expect(observation?.content[0]?.content).toContain("completed-before-cancel");
+    expect(agent.streaming).toBe(false);
+  });
+
+  test("propagates an actually aborted tool instead of recording an ordinary failure", async () => {
+    const gate = defineHookGate();
+    const probe = defineProbeProvider([TOOL_CALL, FINAL]);
+    let afterToolUseCount = 0;
+    let afterRunCount = 0;
+    const agent = defineAgent({
+      provider: probe.provider,
+      middlewares: [{
+        afterToolUse: async () => { afterToolUseCount += 1; },
+        afterAgentRun: async () => { afterRunCount += 1; },
+      }],
+      invoke: async (signal) => {
+        if (!signal) throw new Error("Tool did not receive the run signal");
+        await gate.wait();
+        // 与上一例不同：执行确实因取消而失败，没有成功结果可发布。
+        signal.throwIfAborted();
+        return "unexpected";
+      },
+    });
+
+    await abortWhileHookWaits(agent, gate);
+    expect(probe.callCount()).toBe(1);
+    expect(afterToolUseCount).toBe(0);
+    expect(afterRunCount).toBe(1);
+    expect(agent.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    // 阶段 12 会为结果未知的动作保存 execution record；本阶段不伪造成功 observation。
+  });
+
 });
 ```
 
 </details>
 
-这里固定的标准语义是：Tool throw 先被规范化，再调用 `afterToolUse`；`afterAgentRun`
-在外层 `finally` 中调用一次。若你选择不同语义，必须同时修改说明和完整测试。
+这里固定的标准语义是：普通 Tool throw 先被规范化，再调用 `afterToolUse`；run signal 导致的 `ABORTED` 单独传播取消；`afterAgentRun`
+在外层 `finally` 中调用一次。
 
 最后执行本阶段的完整测试：
 
@@ -2656,7 +3094,7 @@ describe("Agent middleware", () => {
 bun test src/agent/__tests__/host-hooks.test.ts src/agent/__tests__/middleware.test.ts
 ```
 
-按本章给出的测试内容，预期为 **8 pass、0 fail**：2 项 host 聚焦测试，加上 6 项 Middleware 生命周期与策略测试。
+按本章给出的测试内容，预期为 **24 pass、0 fail**。
 
 ### 阶段后对照
 
@@ -2671,6 +3109,10 @@ bun test src/agent/__tests__/host-hooks.test.ts src/agent/__tests__/middleware.t
 - [ ] skip 不会破坏 transcript 协议；
 - [ ] hook 顺序由测试固定；
 - [ ] `host-hooks.test.ts` 的 2 项调用次数与合并结果测试通过；
+- [ ] 等待 hook 和恢复 `yield` 后能传播取消，不再发布最终回复或开启新工作；
+- [ ] 单个已完成 Tool 的结果不会因取消丢失，真正的 `ABORTED` 与普通失败分开处理；
+- [ ] progress 的接收和 `yield` 恢复边界有取消检查，异常和取消路径均完成必要收尾并复位状态；
+- [ ] `ADR-007` 记录并发取消尚未完整覆盖的边界，并明确阶段 12.0 的前置修复；
 - [ ] `ADR-007` 解释 Middleware 顺序和异常语义。
 
 ## 第二部分综合练习
@@ -2689,5 +3131,186 @@ bun run examples/runtime-demo.ts --abort-after 100
 - 并发 Tool 完成顺序；
 - Middleware 拒绝执行后的模型 observation；
 - abort 后资源清理。
+
+### 综合示例完整代码
+
+在**练习项目**中创建 `examples/runtime-demo.ts`，填入下面的代码。它复用阶段 3～6 的 Model、Agent 和 Middleware，不需要 API Key，也不发起网络请求。
+
+三个选项分别运行，不组合使用。不传参数就是正常 ReAct；`--abort-after` 从 `beforeAgentRun` 开始计时，单位是毫秒。示例 Tool 的等待支持 signal，并用 `finally` 模拟资源释放。
+
+<details>
+<summary>展开完整代码：<code>runtime-demo.ts</code></summary>
+
+```ts
+import assert from "node:assert/strict";
+import { setTimeout as delay } from "node:timers/promises";
+import { parseArgs } from "node:util";
+import { z } from "zod";
+
+import { Agent } from "@/agent/agent";
+import type { AssistantMessage, ToolUseContent } from "@/foundation/messages";
+import { Model, ScriptedModelProvider } from "@/foundation/models";
+import { defineTool } from "@/foundation/tools";
+
+const { values } = parseArgs({
+  args: Bun.argv.slice(2),
+  options: {
+    parallel: { type: "boolean", default: false },
+    deny: { type: "string" },
+    "abort-after": { type: "string" },
+  },
+  strict: true,
+  allowPositionals: false,
+});
+const abortAfter = values["abort-after"] === undefined
+  ? undefined
+  : Number(values["abort-after"]);
+if (abortAfter !== undefined && (!Number.isSafeInteger(abortAfter) || abortAfter < 0)) {
+  throw new Error("--abort-after 必须是非负整数毫秒数");
+}
+if (values.deny !== undefined && values.deny !== "get_weather") {
+  throw new Error("此示例仅支持 --deny get_weather");
+}
+if ([values.parallel, values.deny !== undefined, abortAfter !== undefined].filter(Boolean).length > 1) {
+  throw new Error("请分别运行三个选项，便于观察每一种场景");
+}
+
+let activeTools = 0;
+let invokedTools = 0;
+let afterRunCount = 0;
+let observedByModel = 0;
+let abortTimer: ReturnType<typeof setTimeout> | undefined;
+const completed: string[] = [];
+const observations: string[] = [];
+
+function defineDemoTool(name: string, milliseconds: number, result: string) {
+  return defineTool({
+    name,
+    description: "Return a fixed offline result",
+    parameters: z.object({ description: z.string() }),
+    invoke: async (_input, signal) => {
+      invokedTools += 1;
+      activeTools += 1;
+      console.log(`[tool:start] ${name}`);
+      try {
+        // 将 run signal 传给真正的异步操作，取消时不必等计时结束。
+        await delay(milliseconds, undefined, { signal });
+        completed.push(name);
+        console.log(`[tool:done] ${name}`);
+        return result;
+      } finally {
+        activeTools -= 1;
+        console.log(`[tool:cleanup] ${name}`);
+      }
+    },
+  });
+}
+
+const names = values.parallel ? ["get_weather", "get_time"] : ["get_weather"];
+const calls: ToolUseContent[] = names.map((name) => ({
+  type: "tool_use", id: `call-${name}`, name, input: { description: "演示离线工具调用" },
+}));
+const responses: AssistantMessage[] = [
+  { role: "assistant", content: calls },
+  {
+    role: "assistant",
+    content: [{ type: "text", text: values.deny ? "天气查询被拒绝。" : "离线工具调用完成。" }],
+  },
+];
+const agent = new Agent({
+  prompt: "Run the offline demo",
+  model: new Model({ name: "scripted", provider: new ScriptedModelProvider({ responses }) }),
+  tools: [
+    defineDemoTool("get_weather", 300, "晴，26°C"),
+    defineDemoTool("get_time", 30, "12:00"),
+  ],
+  middlewares: [{
+    beforeAgentRun: async () => {
+      if (abortAfter !== undefined) {
+        abortTimer = setTimeout(() => {
+          console.log("[run:abort-requested]");
+          agent.abort();
+        }, abortAfter);
+      }
+    },
+    beforeModel: async ({ modelContext }) => {
+      // 第二次模型调用必须能读到 observation，包括被拒绝的 Tool。
+      observedByModel = modelContext.messages.filter((message) => message.role === "tool").length;
+      console.log(`[model:observations] ${observedByModel}`);
+    },
+    beforeToolUse: async ({ toolUse }) => {
+      if (toolUse.name === values.deny) {
+        console.log(`[tool:denied] ${toolUse.name}`);
+        return { __skip: true, result: { error: "Denied by demo middleware" } };
+      }
+    },
+    afterAgentRun: async () => {
+      afterRunCount += 1;
+      console.log("[run:cleanup]");
+    },
+  }],
+});
+
+let aborted = false;
+try {
+  for await (const event of agent.stream({ role: "user", content: [{ type: "text", text: "运行演示" }] })) {
+    if (event.type !== "message") continue;
+    if (event.message.role === "tool") {
+      for (const result of event.message.content) {
+        observations.push(result.tool_use_id);
+        console.log(`[observation] ${result.tool_use_id}: ${result.content}`);
+      }
+    } else {
+      console.log(`[assistant] ${JSON.stringify(event.message.content)}`);
+    }
+  }
+} catch (error) {
+  // 只吞掉预期取消；实现错误继续抛出，让命令失败。
+  if (!(error instanceof Error) || error.name !== "AbortError") throw error;
+  aborted = true;
+  console.log("[run:aborted]");
+} finally {
+  clearTimeout(abortTimer);
+  console.log(`[summary] activeTools=${activeTools}, afterRun=${afterRunCount}, streaming=${agent.streaming}`);
+}
+
+assert.equal(activeTools, 0);
+assert.equal(afterRunCount, 1);
+assert.equal(agent.streaming, false);
+if (!aborted) {
+  assert.equal(observedByModel, names.length);
+  assert.equal(observations.length, names.length);
+  assert.equal(invokedTools, values.deny ? 0 : names.length);
+  if (values.parallel) {
+    assert.deepEqual(completed, ["get_time", "get_weather"]);
+    assert.deepEqual(observations, ["call-get_time", "call-get_weather"]);
+  }
+}
+// ANSI 32m 设置绿色，0m 重置颜色，避免影响后续终端输出。
+console.log("\u001b[32m[check] passed\u001b[0m");
+```
+
+</details>
+
+### 运行与自查
+
+```bash
+bun run check:types
+bun run examples/runtime-demo.ts
+bun run examples/runtime-demo.ts --parallel
+bun run examples/runtime-demo.ts --deny get_weather
+bun run examples/runtime-demo.ts --abort-after 100
+```
+
+| 场景 | 应观察到的行为 |
+|---|---|
+| 不传参数 | assistant 发出 Tool call → 天气 observation → 第二次模型调用看到 1 条 observation → 最终回复 |
+| `--parallel` | 天气先出现在调用列表，但耗时更短的时间 Tool 先完成；observations 按 `get_time`、`get_weather` 的完成顺序记录 |
+| `--deny get_weather` | 输出 `tool:denied`，没有 `tool:start`；仍生成包含拒绝原因的 observation，第二次模型调用能看到它 |
+| `--abort-after 100` | 通常在天气 Tool 的 300ms 等待期间取消；输出 `tool:cleanup`、`run:cleanup` 和 `run:aborted`，不继续生成最终回复 |
+
+四种场景最后都应输出 `activeTools=0, afterRun=1, streaming=false` 和 `[check] passed`。机器调度可能让计时取消发生在更早的边界，因此取消位置的严格验收仍使用 6.5 的手动 gate 测试；若传入超过演示总耗时的取消时间，run 可以正常结束，`finally` 会清除尚未触发的 timer。
+
+这里的最终回复是预先编排的 scripted response，并不代表模型真的推理出了结果；`beforeModel` 打印的 observation 数量用于确认结果确实进入了下一次模型请求。示例中的断言检查基本结果、并发记录顺序和清理状态，不能替代 6.5 的完整回归测试，也不覆盖留到阶段 12.0 的并发取消边界。
 
 到这里，你已经具备一个可测试的通用 Agent runtime。下一部分才开始接真实模型和 Coding Agent。

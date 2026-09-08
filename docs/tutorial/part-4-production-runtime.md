@@ -832,10 +832,13 @@ bun test src/runtime/trace
 - 对结果未知的修改动作停止并请求人工决策；
 - 明确记录运行状态，而不是假装一定能自动恢复。
 
+**开始 checkpoint/resume 实现前，先完成下面的 12.0。** 阶段 6 保留的并发取消缺口，会让已完成副作用缺少 observation；若此时直接保存 checkpoint，恢复代码可能把它误判为需要重试的动作。
+
 创建文件：
 
 ```bash
 mkdir -p src/runtime/checkpoint/__tests__ src/runtime/replay/__tests__
+touch src/agent/__tests__/tool-cancellation-boundary.test.ts
 touch src/foundation/runtime/run-state.ts src/foundation/runtime/checkpoint-store.ts
 touch src/runtime/checkpoint/file-checkpoint-store.ts src/runtime/checkpoint/resume-run.ts
 touch src/foundation/runtime/fault-injector.ts src/foundation/runtime/agent-checkpoint.ts
@@ -851,6 +854,8 @@ touch src/runtime/replay/__tests__/replay.test.ts examples/stage-12-recovery.ts
 执行后新增结构如下：
 
 ```text
+src/agent/__tests__/
+└── tool-cancellation-boundary.test.ts  # 进入恢复实现前验证并发取消与迟到任务隔离
 src/foundation/runtime/
 ├── run-state.ts                       # 可恢复的 canonical state 契约
 ├── checkpoint-store.ts                # checkpoint 持久化接口
@@ -874,6 +879,126 @@ examples/
 ├── recovery-scenario.ts                # 实际执行计数器写入、中断与续跑
 └── stage-12-recovery.ts                # 演示故障注入、checkpoint 与恢复
 ```
+
+### 12.0 先补齐并发取消边界
+
+这一步承接[阶段 6 的已知边界](./part-2-agent-runtime.md)。先完善现有 `_act()` 的结果收集与关闭协议，再实现 12.1 以后的 checkpoint；到 12C 恢复并发时继续运行这里的回归测试，不能用暂时改成顺序执行来绕过验收。
+
+需要明确三个不同状态：
+
+- **执行中**：Tool 或 hook 尚未交付结果，不能认定副作用没有发生。
+- **结果已就绪**：完整 ToolMessage 已交给 runtime 的结果队列，但可能尚未追加到 transcript。
+- **已记录**：observation 已追加一次；接入 checkpoint 后，还要区分内存记录与持久化成功。
+
+建议让每个 run 拥有自己的 pending 集合、已完成结果队列和关闭状态。任务完成时只交付给本次 run 的结果队列，由统一的消费位置追加 transcript；`yield` 只负责展示，不应决定哪些已完成结果能够被保存。
+
+取消关闭按以下顺序设计：
+
+1. 停止启动新的模型请求和 Tool，将 signal 传给正在执行的可中止操作。
+2. 固定关闭边界，保存边界前已经交付给 runtime 的结果，每个 `tool_use_id` 最多追加一次。已取得结果但仍在执行必要 `afterToolUse` 收尾的任务，要在 ADR 中明确收尾策略；若无法确认结果，不得假装其副作用未发生。
+3. 不为所有未完成任务无限等待。为每个在途 Promise 保留 rejection handler，移除已不用的 abort listener，并按明确策略处理无法及时停止的任务。
+4. run 关闭后，迟到结果以及 Middleware 返回的更新不能再修改该 run 的 transcript/context；也不能进入下一次 run。需要 run 身份和写入开关，不能只依赖容易被新 run 重置的 `_streaming` 布尔值。
+5. 完成以上记录与隔离后，再执行最终 `afterAgentRun`、发 `run_end` 并复位运行状态。用户取消不等于进程崩溃；关闭边界之后才收到的未知副作用，在接入持久化后按 12.3/12.4 的 execution record 对账。
+
+目标文件：`src/agent/__tests__/tool-cancellation-boundary.test.ts`。先填入下面的回归：
+
+<details>
+<summary>展开首个回归用例：<code>tool-cancellation-boundary.test.ts</code></summary>
+
+```ts
+import { expect, test } from "bun:test";
+import { z } from "zod";
+
+import type { AssistantMessage, UserMessage } from "@/foundation/messages";
+import { Model } from "@/foundation/models/model";
+import type { ModelProvider } from "@/foundation/models/model-provider";
+import { defineTool } from "@/foundation/tools";
+
+import { Agent } from "../agent";
+
+test("records both ready tool results before cancellation cleanup", async () => {
+  const names = ["first", "second"];
+  let toolCalls = 0;
+  let afterToolCalls = 0;
+  let modelCalls = 0;
+  let afterRunCount = 0;
+  let idsSeenAtCleanup: string[] = [];
+  const call: AssistantMessage = {
+    role: "assistant",
+    content: names.map((name) => ({
+      type: "tool_use", id: name, name, input: { description: "verify parallel completion" },
+    })),
+  };
+  const provider: ModelProvider = {
+    async invoke(): Promise<AssistantMessage> {
+      modelCalls += 1;
+      return modelCalls === 1
+        ? structuredClone(call)
+        : { role: "assistant", content: [{ type: "text", text: "done" }] };
+    },
+    async *stream(params) { yield await this.invoke(params); },
+  };
+  const agent = new Agent({
+    model: new Model({ name: "cancellation-probe", provider }),
+    prompt: "test",
+    tools: names.map((name) => defineTool({
+      name,
+      description: "Return a completed result",
+      parameters: z.object({ description: z.string() }),
+      invoke: async () => { toolCalls += 1; return `${name} completed`; },
+    })),
+    middlewares: [{
+      afterToolUse: async () => { afterToolCalls += 1; },
+      afterAgentRun: async ({ agentContext }) => {
+        afterRunCount += 1;
+        // 验证结果在最终收尾前已记录，而不是 run 结束后才由后台任务补写。
+        idsSeenAtCleanup = agentContext.messages
+          .filter((message) => message.role === "tool")
+          .flatMap((message) => message.content.map((content) => content.tool_use_id));
+      },
+    }],
+  });
+  const user: UserMessage = { role: "user", content: [{ type: "text", text: "run" }] };
+  const run = (async () => {
+    for await (const event of agent.stream(user)) {
+      if (event.type === "message" && event.message.role === "tool") {
+        // 两个动作和它们的结果 hooks 均已完成，才触发本例的取消边界。
+        expect(toolCalls).toBe(2);
+        expect(afterToolCalls).toBe(2);
+        agent.abort();
+      }
+    }
+  })();
+
+  await expect(run).rejects.toMatchObject({ name: "AbortError" });
+  expect(modelCalls).toBe(1);
+  expect(afterRunCount).toBe(1);
+  expect(idsSeenAtCleanup).toHaveLength(2);
+  expect(new Set(idsSeenAtCleanup)).toEqual(new Set(names));
+  expect(agent.messages.filter((message) => message.role === "tool")).toHaveLength(2);
+  expect(agent.streaming).toBe(false);
+});
+```
+
+</details>
+
+在阶段 6 的基础 pending-set 实现上，这个用例预期失败：两个 Tool 都完成，但通常只有第一条 observation 被保存。修复后它必须通过，不能通过让消费者忽略取消或重新执行 Tool 来凑齐结果。
+
+还必须在同一文件补齐下面两项用例。使用阶段 6 的手动 Promise gate 控制时序；测试中只给“是否能结束”设置宽松超时兜底，并在 `finally` 释放 gate，避免失败后遗留悬挂任务。
+
+| 必补用例 | 如何构造 | 断言 |
+|---|---|---|
+| 一个结果完成，另一个 Tool 不响应 signal | fast Tool 返回结果；slow Tool 等待手动 gate；收到 fast observation 后取消，先等 run 结束，再释放 slow | fast observation 恰好一条；不无限等待 slow；最终收尾一次；slow 迟到后不再调用会修改状态的 hook，不改变已关闭 run 或新 run |
+| 取消时仍有 `beforeToolUse` 等待 | 一个 Tool 已完成；另一个 Tool 的 `beforeToolUse` 等 gate，释放后返回 `{ prompt: "late update" }` | 取消结束后释放 gate，真实 Tool 执行次数仍为 0；迟到的返回值未合并进 context；没有未处理的 Promise rejection |
+
+运行并通过这三项回归后，再继续 12.1：
+
+```bash
+bun test src/agent/__tests__/tool-cancellation-boundary.test.ts
+bun test src/agent/__tests__/host-hooks.test.ts src/agent/__tests__/middleware.test.ts
+```
+
+在 `ADR-013` 写明：结果何时算“已交付”、取消关闭边界如何确定、迟到任务如何隔离、无法确定结果的动作如何转为 unknown。通过内存队列测试不代表结果已经耐受进程崩溃；后续仍必须实现 intent、原子 checkpoint 和恢复对账。
 
 ### 12.1 RunState schema
 
@@ -1120,11 +1245,14 @@ private async *_run(options: {
   try {
     if (options.userMessage) {
       this._context.messages.push(options.userMessage);
+      signal.throwIfAborted();
       await this._beforeAgentRun();
+      signal.throwIfAborted();
     }
     yield* this._runSteps(options.nextStep, signal);
   } catch (error) {
     if (!(error instanceof InjectedCrashError) && this._checkpoint) {
+      // _act 必须先完成 12.0 的结果回收和关闭隔离，再把取消向外抛出。
       this._checkpoint.state.status = signal.aborted ? "aborted" : "failed";
       await this._saveCheckpoint();
     }
@@ -1157,23 +1285,29 @@ private async *_runSteps(startStep: number, signal: AbortSignal): AsyncGenerator
       if (!toolUses.length) throw new Error("Acting checkpoint has no tool calls");
     } else {
       await this._beforeAgentStep(step);
+      signal.throwIfAborted();
       await this._setCheckpointPhase("thinking", step);
+      signal.throwIfAborted();
       const assistant = yield* this._think(signal);
       signal.throwIfAborted();
       await this._afterModel(assistant);
+      signal.throwIfAborted();
       this._context.messages.push(assistant);
       toolUses = this._extractToolUses(assistant);
       this._planToolExecutions(toolUses);
       await this._setCheckpointPhase(toolUses.length ? "acting" : "idle", step,
         toolUses.length ? "running" : "completed");
+      signal.throwIfAborted();
       this._checkpoint?.faultInjector?.hit("after_model");
       yield { type: "message", message: assistant };
+      signal.throwIfAborted();
       if (!toolUses.length) return;
     }
     yield* this._act(toolUses, signal);
-    signal.throwIfAborted();
     await this._afterAgentStep(step);
+    signal.throwIfAborted();
     await this._setCheckpointPhase("idle", step + 1);
+    signal.throwIfAborted();
   }
   throw new MaximumStepsError({ maxSteps: this.maxSteps });
 }
@@ -1229,8 +1363,13 @@ crash 可以补回消息，已经追加的消息不会出现两次。进入下�
 
 保存时复制 `{ ...state, prompt: this._context.prompt, messages: this._context.messages }`，
 不能让旧数组快照覆盖新 transcript。12C 再保留并发 `_act`：record 更新和 save 的入队顺序
-固定，save 队列不得吞掉失败。模拟 crash 后设置共享停止标志、abort 并等待同批任务清理，
-停止后禁止其他任务再写 checkpoint；真正的进程崩溃测试则由外部进程终止。
+固定，save 队列不得吞掉失败。模拟 crash 后设置共享停止标志、abort，并等待可中止任务完成清理；
+无法及时停止的任务按 12.0 隔离，不能无限等待。停止后禁止其他任务再写 checkpoint；
+真正的进程崩溃测试则由外部进程终止。
+
+12C 必须继续遵守 12.0 的关闭边界：先收集边界内已经交付的结果，再串行完成对应 execution record、observation 与 checkpoint 写入，最后保存 run 的取消状态并关闭写入口。对无法等待完成的任务，保持其结果未知；不能把“收到 abort”直接记为副作用未发生。已排队的合法最终写入与关闭后新到达的写入要区分处理，不能让关闭标志反而丢弃已确认结果。
+
+在 `recovery-integration.test.ts` 增加并发取消后续跑用例：两个写入 Tool 各更新一个计数器，确认两个结果都已交付后，在收到第一条 Tool observation 时取消；检查已持久化的两个结果各有一条关联 observation。再 resume，两个计数器仍各为 1，不重新调用已完成 Tool，也不重新生成这一批 Tool calls。使用同样的 call id 重复对账，不增加第三条 observation。这是将 12.0 的内存保证接到真实恢复链路上的验证。
 
 #### 恢复决策与 observation 对账
 
@@ -1990,11 +2129,15 @@ describe("replayTrace", () => {
 最后执行本阶段的完整测试：
 
 ```bash
-bun test src/runtime/checkpoint src/runtime/replay
+bun test src/agent/__tests__/tool-cancellation-boundary.test.ts src/runtime/checkpoint src/runtime/replay
 ```
 
 ### 验收
 
+- [ ] 先通过 12.0 的三项并发取消/迟到任务隔离测试，再接入 checkpoint；
+- [ ] 取消时已交付结果各记录一次，关闭后旧任务不再修改 context、transcript 或 checkpoint；
+- [ ] 并发取消后 resume 不重复已完成副作用，计数器和 observation 去重断言通过；
+- [ ] 阶段 6 的 24 项回归在恢复改造后仍通过；
 - [ ] checkpoint 原子写入；
 - [ ] schema 有 version；
 - [ ] Tool intent 在副作用前持久化；
