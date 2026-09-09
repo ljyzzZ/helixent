@@ -76,10 +76,23 @@ Agent 使用统一的 `Message` 类型记录对话，OpenAI SDK 则使用自己�
 | `convertToOpenAITools` | `Tool[]` | SDK 的 function Tool definitions |
 | `parseOpenAIAssistantMessage` | SDK assistant response 与 usage | canonical `AssistantMessage` |
 
-消息转换保留对话顺序，并将 assistant 的正文、思考内容和工具调用分别映射到 `content`、
-`reasoning_content` 和 `tool_calls`。本节的 adapter 支持 `reasoning_content` 扩展字段：
-接收响应时将它解析为 canonical `thinking`，发送历史消息时再写回该字段。下面的扩展类型
-用于声明这项 endpoint 协议。
+本节基于 OpenAI Chat Completions 实现消息转换，并支持 `reasoning_content` 扩展。
+assistant 的正文、思考内容和工具调用分别映射到 `content`、`reasoning_content` 和
+`tool_calls`，转换时保持原始对话记录不变。
+
+以下对两个特殊字段作出说明：
+
+- `reasoning_content` 是第三方扩展字段，DeepSeek 和 Qwen 等思考模式都使用它。
+  本节适配为：接收时解析为 canonical `thinking`，流式调用时累积片段，发送历史消息时写回该字段。
+
+  这是厂商扩展字段，不属于 OpenAI 官方 Chat Completions 协议，因此 SDK 的标准类型中没有对应声明。本节通过扩展类型补充声明，实际是否支持由所接入的 endpoint 决定。
+
+  真实接入时需核对具体 endpoint、模型和模式的历史回传规则。参见 [Qwen 深度思考](https://www.alibabacloud.com/help/zh/model-studio/deep-thinking) 和 [DeepSeek Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode/)。
+- 而在 SDK 的字段中有一个 `refusal` 字段是 OpenAI 官方的拒绝答复字段，非流式响应使用 `message.refusal`，流式响应使用
+  `delta.refusal`。本项目暂未适配；当响应只有 refusal、没有正文和工具调用时，
+  当前转换会得到空的 content 数组，读者可自行增加拒绝文本的保存与展示。
+  参见 [Chat Completions 响应](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)
+  和 [流式事件](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)。
 
 目标文件：`src/community/openai/utils.ts`
 
@@ -431,11 +444,48 @@ bun test src/community/openai/__tests__/utils.test.ts
 
 目标文件：`src/community/openai/model-provider.ts`
 
+上一节的转换函数只处理数据格式。本节把它们与 SDK 调用连接起来，让 `invoke` 接收一次
+模型调用的参数，发出请求，再返回 canonical `AssistantMessage`。
+
+调用链是 `Model.invoke(context) → provider.invoke(params)`。`Model` 会把模型名称、
+模型 options 和本轮上下文整理为 `ModelProviderInvokeParams`：
+
+| 参数 | 来源与用途 |
+|---|---|
+| `model` | `Model.name`，指定 endpoint 上要调用的模型 |
+| `messages` | `Model` 将 prompt（如果有）和对话历史组成的 canonical 消息数组 |
+| `tools` | 本轮允许模型选择的工具，由上下文提供；可省略 |
+| `options` | 创建 `Model` 时传入的模型参数，如 `temperature`、`max_tokens` |
+| `signal` | 本轮上下文的取消信号，用来中止正在进行的请求；可省略 |
+
+下面是项目的组织方式：`_baseChatCompletionParams` 构造请求体，`toTokenUsage` 转换
+用量字段，`invoke` 负责串起整个流程。两个辅助函数提供完整实现，按三个 TODO 完成 `invoke`。
+
 ```ts
 import OpenAI from "openai";
+import type { ChatCompletionCreateParamsNonStreaming } from "openai/resources";
 
-import type { AssistantMessage } from "@/foundation/messages";
+import type { AssistantMessage, TokenUsage } from "@/foundation/messages";
 import type { ModelProvider, ModelProviderInvokeParams } from "@/foundation/models";
+
+import {
+  convertToOpenAIMessages,
+  convertToOpenAITools,
+  parseOpenAIAssistantMessage,
+} from "./utils";
+
+function toTokenUsage(usage?: {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}): TokenUsage | undefined {
+  if (!usage) return undefined;
+  return {
+    promptTokens: usage.prompt_tokens ?? 0,
+    completionTokens: usage.completion_tokens ?? 0,
+    totalTokens: usage.total_tokens ?? 0,
+  };
+}
 
 export class OpenAIModelProvider implements ModelProvider {
   private readonly _client: OpenAI;
@@ -449,7 +499,11 @@ export class OpenAIModelProvider implements ModelProvider {
   }
 
   async invoke(params: ModelProviderInvokeParams): Promise<AssistantMessage> {
-    // TODO 1：构造 request → client.chat.completions.create → parse；透传 signal。
+    // TODO 1：调用 this._baseChatCompletionParams(params)，得到 SDK 请求体 request。
+    // TODO 2：await this._client.chat.completions.create(request, { signal: params.signal })，
+    // 将完整 SDK 响应保存为 response。
+    // TODO 3：将 response.choices[0]!.message 和 toTokenUsage(response.usage)
+    // 传给 parseOpenAIAssistantMessage，并返回转换结果。
     throw new Error("TODO: implement OpenAIModelProvider.invoke");
   }
 
@@ -457,23 +511,71 @@ export class OpenAIModelProvider implements ModelProvider {
     // 7A 先保留接口；7B 再接入 StreamAccumulator 并实现累计 snapshot。
     throw new Error("TODO: implement OpenAIModelProvider.stream in 7B");
   }
+
+  private _baseChatCompletionParams({
+    model,
+    messages,
+    tools,
+    options,
+  }: ModelProviderInvokeParams): ChatCompletionCreateParamsNonStreaming {
+    return {
+      model,
+      messages: convertToOpenAIMessages(messages),
+      tools: tools ? convertToOpenAITools(tools) : undefined,
+      temperature: 0,
+      ...options,
+    };
+  }
 }
 ```
 
-默认使用确定性更强的 provider options，并允许调用方最后覆盖：
+先看 TODO 1。`_baseChatCompletionParams` 是类内部的辅助方法，参数中的
+`{ model, messages, tools, options }` 是对象解构，从传入的 `params` 中取出这些字段。
+方法里的 `return` 返回 SDK 请求体，因此只构造数据，不会发送请求。各字段的处理方式如下：
 
-```ts
-return {
-  model,
-  messages: convertToOpenAIMessages(messages),
-  tools: tools ? convertToOpenAITools(tools) : undefined,
-  temperature: 0,
-  top_p: 0,
-  ...options,
-};
-```
+- `model` 原样传入，告诉 endpoint 使用哪个模型。
+- `messages` 调用上一节的 `convertToOpenAIMessages`，将 canonical 消息转成 SDK 格式。
+- `tools` 有传入时调用 `convertToOpenAITools`，生成工具名称、描述和参数 schema；未传入时
+  保持 `undefined`。这里传递工具定义，工具的实际执行仍由 Agent 负责。
+- `temperature: 0` 保留默认模型参数。末尾的 `...options` 将调用方传入的参数展开
+  到同一个对象中；同名字段以后面的值为准。例如 `options` 中设置 `temperature: 0.6`，
+  最终请求就使用 `0.6`；其他字段也按原项目的方式原样合并。
 
-不要在日志、trace 或测试 snapshot 中记录 API key。
+TODO 2 才发出请求。`this._client` 是构造函数中保存的 SDK client，已经持有 `baseURL`
+和 `apiKey`。SDK 按 API 资源组织入口，`chat.completions.create` 可以逐层理解：
+
+| 层级 | 含义 |
+|---|---|
+| `chat` | client 上的聊天 API 分组 |
+| `completions` | 该分组下负责根据对话消息生成模型回复的资源 |
+| `create(...)` | 向这个资源提交一次生成请求 |
+
+前两层是对象属性，真正调用的方法是末尾的 `create()`。本项目每轮都会提交 `messages`
+和可选的 `tools`，让模型生成下一条回复或工具调用；这正是 Chat Completions API 的职责，
+因此使用 SDK 中对应的入口。`create` 底层发出 `POST /chat/completions`；使用官方
+`baseURL` 时，请求地址是 `https://api.openai.com/v1/chat/completions`，配置兼容服务的
+`baseURL` 时则发往该服务。参见 [Create chat completion](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
+
+可以在编辑器中对 `create` 使用“转到定义”，沿着参数类型和返回类型阅读 SDK。
+本小节关注 `ChatCompletionCreateParamsNonStreaming`：它描述非流式请求体，
+对应的返回值经过 `await` 后是 `ChatCompletion`，其中包含下一步要处理的 `choices` 和 `usage`。
+
+`chat.completions.create` 的第一个参数是上一步的请求体，第二个参数是 SDK
+的请求控制选项。把 `params.signal` 放在第二个参数中，调用方取消操作时，SDK 就能中止请求；
+它不属于模型要读取的 JSON 数据。`await` 等待这次非流式调用完成，得到完整响应。
+
+这里的 `params.options` 用于设置模型参数，与构造函数中的连接配置、SDK 第二个参数中的
+请求控制选项用途不同。API key 由 SDK 用于鉴权，不应写入消息、日志或测试 snapshot。
+
+最后完成 TODO 3。SDK 响应中的 `choices` 保存候选回复；本项目取第一项的 `message`，
+交给 `parseOpenAIAssistantMessage`，继续使用上一节已经实现的正文、thinking 和工具调用解析。
+代码中的 `!` 是 TypeScript 非空断言：这里沿用项目取首项回复的约定，它本身不做运行时校验。
+
+`usage` 位于 SDK 响应的顶层，需要先经 `toTokenUsage` 转成 canonical 字段：
+`prompt_tokens → promptTokens`、`completion_tokens → completionTokens`、
+`total_tokens → totalTokens`。整个 `usage` 缺省时保留 `undefined`；存在时，个别缺省字段按
+原项目取 `0`。把转换后的 usage 作为解析函数的第二个参数，`invoke` 最终就能返回同时包含
+消息内容与用量的 `AssistantMessage`。
 
 本小节只完成 `invoke`。`stream` 保留显式报错的占位实现，进入 7B 后再补齐；
 `index.ts` 导出 `OpenAIModelProvider`。
@@ -522,7 +624,6 @@ describe("OpenAIModelProvider", () => {
     expect(request).toMatchObject({
       model: "test-model",
       temperature: 0.25,
-      top_p: 0,
     });
     expect(sdkSignal).toBe(controller.signal);
     expect(result).toMatchObject({
@@ -560,13 +661,24 @@ touch src/community/openai/__tests__/stream-accumulator.test.ts
 目标文件：`src/community/openai/stream-accumulator.ts`
 
 定义 provider-local accumulator。文本 delta 分支是标准实现示例；thinking、Tool fragment
-和 usage 分别保留为独立 TODO，不能共享可变字符串。
+和 usage 分别保留为独立 TODO，每个 Tool call 按 index 分别累计参数。
+
+`_toolCalls` 保存拼接中的 `argumentsText`，而 `ToolUseContent` 要求解析后的 `input`。
+在 `snapshot()` 中完成这次转换：先加入非空 thinking、正文，再按 Tool call index 从小到大
+加入工具调用。`AssistantMessageContent` 本身就是数组类型，可以逐个 `push` 内容块；
+不能只给内部记录补上 `type`，也不要把整个工具数组作为一个元素加入 `content`。
+
+参数可能分多次到达，例如 `'{"path":"/tmp/'` 和 `'demo"}'`。沿用原项目的处理方式：
+没有收到 usage 时，暂不输出 JSON 尚不能解析的工具调用，但其他已完整的调用仍可输出；
+参数拼接完整后，下一次快照就能包含它。收到 usage 后，仍解析失败的调用以 `input: {}`
+兜底。本实现以 usage 是否存在判断这一阶段，不以 token 数量是否大于零判断；
+这依赖下一节请求末尾用量的约定，未收到 usage 时不会仅因调用 `snapshot()` 而进入兜底。
 
 <details>
 <summary>展开完整代码：<code>stream-accumulator.ts</code></summary>
 
 ```ts
-import type { AssistantMessage, TokenUsage } from "@/foundation/messages";
+import type { AssistantMessage, AssistantMessageContent, TokenUsage } from "@/foundation/messages";
 
 export interface ProviderChunk {
   textDelta?: string;
@@ -601,8 +713,12 @@ export class StreamAccumulator {
   }
 
   snapshot(): AssistantMessage {
-    // TODO 4：按稳定顺序构造完整 content 数组；argumentsText 不完整时暂用 {}。
-    // TODO 5：返回新对象和新数组，调用方修改 snapshot 不能污染 accumulator。
+    const content: AssistantMessageContent = [];
+    // TODO 4：按 thinking、text、Tool call 的顺序构造 content，省略空文本块。
+    // 提示：Map 的插入顺序不等于 index 顺序；排序时需要保留 entries() 中的 index。
+    // TODO 5：将 argumentsText 解析为 input，显式构造 tool_use 内容块。
+    // 提示：解析失败时，未收到 usage 则跳过该调用，收到 usage 后才以 {} 兜底。
+    // TODO 6：返回独立快照；内容块、嵌套 input 和 usage 都不能暴露内部可变引用。
     throw new Error("TODO: implement StreamAccumulator.snapshot");
   }
 }
@@ -624,15 +740,50 @@ SDK chunk 到这个类型的转换留在 `model-provider.ts`，不要让 SDK typ
 ```ts
 import { describe, expect, test } from "bun:test";
 
+import type { AssistantMessageContent, ToolUseContent } from "@/foundation/messages";
+
 import { StreamAccumulator } from "../stream-accumulator";
 
 describe("OpenAI StreamAccumulator", () => {
+  test("omits empty content and leaves absent usage undefined", () => {
+    const accumulator = new StreamAccumulator();
+    expect(accumulator.snapshot().content).toEqual([]);
+    accumulator.push({});
+    accumulator.push({ textDelta: "", thinkingDelta: "" });
+
+    expect(accumulator.snapshot().role).toBe("assistant");
+    expect(accumulator.snapshot().content).toEqual([]);
+    expect(accumulator.snapshot().usage).toBeUndefined();
+  });
+
+  test("accumulates thinking and emits thinking before text and tools", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({
+      textDelta: "answer",
+      thinkingDelta: "think",
+      toolCall: { index: 0, id: "a", name: "read_file", argumentsDelta: "{}" },
+    });
+    const first = accumulator.snapshot();
+    accumulator.push({ thinkingDelta: " more", textDelta: "!" });
+
+    expect(first.content).toEqual([
+      { type: "thinking", thinking: "think" },
+      { type: "text", text: "answer" },
+      { type: "tool_use", id: "a", name: "read_file", input: {} },
+    ]);
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "thinking", thinking: "think more" },
+      { type: "text", text: "answer!" },
+      { type: "tool_use", id: "a", name: "read_file", input: {} },
+    ]);
+  });
+
   test("accumulates text and usage into independent snapshots", () => {
     const accumulator = new StreamAccumulator();
-    accumulator.push({ textDelta: "hel" } as never);
+    accumulator.push({ textDelta: "hel" });
     const first = accumulator.snapshot();
-    accumulator.push({ textDelta: "lo" } as never);
-    accumulator.push({ usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } } as never);
+    accumulator.push({ textDelta: "lo" });
+    accumulator.push({ usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } });
 
     expect(first.content).toEqual([{ type: "text", text: "hel" }]);
     expect(accumulator.snapshot()).toMatchObject({
@@ -644,32 +795,141 @@ describe("OpenAI StreamAccumulator", () => {
   test("joins fragmented JSON without mixing concurrent tool calls", () => {
     const accumulator = new StreamAccumulator();
     accumulator.push({
-      toolCall: { index: 1, id: "b", name: "read_file", argumentsDelta: '{"path":"b' },
-    } as never);
+      toolCall: { index: 10, id: "a", name: "read_file", argumentsDelta: '{"path":"b' },
+    });
     accumulator.push({
-      toolCall: { index: 0, id: "a", name: "read_file", argumentsDelta: '{"path":"/tmp/' },
-    } as never);
-    accumulator.push({ toolCall: { index: 1, argumentsDelta: '.ts"}' } } as never);
-    accumulator.push({ toolCall: { index: 0, argumentsDelta: 'demo","line":1}' } } as never);
+      toolCall: { index: 2, id: "z", name: "read_file", argumentsDelta: '{"path":"/tmp/' },
+    });
+    accumulator.push({ toolCall: { index: 10, argumentsDelta: '.ts"}' } });
+    accumulator.push({ toolCall: { index: 2, argumentsDelta: 'demo","line":1}' } });
 
     expect(accumulator.snapshot().content).toEqual([
       {
         type: "tool_use",
-        id: "a",
+        id: "z",
         name: "read_file",
         input: { path: "/tmp/demo", line: 1 },
       },
-      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+      { type: "tool_use", id: "a", name: "read_file", input: { path: "b.ts" } },
     ]);
   });
 
   test("does not expose mutable accumulator state", () => {
     const accumulator = new StreamAccumulator();
-    accumulator.push({ textDelta: "safe" } as never);
+    accumulator.push({ textDelta: "safe" });
     const snapshot = accumulator.snapshot();
     snapshot.content.splice(0);
 
     expect(accumulator.snapshot().content).toEqual([{ type: "text", text: "safe" }]);
+  });
+
+  test("withholds only incomplete calls and exposes them once JSON is complete", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({
+      toolCall: { index: 1, id: "b", name: "read_file", argumentsDelta: '{"path":"b.ts"}' },
+    });
+    accumulator.push({
+      toolCall: { index: 0, id: "a", name: "read_file", argumentsDelta: '{"path":"/tmp/' },
+    });
+    const partial = accumulator.snapshot();
+    expect(partial.content).toEqual([
+      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+    ]);
+    expect(accumulator.snapshot().content).toEqual(partial.content);
+
+    accumulator.push({ toolCall: { index: 0, argumentsDelta: 'demo"}' } });
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "tool_use", id: "a", name: "read_file", input: { path: "/tmp/demo" } },
+      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+    ]);
+    expect(partial.content).toEqual([
+      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+    ]);
+    expect(accumulator.snapshot().usage).toBeUndefined();
+  });
+
+  test("falls back only for invalid arguments after receiving usage, including zero usage", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ toolCall: { index: 2, id: "empty", name: "read_file" } });
+    accumulator.push({
+      toolCall: { index: 1, id: "broken", name: "read_file", argumentsDelta: '{"path":' },
+    });
+    accumulator.push({
+      toolCall: { index: 0, id: "valid", name: "read_file", argumentsDelta: '{"path":"a.ts"}' },
+    });
+    const valid: ToolUseContent = { type: "tool_use", id: "valid", name: "read_file", input: { path: "a.ts" } };
+    expect(accumulator.snapshot().content).toEqual([valid]);
+
+    accumulator.push({ usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } });
+    expect(accumulator.snapshot().content).toEqual([
+      valid,
+      { type: "tool_use", id: "broken", name: "read_file", input: {} },
+      { type: "tool_use", id: "empty", name: "read_file", input: {} },
+    ]);
+    expect(accumulator.snapshot().usage).toEqual({
+      promptTokens: 0, completionTokens: 0, totalTokens: 0,
+    });
+  });
+
+  test("merges metadata arriving after arguments and preserves it across later fragments", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ toolCall: { index: 3, argumentsDelta: '{"path":' } });
+    accumulator.push({ toolCall: { index: 3, id: "a", name: "read_file" } });
+    accumulator.push({ toolCall: { index: 3, id: "a", name: "read_file", argumentsDelta: '"a.ts"}' } });
+    accumulator.push({ toolCall: { index: 3, argumentsDelta: "" } });
+
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+    ]);
+  });
+
+  test("replaces usage when reported and preserves it when a chunk omits it", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ usage: { promptTokens: 3, completionTokens: 1, totalTokens: 4 } });
+    const first = accumulator.snapshot();
+    accumulator.push({ usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 } });
+    accumulator.push({});
+
+    expect(first.usage).toEqual({ promptTokens: 3, completionTokens: 1, totalTokens: 4 });
+    expect(accumulator.snapshot().usage).toEqual({
+      promptTokens: 3, completionTokens: 2, totalTokens: 5,
+    });
+  });
+
+  test("isolates content objects, nested tool input and usage between snapshots", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({
+      thinkingDelta: "think",
+      textDelta: "safe",
+      toolCall: {
+        index: 0, id: "a", name: "read_file",
+        argumentsDelta: '{"options":{"paths":["a.ts"]}}',
+      },
+      usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
+    });
+    const first = accumulator.snapshot();
+    const second = accumulator.snapshot();
+    for (const item of first.content) {
+      if (item.type === "thinking") item.thinking = "changed";
+      if (item.type === "text") item.text = "changed";
+      if (item.type === "tool_use") {
+        item.id = "changed";
+        item.name = "changed";
+        const options = item.input.options as { paths: string[] };
+        options.paths.push("changed.ts");
+      }
+    }
+    first.usage!.totalTokens = 999;
+
+    const expectedContent: AssistantMessageContent = [
+      { type: "thinking", thinking: "think" },
+      { type: "text", text: "safe" },
+      { type: "tool_use", id: "a", name: "read_file", input: { options: { paths: ["a.ts"] } } },
+    ];
+    expect(second.content).toEqual(expectedContent);
+    expect(accumulator.snapshot().content).toEqual(expectedContent);
+    expect(second.usage).toEqual({ promptTokens: 3, completionTokens: 2, totalTokens: 5 });
+    expect(accumulator.snapshot().usage).toEqual(second.usage);
   });
 });
 ```
@@ -680,20 +940,57 @@ describe("OpenAI StreamAccumulator", () => {
 bun test src/community/openai/__tests__/stream-accumulator.test.ts
 ```
 
-通过后应能观察到：旧 snapshot 不随后续 delta 改变；两个交错的 Tool call 不串线；
-调用方修改 snapshot 不会污染 accumulator。
+通过后应能观察到：thinking、正文和工具调用按约定顺序累计；交错的 Tool call 不串线；
+未完成参数在中途快照中暂不出现，收到 usage 后才对仍非法的参数兜底；修改旧 snapshot
+的内容块、嵌套参数或 usage，不会影响其他快照和后续输出。
 
 #### 7.2.2 接入 Provider.stream，并用 fake stream 验证
 
-目标文件：`src/community/openai/model-provider.ts`。补齐 7A 留下的 `stream` 方法：
+目标文件：`src/community/openai/model-provider.ts`。
+
+这里的 `stream` 是本项目的 `ModelProvider` 方法，底层仍调用 SDK 的
+`chat.completions.create`。非流式与流式都向同一个 API 提交对话并生成回复，区别在于
+服务端如何返回结果。设置 `stream: true` 后，服务端通过 SSE（Server-Sent Events）
+在一次响应中持续发送生成片段，SDK 负责把这些网络事件解析成 chunk 对象。
+
+| 调用方式 | 请求中的 `stream` | `await create(...)` 后得到什么 |
+|---|---|---|
+| 非流式 | 省略或 `false` | 一份完整的 `ChatCompletion`，读取 `choices[0].message` |
+| 流式 | `true` | `Stream<ChatCompletionChunk>`，通过 `for await...of` 逐个读取 chunk |
+
+流式路径中的 `await` 得到的是可异步迭代的流对象。之后的 `for await...of` 才持续等待并
+读取后续片段，每次循环消费同一次请求的数据。chunk 中通常是本次新增的 `delta`，而项目
+要求每次对外输出累计的 `AssistantMessage`，因此还需要上一节的 accumulator 保存状态。
+协议结构见 [Chat Completions 流式事件](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)。
+
+实现前，可以按以下顺序查看相关定义：
+
+1. SDK 的 `chat.completions.create` 重载：关注 `ChatCompletionCreateParamsStreaming` 中
+   的 `stream: true`，以及返回类型中的 `Stream<ChatCompletionChunk>`。
+2. SDK 的 `Stream`：它实现 `AsyncIterable`，所以能被 `for await...of` 消费。阅读
+   `[Symbol.asyncIterator]` 可了解迭代入口；本项目直接使用这个能力即可。
+3. SDK 的 `ChatCompletionChunk`：重点看 `choices[0]?.delta.content`、`delta.tool_calls`
+   和顶层 `usage`。工具参数也可能分片到达，需要按 call index 累积；`reasoning_content`
+   沿用 7.1.2 的厂商扩展声明。
+4. 本项目的 `StreamAccumulator.push` 与 `snapshot`：前者把新增片段写入累计状态，后者
+   构造当前完整消息。`yield` 是生成器语法，用来把 snapshot 交给调用 `provider.stream()`
+   的上层消费；它本身不负责请求模型或合并片段。
+
+理解这条数据流后，补齐 7A 留下的 `stream` 方法：
 
 1. 复用 `invoke` 的请求转换，调用 `chat.completions.create` 时设置 `stream: true`，
-   并通过第二个参数传入 `signal`。
-2. 为每次调用创建独立的 `StreamAccumulator`，把 SDK chunk 中的 text、thinking、Tool
+   并通过第二个参数传入 `signal`。原项目同时设置 `stream_options: { include_usage: true }`，
+   请求服务端在流结束前单独报告本次调用的用量。
+2. 为每次调用创建独立的 `StreamAccumulator`，通过 `for await...of` 读取 SDK 返回的流。
+   把 chunk 中的 text、thinking、Tool
    fragments 和 usage 转成 `ProviderChunk`，依次 `push`。
 3. 每次 `yield` 返回累计 snapshot。即使 chunk 的 `choices` 为空，也要处理其中的 usage。
-4. 流结束前确认 Tool arguments 已完整；最终仍非法时抛出带 call id 的错误，不能把临时
-   `{}` 当成最终 Tool input。最终 snapshot 与 `invoke` 的返回语义一致，不带临时 streaming 标记。
+4. 最终 Tool input 沿用 7.2.1 的处理规则：收到 usage 后，仍无法解析的参数以 `{}` 兜底。
+   这是原项目流式路径的现有行为，与非流式转换中解析失败时抛错的处理不同。
+
+`include_usage` 对应的末尾 chunk 可以没有候选回复，只携带用量数据，所以处理 usage
+不能依赖 `choices[0]` 存在。若流被中断，末尾用量可能不会到达；只有收到服务端报告后才更新
+累计 usage。参见 [stream_options 定义](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
 
 **对应测试**
 
@@ -781,7 +1078,7 @@ src/community/anthropic/
 ├── index.ts                       # 导出 AnthropicModelProvider
 └── __tests__/
     ├── utils.test.ts              # Anthropic 协议转换测试
-    ├── stream-accumulator.test.ts  # 内容顺序与 usage 测试
+    ├── stream-accumulator.test.ts  # 内容顺序、thinking 签名与 usage 测试
     └── model-provider.test.ts     # fake client 请求与响应测试
 ```
 
@@ -789,13 +1086,36 @@ src/community/anthropic/
 
 目标文件：`src/community/anthropic/utils.ts`
 
-实现 Anthropic 协议转换函数：
+Anthropic 的 `thinking` block 包含 `thinking` 文本和不透明的 `signature`。在 thinking
+伴随 Tool use 的对话中，返回 Tool result 时必须一并回传之前完整、未修改的 thinking block。
+即使文本为空，也要保留其签名。协议说明见 [Anthropic Thinking](https://platform.claude.com/docs/en/build-with-claude/thinking)。
+
+本节用 adapter 内部的 `_anthropicSignature` 保存签名，发送请求时还原为 SDK 的 `signature`。
+它随 canonical thinking block 保存在对话记录中，不需要修改 foundation 的类型。
+下面给出签名转换的辅助函数，其余转换按 TODO 完成：
 
 ```ts
 import Anthropic from "@anthropic-ai/sdk";
 
-import type { AssistantMessage, Message } from "@/foundation/messages";
+import type { AssistantMessage, Message, ThinkingContent } from "@/foundation/messages";
 import type { Tool } from "@/foundation/tools";
+
+export interface AnthropicThinkingContent extends ThinkingContent {
+  // 流式中间快照可能尚未收到签名。
+  _anthropicSignature?: string;
+}
+
+function parseAnthropicThinking(block: Anthropic.ThinkingBlock): AnthropicThinkingContent {
+  return { type: "thinking", thinking: block.thinking, _anthropicSignature: block.signature };
+}
+
+function convertToAnthropicThinking(item: ThinkingContent): Anthropic.ThinkingBlockParam {
+  const signature = (item as AnthropicThinkingContent)._anthropicSignature;
+  if (typeof signature !== "string" || signature.length === 0) {
+    throw new Error("MISSING_THINKING_SIGNATURE: cannot replay an unsigned thinking block");
+  }
+  return { type: "thinking", thinking: item.thinking, signature };
+}
 
 export function extractSystemPrompt(messages: Message[]): string | undefined {
   // TODO 1：只收集 system text，并用两个换行连接；没有 system 时返回 undefined。
@@ -806,6 +1126,7 @@ export function extractSystemPrompt(messages: Message[]): string | undefined {
 export function convertToAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
   // TODO 2：排除 system message，并把 Tool result 转成 user-role content。
   // 参数规则：保持原始消息及 content block 顺序，不修改 canonical messages。
+  // assistant thinking 分支调用 convertToAnthropicThinking，保留空 thinking 文本。
   throw new Error("TODO: implement convertToAnthropicMessages");
 }
 
@@ -816,6 +1137,7 @@ export function convertToAnthropicTools(tools: Tool[]): Anthropic.Tool[] {
 
 export function parseAnthropicAssistantMessage(message: Anthropic.Message): AssistantMessage {
   // TODO 4：解析 text、thinking、tool_use，并原样保存 Tool id 和 provider usage。
+  // thinking 分支调用 parseAnthropicThinking，将文本和签名一起存入 content。
   throw new Error("TODO: implement parseAnthropicAssistantMessage");
 }
 ```
@@ -831,9 +1153,11 @@ export function parseAnthropicAssistantMessage(message: Anthropic.Message): Assi
 
 ```ts
 import { describe, expect, test } from "bun:test";
+import type Anthropic from "@anthropic-ai/sdk";
 
 import type { Message } from "@/foundation/messages";
 
+import type { AnthropicThinkingContent } from "../utils";
 import {
   convertToAnthropicMessages,
   extractSystemPrompt,
@@ -854,28 +1178,76 @@ describe("Anthropic protocol conversion", () => {
     ]);
   });
 
-  test("keeps assistant text, thinking and multiple tool ids", () => {
-    const result = convertToAnthropicMessages([
+  test("round-trips thinking signatures and multiple tool calls without changing history", () => {
+    const content: Anthropic.ContentBlockParam[] = [
+      { type: "thinking", thinking: "plan", signature: "opaque-signature-a" },
+      { type: "text", text: "running" },
+      { type: "thinking", thinking: "verify", signature: "opaque-signature-b" },
+      { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+      { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+    ];
+    const response = {
+      role: "assistant", content, usage: { input_tokens: 8, output_tokens: 5 },
+    };
+    const originalResponse = structuredClone(response);
+    const assistant = parseAnthropicAssistantMessage(response as never);
+    const messages: Message[] = [assistant, {
+      role: "tool",
+      content: [
+        { type: "tool_result", tool_use_id: "a", content: "file A" },
+        { type: "tool_result", tool_use_id: "b", content: "file B" },
+      ],
+    }];
+    const originalMessages = structuredClone(messages);
+
+    expect(convertToAnthropicMessages(messages)).toEqual([
+      { role: "assistant", content },
       {
-        role: "assistant",
+        role: "user",
         content: [
-          { type: "thinking", thinking: "plan" },
-          { type: "text", text: "running" },
-          { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
-          { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
+          { type: "tool_result", tool_use_id: "a", content: "file A" },
+          { type: "tool_result", tool_use_id: "b", content: "file B" },
         ],
       },
     ]);
+    expect(response).toEqual(originalResponse);
+    expect(messages).toEqual(originalMessages);
+  });
 
-    expect(result[0]).toMatchObject({
+  test("preserves signed thinking even when its text is empty", () => {
+    const assistant = parseAnthropicAssistantMessage({
       role: "assistant",
-      content: [
-        { type: "thinking", thinking: "plan" },
-        { type: "text", text: "running" },
-        { type: "tool_use", id: "a" },
-        { type: "tool_use", id: "b" },
-      ],
-    });
+      content: [{ type: "thinking", thinking: "", signature: "opaque-empty-signature" }],
+      usage: { input_tokens: 1, output_tokens: 2 },
+    } as never);
+
+    const expected: AnthropicThinkingContent[] = [
+      { type: "thinking", thinking: "", _anthropicSignature: "opaque-empty-signature" },
+    ];
+    expect(assistant.content).toEqual(expected);
+    expect(convertToAnthropicMessages([assistant])).toEqual([
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "", signature: "opaque-empty-signature" }],
+      },
+    ]);
+  });
+
+  test("rejects replaying thinking without a signature", () => {
+    expect(() => convertToAnthropicMessages([{
+      role: "assistant",
+      content: [{ type: "thinking", thinking: "plan" }],
+    }])).toThrow("MISSING_THINKING_SIGNATURE");
+  });
+
+  test("keeps empty text blocks when parsing a response", () => {
+    const result = parseAnthropicAssistantMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "" }],
+      usage: { input_tokens: 1, output_tokens: 0 },
+    } as never);
+
+    expect(result.content).toEqual([{ type: "text", text: "" }]);
   });
 
   test("converts tool results into user-role content", () => {
@@ -908,7 +1280,7 @@ describe("Anthropic protocol conversion", () => {
     } as never);
 
     expect(result.content).toMatchObject([
-      { type: "thinking", thinking: "plan" },
+      { type: "thinking", thinking: "plan", _anthropicSignature: "signature" },
       { type: "text", text: "running" },
       { type: "tool_use", id: "a", input: { path: "a.ts" } },
     ]);
@@ -924,7 +1296,7 @@ bun test src/community/anthropic/__tests__/utils.test.ts
 ```
 
 通过后应确认：system 从消息中单独提取；Tool result 转成 user-role content；
-text、thinking、Tool id 与 usage 在转换中保留。
+text、thinking、Tool id 与 usage 在转换中保留；thinking 的文本和签名可以完整回传。
 
 #### 7.3.3 实现 StreamAccumulator，并运行事件累积测试
 
@@ -938,23 +1310,28 @@ import type { AssistantMessage } from "@/foundation/messages";
 
 export type ProviderChunk =
   | { type: "text_delta"; index: number; text: string }
+  | { type: "thinking_start"; index: number; thinking: string; signature: string }
   | { type: "thinking_delta"; index: number; thinking: string }
+  | { type: "signature_delta"; index: number; signature: string }
   | { type: "tool_start"; index: number; id: string; name: string }
   | { type: "input_json_delta"; index: number; partialJson: string }
   | { type: "message_start"; inputTokens: number }
   | { type: "message_end"; outputTokens: number };
 
 export class StreamAccumulator {
-  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态。
+  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态，thinking 包含 signature。
   // TODO 2：分别保存 input/output usage，message_end 后产生完整 TokenUsage。
 
   push(chunk: ProviderChunk): void {
     // TODO 3：按 chunk.type 分派；同一 index 的 partialJson 只能追加到同一 Tool。
+    // thinking_start 初始化文本和签名；thinking_delta 追加文本，signature_delta 更新签名。
     throw new Error("TODO: implement Anthropic StreamAccumulator.push");
   }
 
   snapshot(): AssistantMessage {
     // TODO 4：按 index 排序输出新 content 数组；不完整 Tool input 暂时使用 {}。
+    // thinking 输出 AnthropicThinkingContent（从 ./utils 导入），用 _anthropicSignature 保存签名。
+    // 保留文本为空的 thinking block；复制每个 block，后续 delta 不能改变旧 snapshot。
     throw new Error("TODO: implement Anthropic StreamAccumulator.snapshot");
   }
 }
@@ -962,7 +1339,8 @@ export class StreamAccumulator {
 
 这里的 `index` 表示一次响应内的 content block index。`partialJson` 只能追加到同一
 index 的 Tool；usage 只在 provider 明确报告时出现。SDK event 先在 `model-provider.ts`
-中转换为上面的 union，再交给 accumulator。
+中转换为上面的 union，再交给 accumulator。thinking block 在 start 时就要建立状态，
+随后将 `signature_delta.signature` 原样赋给对应 block 的签名；签名不参与文本拼接。
 
 **对应测试**
 
@@ -975,12 +1353,15 @@ index 的 Tool；usage 只在 provider 明确报告时出现。SDK event 先在 
 import { describe, expect, test } from "bun:test";
 
 import { StreamAccumulator } from "../stream-accumulator";
+import type { AnthropicThinkingContent } from "../utils";
 
 describe("Anthropic StreamAccumulator", () => {
   test("keeps block index order while accumulating deltas", () => {
     const accumulator = new StreamAccumulator();
     accumulator.push({ index: 1, type: "text_delta", text: "answer" } as never);
+    accumulator.push({ index: 0, type: "thinking_start", thinking: "", signature: "" });
     accumulator.push({ index: 0, type: "thinking_delta", thinking: "plan" } as never);
+    accumulator.push({ index: 0, type: "signature_delta", signature: "opaque-signature" });
     accumulator.push({
       index: 2,
       type: "tool_start",
@@ -990,11 +1371,48 @@ describe("Anthropic StreamAccumulator", () => {
     accumulator.push({ index: 2, type: "input_json_delta", partialJson: '{"path"' } as never);
     accumulator.push({ index: 2, type: "input_json_delta", partialJson: ':"a.ts"}' } as never);
 
+    const thinking: AnthropicThinkingContent = {
+      type: "thinking", thinking: "plan", _anthropicSignature: "opaque-signature",
+    };
     expect(accumulator.snapshot().content).toEqual([
-      { type: "thinking", thinking: "plan" },
+      thinking,
       { type: "text", text: "answer" },
       { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
     ]);
+  });
+
+  test("keeps signatures on their own blocks and leaves earlier snapshots unchanged", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ type: "thinking_start", index: 0, thinking: "first", signature: "" });
+    const first = accumulator.snapshot();
+    const originalFirst = structuredClone(first);
+    accumulator.push({ type: "signature_delta", index: 0, signature: "opaque-a" });
+    accumulator.push({ type: "thinking_start", index: 2, thinking: "second", signature: "opaque-b" });
+    accumulator.push({ type: "thinking_delta", index: 2, thinking: " plan" });
+
+    const final = accumulator.snapshot();
+    const expected: AnthropicThinkingContent[] = [
+      { type: "thinking", thinking: "first", _anthropicSignature: "opaque-a" },
+      { type: "thinking", thinking: "second plan", _anthropicSignature: "opaque-b" },
+    ];
+    expect(final.content).toEqual(expected);
+    expect(first).toEqual(originalFirst);
+    const originalFinal = structuredClone(final);
+    const thinking = final.content[0];
+    if (thinking?.type !== "thinking") throw new Error("Expected thinking");
+    thinking.thinking = "changed by caller";
+    expect(accumulator.snapshot()).toEqual(originalFinal);
+  });
+
+  test("keeps a signature-only thinking block without thinking deltas", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ type: "thinking_start", index: 0, thinking: "", signature: "" });
+    accumulator.push({ type: "signature_delta", index: 0, signature: "opaque-empty-signature" });
+
+    const expected: AnthropicThinkingContent[] = [
+      { type: "thinking", thinking: "", _anthropicSignature: "opaque-empty-signature" },
+    ];
+    expect(accumulator.snapshot().content).toEqual(expected);
   });
 
   test("combines input and output token usage", () => {
@@ -1018,7 +1436,7 @@ bun test src/community/anthropic/__tests__/stream-accumulator.test.ts
 ```
 
 通过后应确认：thinking、text 和 Tool 按 block index 输出，JSON fragments 正确拼接，
-输入与输出 tokens 合并为 canonical `TokenUsage`。
+签名保存在所属 thinking block，旧 snapshot 保持不变，输入与输出 tokens 合并为 canonical `TokenUsage`。
 
 #### 7.3.4 实现 Provider.invoke，并用 fake client 验证
 
@@ -1050,6 +1468,7 @@ export class AnthropicModelProvider implements ModelProvider {
   async *stream(params: ModelProviderInvokeParams): AsyncGenerator<AssistantMessage> {
     // TODO 4：复用请求转换，设置 stream=true，并透传 signal。
     // TODO 5：把 SDK events 转成 ProviderChunk，逐个 push，再 yield 累计 snapshot。
+    // thinking 的 content_block_start 与 signature_delta 都要转发，保留对应 index。
     // TODO 6：流结束时校验 Tool JSON 完整性，保留最终 usage。
     throw new Error("TODO: implement AnthropicModelProvider.stream");
   }
@@ -1136,7 +1555,7 @@ bun test src/community/anthropic/__tests__/model-provider.test.ts
 #### 7.3.5 接入 Provider.stream，并用 fake stream 验证
 
 目标文件：`src/community/anthropic/model-provider.ts`。现在补齐 `stream`，把 SDK 的
-text/thinking delta、Tool block start、JSON delta 和 usage
+text/thinking delta、thinking/Tool block start、signature delta、JSON delta 和 usage
 事件转换为本章的 `ProviderChunk`。每次调用使用独立 accumulator；最终 Tool JSON 非法时
 抛出带 call id 的错误。流中暂时不完整的 input 可以是 `{}`，最终结果不能静默保留这个占位值。
 
@@ -1149,7 +1568,7 @@ text/thinking delta、Tool block start、JSON delta 和 usage
 <summary>展开追加用例：Anthropic fake stream</summary>
 
 ```ts
-test("streams Anthropic events into cumulative text and final usage", async () => {
+test("streams signed thinking and replays it with tool results", async () => {
   let request: Record<string, unknown> | undefined;
   let sdkSignal: AbortSignal | undefined;
   const client = {
@@ -1157,6 +1576,13 @@ test("streams Anthropic events into cumulative text and final usage", async () =
       create: async (body: Record<string, unknown>, options: { signal?: AbortSignal }) => {
         request = body;
         sdkSignal = options.signal;
+        if (!body.stream) {
+          return {
+            id: "message-2", type: "message", role: "assistant", model: "test-model",
+            content: [{ type: "text", text: "done" }], stop_reason: "end_turn", stop_sequence: null,
+            usage: { input_tokens: 5, output_tokens: 1 },
+          };
+        }
         return (async function* () {
           yield {
             type: "message_start",
@@ -1168,20 +1594,42 @@ test("streams Anthropic events into cumulative text and final usage", async () =
           };
           yield {
             type: "content_block_start", index: 0,
-            content_block: { type: "text", text: "" },
+            content_block: { type: "thinking", thinking: "", signature: "" },
           };
           yield {
             type: "content_block_delta", index: 0,
-            delta: { type: "text_delta", text: "hel" },
+            delta: { type: "thinking_delta", thinking: "plan" },
           };
           yield {
             type: "content_block_delta", index: 0,
-            delta: { type: "text_delta", text: "lo" },
+            delta: { type: "signature_delta", signature: "opaque-stream-signature" },
           };
           yield { type: "content_block_stop", index: 0 };
           yield {
+            type: "content_block_start", index: 1,
+            content_block: { type: "text", text: "" },
+          };
+          yield {
+            type: "content_block_delta", index: 1,
+            delta: { type: "text_delta", text: "hel" },
+          };
+          yield {
+            type: "content_block_delta", index: 1,
+            delta: { type: "text_delta", text: "lo" },
+          };
+          yield { type: "content_block_stop", index: 1 };
+          yield {
+            type: "content_block_start", index: 2,
+            content_block: { type: "tool_use", id: "call-1", name: "read_file", input: {} },
+          };
+          yield {
+            type: "content_block_delta", index: 2,
+            delta: { type: "input_json_delta", partial_json: '{"path":"a.ts"}' },
+          };
+          yield { type: "content_block_stop", index: 2 };
+          yield {
             type: "message_delta",
-            delta: { stop_reason: "end_turn", stop_sequence: null },
+            delta: { stop_reason: "tool_use", stop_sequence: null },
             usage: { output_tokens: 2 },
           };
           yield { type: "message_stop" };
@@ -1192,25 +1640,55 @@ test("streams Anthropic events into cumulative text and final usage", async () =
   const controller = new AbortController();
   const provider = new AnthropicModelProvider({ client: client as never });
   const snapshots = [];
+  const options = { thinking: { type: "enabled", budget_tokens: 1024 } };
 
   for await (const snapshot of provider.stream({
     model: "test-model",
     messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+    options,
     signal: controller.signal,
   })) {
     snapshots.push(snapshot);
   }
 
-  expect(request).toMatchObject({ model: "test-model", stream: true });
+  expect(request).toMatchObject({ model: "test-model", stream: true, ...options });
   expect(sdkSignal).toBe(controller.signal);
   expect(snapshots.some((snapshot) =>
     snapshot.content.some((item) => item.type === "text" && item.text === "hel"),
   )).toBe(true);
-  expect(snapshots.at(-1)).toMatchObject({
+  const final = snapshots.at(-1);
+  if (!final) throw new Error("Expected a final snapshot");
+  expect(final).toMatchObject({
     role: "assistant",
-    content: [{ type: "text", text: "hello" }],
+    content: [
+      { type: "thinking", thinking: "plan", _anthropicSignature: "opaque-stream-signature" },
+      { type: "text", text: "hello" },
+      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+    ],
     usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
   });
+
+  await provider.invoke({
+    model: "test-model",
+    messages: [
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      final,
+      { role: "tool", content: [{ type: "tool_result", tool_use_id: "call-1", content: "file A" }] },
+    ],
+    options,
+  });
+  expect(request?.messages).toEqual([
+    { role: "user", content: [{ type: "text", text: "hello" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "plan", signature: "opaque-stream-signature" },
+        { type: "text", text: "hello" },
+        { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+      ],
+    },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "file A" }] },
+  ]);
 });
 ```
 
@@ -1218,6 +1696,8 @@ test("streams Anthropic events into cumulative text and final usage", async () =
 
 用例中的 SDK `message_delta.usage.output_tokens` 应映射到 normalized `message_end`；
 `message_stop` 自身没有 usage，不能因此把已累计的 tokens 清零。
+fake signature 只验证字段传递；真实请求中的签名必须来自 API 响应。流式快照可以暂缺签名，
+回传历史消息时应使用已收齐签名的最终结果。
 
 完成本章后运行：
 
