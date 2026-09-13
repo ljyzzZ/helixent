@@ -979,7 +979,7 @@ bun test src/community/openai/__tests__/stream-accumulator.test.ts
 理解这条数据流后，补齐 7A 留下的 `stream` 方法：
 
 1. 复用 `invoke` 的请求转换，调用 `chat.completions.create` 时设置 `stream: true`，
-   并通过第二个参数传入 `signal`。原项目同时设置 `stream_options: { include_usage: true }`，
+   并通过第二个参数传入 `signal`。**项目同时还需要设置 `stream_options: { include_usage: true }`**，
    请求服务端在流结束前单独报告本次调用的用量。
 2. 为每次调用创建独立的 `StreamAccumulator`，通过 `for await...of` 读取 SDK 返回的流。
    把 chunk 中的 text、thinking、Tool
@@ -995,7 +995,12 @@ bun test src/community/openai/__tests__/stream-accumulator.test.ts
 **对应测试**
 
 目标文件：`src/community/openai/__tests__/model-provider.test.ts`。保留 7A 的测试，
-在文件末尾追加下面的完整用例；沿用已有的 `test` 和 `OpenAIModelProvider` imports。
+在文件末尾追加下面的完整用例。
+这些用例直接向 Provider 输入 SDK 形状的 chunk，检查请求配置和转换后的累计消息，
+因此不能只靠 accumulator 的单元测试代替。
+
+<details>
+<summary>展开追加用例：<code>OpenAI fake stream</code></summary>
 
 ```ts
 test("streams cumulative snapshots and keeps usage-only chunks", async () => {
@@ -1032,7 +1037,11 @@ test("streams cumulative snapshots and keeps usage-only chunks", async () => {
     snapshots.push(snapshot);
   }
 
-  expect(request).toMatchObject({ model: "test-model", stream: true });
+  expect(request).toMatchObject({
+    model: "test-model",
+    stream: true,
+    stream_options: { include_usage: true },
+  });
   expect(sdkSignal).toBe(controller.signal);
   expect(snapshots[0]?.content).toEqual([{ type: "text", text: "hel" }]);
   expect(snapshots.at(-1)).toMatchObject({
@@ -1041,7 +1050,136 @@ test("streams cumulative snapshots and keeps usage-only chunks", async () => {
     usage: { promptTokens: 3, completionTokens: 2, totalTokens: 5 },
   });
 });
+
+test("accumulates reasoning_content separately from text", async () => {
+  const client = {
+    chat: {
+      completions: {
+        create: async () => (async function* () {
+          yield { choices: [{ index: 0, delta: { reasoning_content: "先分析" } }] };
+          yield {
+            choices: [{ index: 0, delta: { reasoning_content: "再回答", content: "hel" } }],
+          };
+          yield { choices: [{ index: 0, delta: { content: "lo" } }] };
+        })(),
+      },
+    },
+  };
+  const provider = new OpenAIModelProvider({ client: client as never });
+  const snapshots = [];
+
+  for await (const snapshot of provider.stream({ model: "test-model", messages: [] })) {
+    snapshots.push(snapshot);
+  }
+
+  expect(snapshots.map((snapshot) => snapshot.content)).toEqual([
+    [{ type: "thinking", thinking: "先分析" }],
+    [
+      { type: "thinking", thinking: "先分析再回答" },
+      { type: "text", text: "hel" },
+    ],
+    [
+      { type: "thinking", thinking: "先分析再回答" },
+      { type: "text", text: "hello" },
+    ],
+  ]);
+  expect(snapshots.at(-1)?.usage).toBeUndefined();
+});
+
+test("maps SDK function fields to tool name and input before usage arrives", async () => {
+  const client = {
+    chat: {
+      completions: {
+        create: async () => (async function* () {
+          yield {
+            choices: [{ index: 0, delta: { tool_calls: [{
+              index: 0,
+              id: "call-read",
+              type: "function",
+              function: { name: "read_file", arguments: '{"path":"a.ts"}' },
+            }] } }],
+          };
+        })(),
+      },
+    },
+  };
+  const provider = new OpenAIModelProvider({ client: client as never });
+  const snapshots = [];
+
+  for await (const snapshot of provider.stream({ model: "test-model", messages: [] })) {
+    snapshots.push(snapshot);
+  }
+
+  expect(snapshots).toHaveLength(1);
+  expect(snapshots[0]?.content).toEqual([
+    { type: "tool_use", id: "call-read", name: "read_file", input: { path: "a.ts" } },
+  ]);
+  expect(snapshots[0]?.usage).toBeUndefined();
+});
+
+test("handles all tool fragments per chunk without mixing calls or repeating text", async () => {
+  const client = {
+    chat: {
+      completions: {
+        create: async () => (async function* () {
+          yield {
+            choices: [{ index: 0, delta: {
+              content: "读取",
+              reasoning_content: "检查",
+              tool_calls: [
+                {
+                  index: 1, id: "call-b", type: "function",
+                  function: { name: "write_file", arguments: '{"path":"b.ts",' },
+                },
+                {
+                  index: 0, id: "call-a", type: "function",
+                  function: { name: "read_file", arguments: '{"path":' },
+                },
+              ],
+            } }],
+          };
+          yield {
+            choices: [{ index: 0, delta: {
+              content: "完成",
+              reasoning_content: "文件",
+              tool_calls: [
+                { index: 0, function: { arguments: '"a.ts"}' } },
+                { index: 1, function: { arguments: '"content":"ok"}' } },
+              ],
+            } }],
+          };
+        })(),
+      },
+    },
+  };
+  const provider = new OpenAIModelProvider({ client: client as never });
+  const snapshots = [];
+
+  for await (const snapshot of provider.stream({ model: "test-model", messages: [] })) {
+    snapshots.push(snapshot);
+  }
+
+  expect(snapshots.map((snapshot) => snapshot.content)).toEqual([
+    [
+      { type: "thinking", thinking: "检查" },
+      { type: "text", text: "读取" },
+    ],
+    [
+      { type: "thinking", thinking: "检查文件" },
+      { type: "text", text: "读取完成" },
+      { type: "tool_use", id: "call-a", name: "read_file", input: { path: "a.ts" } },
+      {
+        type: "tool_use", id: "call-b", name: "write_file",
+        input: { path: "b.ts", content: "ok" },
+      },
+    ],
+  ]);
+});
 ```
+
+</details>
+
+测试命令：
 
 ```bash
 bun test src/community/openai
@@ -1092,7 +1230,11 @@ Anthropic 的 `thinking` block 包含 `thinking` 文本和不透明的 `signatur
 
 本节用 adapter 内部的 `_anthropicSignature` 保存签名，发送请求时还原为 SDK 的 `signature`。
 它随 canonical thinking block 保存在对话记录中，不需要修改 foundation 的类型。
-下面给出签名转换的辅助函数，其余转换按 TODO 完成：
+下面给出可通过类型检查的练习骨架：system 提取、user 文本与 URL 图片转换、签名辅助函数和 usage 映射已作为示例实现，
+其余分支按编号 TODO 完成。每个待实现分支暂时抛出错误，完成时用对应的返回值替换 `throw`。
+
+<details>
+<summary>展开代码骨架：<code>utils.ts</code></summary>
 
 ```ts
 import Anthropic from "@anthropic-ai/sdk";
@@ -1106,7 +1248,11 @@ export interface AnthropicThinkingContent extends ThinkingContent {
 }
 
 function parseAnthropicThinking(block: Anthropic.ThinkingBlock): AnthropicThinkingContent {
-  return { type: "thinking", thinking: block.thinking, _anthropicSignature: block.signature };
+  return {
+    type: "thinking",
+    thinking: block.thinking,
+    _anthropicSignature: block.signature,
+  };
 }
 
 function convertToAnthropicThinking(item: ThinkingContent): Anthropic.ThinkingBlockParam {
@@ -1120,29 +1266,144 @@ function convertToAnthropicThinking(item: ThinkingContent): Anthropic.ThinkingBl
 export function extractSystemPrompt(messages: Message[]): string | undefined {
   // TODO 1：只收集 system text，并用两个换行连接；没有 system 时返回 undefined。
   // 参数规则：不得修改 messages，也不得把非 system 内容混入 prompt。
-  throw new Error("TODO: implement extractSystemPrompt");
+  const systemMessages = messages.filter((message) => message.role === "system");
+  if (systemMessages.length === 0) {
+    return undefined;
+  }
+  return systemMessages
+    .flatMap((message) => message.content.map((textContent) => textContent.text))
+    .join("\n\n");
 }
 
 export function convertToAnthropicMessages(messages: Message[]): Anthropic.MessageParam[] {
   // TODO 2：排除 system message，并把 Tool result 转成 user-role content。
   // 参数规则：保持原始消息及 content block 顺序，不修改 canonical messages。
   // assistant thinking 分支调用 convertToAnthropicThinking，保留空 thinking 文本。
-  throw new Error("TODO: implement convertToAnthropicMessages");
+  const nonSystemMessages = messages.filter((message) => message.role !== "system");
+
+  const messageParams: Anthropic.MessageParam[] = [];
+
+  for (const message of nonSystemMessages) {
+    switch (message.role) {
+      case "assistant":
+        messageParams.push({
+          role: "assistant",
+          content: message.content.map((assistantContent): Anthropic.ContentBlockParam => {
+            switch (assistantContent.type) {
+              case "text":
+                // TODO 2.1：返回 text block，字段为 type 和 text。
+                // 空字符串也是有效内容，不要用 if (assistantContent.text) 过滤。
+                throw new Error("TODO 2.1: convert assistant text");
+              case "thinking":
+                // TODO 2.2：返回 convertToAnthropicThinking(assistantContent) 的结果。
+                // 复用签名校验；即使 thinking 为空也要保留该 block。
+                throw new Error("TODO 2.2: convert assistant thinking");
+              case "tool_use":
+                // TODO 2.3：返回 type、id、name、input 四个字段。
+                // input 保持对象，不需要像 OpenAI arguments 那样 JSON.stringify。
+                // 不要重新生成 id，后面的 tool_result 要靠它关联调用。
+                throw new Error("TODO 2.3: convert assistant tool use");
+            }
+          }),
+        });
+        break;
+      case "user":
+        messageParams.push({
+          role: "user",
+          content: message.content.map((userContent) => {
+            if (userContent.type === "text") {
+              return {
+                type: "text",
+                text: userContent.text,
+              };
+            }
+
+            return {
+              type: "image",
+              source: {
+                type: "url",
+                url: userContent.image_url.url,
+              },
+            };
+          }),
+        });
+        break;
+      case "tool":
+        messageParams.push({
+          // Anthropic 用 user 消息承载工具结果，没有独立的 tool role。
+          role: "user",
+          content: message.content.map((toolContent): Anthropic.ToolResultBlockParam => {
+            // TODO 2.4：返回 type="tool_result"、tool_use_id 和 content。
+            // 一条 ToolMessage 内的多个结果放进同一个 content 数组，顺序不变。
+            // toolContent.content 已经是字符串，直接保留，不要再次 JSON.stringify。
+            throw new Error("TODO 2.4: convert tool result");
+          }),
+        });
+        break;
+    }
+  }
+  return messageParams;
 }
 
 export function convertToAnthropicTools(tools: Tool[]): Anthropic.Tool[] {
-  // TODO 3：使用 input_schema，不要复用 OpenAI wire type。
-  throw new Error("TODO: implement convertToAnthropicTools");
+  return tools.map((tool): Anthropic.Tool => {
+    // TODO 3.1：调用 tool.parameters.toJSONSchema() 得到 JSON Schema。
+    // TODO 3.2：返回 name、description、input_schema；不用 OpenAI 的 function 包装层。
+    // input_schema 必须是对象 schema；SDK 要求 type 为字面量 "object"。
+    // 如果 schema.type 的类型太宽，先检查 schema.type !== "object" 并抛错，
+    // 然后使用 { ...schema, type: "object" }，保留 properties、required 等字段。
+    // 不要调用 tool.invoke；这里只转换定义，不执行工具。
+    throw new Error("TODO 3: convert tool definition");
+  });
 }
 
 export function parseAnthropicAssistantMessage(message: Anthropic.Message): AssistantMessage {
-  // TODO 4：解析 text、thinking、tool_use，并原样保存 Tool id 和 provider usage。
-  // thinking 分支调用 parseAnthropicThinking，将文本和签名一起存入 content。
-  throw new Error("TODO: implement parseAnthropicAssistantMessage");
+  const content = message.content.map((anthropicContent): AssistantMessage["content"][number] => {
+    switch (anthropicContent.type) {
+      case "text":
+        // TODO 4.1：返回内部 text block；字段为 type 和 text，保留空字符串。
+        throw new Error("TODO 4.1: parse assistant text");
+      case "thinking":
+        // TODO 4.2：返回 parseAnthropicThinking(anthropicContent) 的结果。
+        // SDK signature 存入 _anthropicSignature，后续回传时再还原。
+        throw new Error("TODO 4.2: parse assistant thinking");
+      case "tool_use":
+        // TODO 4.3：返回内部 tool_use block，保留 id、name 和 input。
+        // SDK 的 anthropicContent.input 是 unknown，内部要求 Record<string, unknown>。
+        // 先检查 typeof input === "object"、input !== null、!Array.isArray(input)，
+        // 不符合时抛出带 anthropicContent.id 的错误；通过检查后再收窄为 Record<string, unknown>。
+        // input 已是解析后的值，不需要 JSON.parse。
+        throw new Error("TODO 4.3: parse assistant tool use");
+      default:
+        // SDK 还有 redacted_thinking、服务端工具等类型，本练习暂不支持。
+        // 显式报错避免静默丢失内容；以后扩展时再定义对应的内部表示。
+        throw new Error(`UNSUPPORTED_CONTENT_BLOCK: ${anthropicContent.type}`);
+    }
+  });
+
+  // 示例：按本节约定映射 provider usage，不按文本长度估算 token。
+  const promptTokens = message.usage.input_tokens;
+  const completionTokens = message.usage.output_tokens;
+  return {
+    role: "assistant",
+    content,
+    usage: {
+      promptTokens,
+      completionTokens,
+      totalTokens: promptTokens + completionTokens,
+    },
+  };
 }
 ```
 
-这些函数必须是纯函数。先用固定 fixture 测完，再调用 SDK。
+</details>
+
+建议按 `TODO 2.1–2.4 → TODO 3 → TODO 4.1–4.3` 的顺序实现：先转换消息，
+再转换工具定义，最后解析响应。`map` 回调标注了目标 block 类型，便于把类型错误定位到具体分支。
+user 示例中的图片使用 `{ type: "url", url }` 作为 `source`，不能直接传内部的 `{ url, detail? }` 对象。
+
+这些函数必须是纯函数，保持消息与内容块顺序，不修改输入。先用下面的固定 fixture 测完，再调用 SDK。
+骨架通过类型检查只说明类型结构成立；未替换的 TODO 仍会抛错，必须补齐实现并运行转换测试。
 
 **对应测试**
 
@@ -1305,8 +1566,17 @@ text、thinking、Tool id 与 usage 在转换中保留；thinking 的文本和�
 Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
 event type 泄漏到 Agent：
 
+下面预先搭好状态类型、事件分派和快照结构，并用 text 累积与 usage 映射作为示例。
+按 `TODO 1.1–1.5 → TODO 2` 补齐 thinking、Tool 和 JSON 解析逻辑；完成一个分支时，
+将对应的 `throw` 替换为实现，并用 `break` 结束该事件分支。
+
+<details>
+<summary>展开代码骨架：<code>stream-accumulator.ts</code></summary>
+
 ```ts
-import type { AssistantMessage } from "@/foundation/messages";
+import type { AssistantMessage, TokenUsage } from "@/foundation/messages";
+
+import type { AnthropicThinkingContent } from "./utils";
 
 export type ProviderChunk =
   | { type: "text_delta"; index: number; text: string }
@@ -1318,29 +1588,159 @@ export type ProviderChunk =
   | { type: "message_start"; inputTokens: number }
   | { type: "message_end"; outputTokens: number };
 
+interface TextBlockState {
+  type: "text";
+  text: string;
+}
+
+interface ThinkingBlockState {
+  type: "thinking";
+  thinking: string;
+  signature: string;
+}
+
+interface ToolBlockState {
+  type: "tool_use";
+  id: string;
+  name: string;
+  partialJson: string;
+}
+
+type BlockState = TextBlockState | ThinkingBlockState | ToolBlockState;
+
 export class StreamAccumulator {
-  // TODO 1：按 block index 保存 text/thinking/tool 的独立累计状态，thinking 包含 signature。
-  // TODO 2：分别保存 input/output usage，message_end 后产生完整 TokenUsage。
+  // Map 的 key 是响应内的 block index；不要用 tool id 或到达顺序代替。
+  private readonly _blocks = new Map<number, BlockState>();
+  private _promptTokens: number | undefined;
+  private _completionTokens: number | undefined;
 
   push(chunk: ProviderChunk): void {
-    // TODO 3：按 chunk.type 分派；同一 index 的 partialJson 只能追加到同一 Tool。
-    // thinking_start 初始化文本和签名；thinking_delta 追加文本，signature_delta 更新签名。
-    throw new Error("TODO: implement Anthropic StreamAccumulator.push");
+    // usage 事件没有 index；先用 in 收窄，再读取对应 block 的累计状态。
+    const blockState = "index" in chunk ? this._blocks.get(chunk.index) : undefined;
+
+    switch (chunk.type) {
+      case "text_delta": {
+        // 示例：首次 delta 创建状态，后续 delta 追加文本。
+        // 即使首个 chunk.text 为空，也会建立 text block。
+        if (blockState === undefined) {
+          this._blocks.set(chunk.index, { type: "text", text: chunk.text });
+          break;
+        }
+        if (blockState.type !== "text") {
+          throw new Error(`INVALID_BLOCK_TYPE: expected text at index ${chunk.index}`);
+        }
+        blockState.text += chunk.text;
+        break;
+      }
+      case "thinking_start":
+        // TODO 1.1：为 chunk.index 建立 ThinkingBlockState。
+        // 保存 chunk.thinking 和 chunk.signature，包括空字符串。
+        // start 应只出现一次；若 blockState 已存在，抛错，避免覆盖累计内容。
+        throw new Error("TODO 1.1: initialize thinking block");
+      case "thinking_delta":
+        // TODO 1.2：检查 blockState 存在且 type === "thinking"，再追加 thinking。
+        // 不要从 delta 临时创建 thinking block，否则会遗漏 start 中的文本和签名。
+        // Map.get 可能返回 undefined；通过检查后，TS 才允许访问 thinking 字段。
+        throw new Error("TODO 1.2: append thinking delta");
+      case "signature_delta":
+        // TODO 1.3：检查 blockState 是 thinking，再更新它的 signature。
+        // 本节 ProviderChunk 的 signature 是完整签名：使用赋值，不使用 +=。
+        // 不要追加到 thinking 文本，也不要更新其他 index 的签名。
+        throw new Error("TODO 1.3: update thinking signature");
+      case "tool_start":
+        // TODO 1.4：为 chunk.index 建立 ToolBlockState。
+        // 保存 id、name，partialJson 初始化为 ""；重复 start 应报错。
+        // 参数先保存为字符串，JSON 片段可能还不完整，不要在这里 JSON.parse。
+        throw new Error("TODO 1.4: initialize tool block");
+      case "input_json_delta":
+        // TODO 1.5：检查 blockState 是 tool_use，再把 chunk.partialJson 追加进去。
+        // 每个 index 有自己的 partialJson；多个 Tool 交错到达时不能混用缓冲区。
+        throw new Error("TODO 1.5: append tool input JSON");
+      case "message_start":
+        // 示例：记录 provider 明确报告的输入 token 数，0 也是有效值。
+        this._promptTokens = chunk.inputTokens;
+        break;
+      case "message_end":
+        this._completionTokens = chunk.outputTokens;
+        break;
+    }
   }
 
   snapshot(): AssistantMessage {
-    // TODO 4：按 index 排序输出新 content 数组；不完整 Tool input 暂时使用 {}。
-    // thinking 输出 AnthropicThinkingContent（从 ./utils 导入），用 _anthropicSignature 保存签名。
-    // 保留文本为空的 thinking block；复制每个 block，后续 delta 不能改变旧 snapshot。
-    throw new Error("TODO: implement Anthropic StreamAccumulator.snapshot");
+    // 示例：Map 按插入顺序遍历，输出前必须按 index 做数值排序。
+    const orderedBlocks = [...this._blocks.entries()].sort(([leftIndex], [rightIndex]) =>
+      leftIndex - rightIndex,
+    );
+    const content = orderedBlocks.map(([, blockState]): AssistantMessage["content"][number] => {
+      switch (blockState.type) {
+        case "text":
+          return { type: "text", text: blockState.text };
+        case "thinking": {
+          // 示例：累计状态使用 signature，内部消息使用 _anthropicSignature。
+          // 流式快照允许签名暂时为空；不要调用会拒绝空签名的发送端转换函数。
+          const thinkingContent: AnthropicThinkingContent = {
+            type: "thinking",
+            thinking: blockState.thinking,
+            _anthropicSignature: blockState.signature,
+          };
+          return thinkingContent;
+        }
+        case "tool_use":
+          return {
+            type: "tool_use",
+            id: blockState.id,
+            name: blockState.name,
+            input: this._parseToolInput(blockState.partialJson),
+          };
+      }
+    });
+
+    // 每次都返回新对象；不能把 Map 中可变的 blockState 直接放进 content。
+    return { role: "assistant", content, usage: this._snapshotUsage() };
+  }
+
+  private _parseToolInput(partialJson: string): Record<string, unknown> {
+    // TODO 2：生成当前快照使用的 Tool input。
+    // 1. partialJson 为空时返回一个新的 {}。
+    // 2. 用 try/catch 包裹 JSON.parse，并把结果先声明为 unknown。
+    // 3. JSON 尚未完整、解析失败时，暂时返回新的 {}，不要让流式快照中断。
+    // 4. 解析成功后检查非 null 的 object 且不是数组，再作为 Record 返回；
+    //    对于 null、数组、字符串等不符合 Tool input 契约的值，也暂时返回 {}。
+    // 每次 snapshot 都重新解析，确保嵌套对象也独立，调用方不能反向修改后续快照。
+    // 这里只提供中间展示；流结束时的严格 JSON 校验由后续 Provider 阶段负责。
+    throw new Error("TODO 2: parse partial tool input for snapshot");
+  }
+
+  private _snapshotUsage(): TokenUsage | undefined {
+    // 示例：两个计数都已报告时才生成完整 usage，缺失时不伪造 0。
+    if (this._promptTokens === undefined || this._completionTokens === undefined) {
+      return undefined;
+    }
+    return {
+      promptTokens: this._promptTokens,
+      completionTokens: this._completionTokens,
+      totalTokens: this._promptTokens + this._completionTokens,
+    };
   }
 }
 ```
+
+</details>
 
 这里的 `index` 表示一次响应内的 content block index。`partialJson` 只能追加到同一
 index 的 Tool；usage 只在 provider 明确报告时出现。SDK event 先在 `model-provider.ts`
 中转换为上面的 union，再交给 accumulator。thinking block 在 start 时就要建立状态，
 随后将 `signature_delta.signature` 原样赋给对应 block 的签名；签名不参与文本拼接。
+
+实现时可以先单独验证 text 和 usage，再补 thinking 与 Tool：
+
+- 累计状态按 `index` 隔离，快照按数值大小排序；事件到达顺序不等于内容展示顺序。
+- 空 thinking 和尚未收到签名的 thinking 都应出现在流式快照中，不能用真假值判断过滤。
+- Tool 参数片段要先拼接再解析；中间的 `{}` 只是展示占位，不代表参数已通过最终校验。
+- 保存一次 `snapshot()` 后继续 `push()`，旧快照应保持不变；修改快照中的嵌套 Tool input，
+  再次读取快照也不应受影响。
+
+这份骨架可以通过类型检查，但含 TODO 的路径仍会抛错。下面的测试需要在补齐实现后通过。
 
 **对应测试**
 
@@ -1358,18 +1758,18 @@ import type { AnthropicThinkingContent } from "../utils";
 describe("Anthropic StreamAccumulator", () => {
   test("keeps block index order while accumulating deltas", () => {
     const accumulator = new StreamAccumulator();
-    accumulator.push({ index: 1, type: "text_delta", text: "answer" } as never);
+    accumulator.push({ index: 1, type: "text_delta", text: "answer" });
     accumulator.push({ index: 0, type: "thinking_start", thinking: "", signature: "" });
-    accumulator.push({ index: 0, type: "thinking_delta", thinking: "plan" } as never);
+    accumulator.push({ index: 0, type: "thinking_delta", thinking: "plan" });
     accumulator.push({ index: 0, type: "signature_delta", signature: "opaque-signature" });
     accumulator.push({
       index: 2,
       type: "tool_start",
       id: "call-1",
       name: "read_file",
-    } as never);
-    accumulator.push({ index: 2, type: "input_json_delta", partialJson: '{"path"' } as never);
-    accumulator.push({ index: 2, type: "input_json_delta", partialJson: ':"a.ts"}' } as never);
+    });
+    accumulator.push({ index: 2, type: "input_json_delta", partialJson: '{"path"' });
+    accumulator.push({ index: 2, type: "input_json_delta", partialJson: ':"a.ts"}' });
 
     const thinking: AnthropicThinkingContent = {
       type: "thinking", thinking: "plan", _anthropicSignature: "opaque-signature",
@@ -1417,14 +1817,73 @@ describe("Anthropic StreamAccumulator", () => {
 
   test("combines input and output token usage", () => {
     const accumulator = new StreamAccumulator();
-    accumulator.push({ type: "message_start", inputTokens: 12 } as never);
-    accumulator.push({ type: "message_end", outputTokens: 4 } as never);
+    accumulator.push({ type: "message_start", inputTokens: 12 });
+    accumulator.push({ type: "message_end", outputTokens: 4 });
 
     expect(accumulator.snapshot().usage).toEqual({
       promptTokens: 12,
       completionTokens: 4,
       totalTokens: 16,
     });
+  });
+
+  test.each([
+    "42", "-7", "1.5", "true", "0", "false", "null", "[]", '[{"path":"a.ts"}]', '"hello"', '""',
+  ])("uses an object placeholder for non-object tool JSON: %s", (partialJson) => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ type: "tool_start", index: 0, id: "call-1", name: "read_file" });
+    accumulator.push({ type: "input_json_delta", index: 0, partialJson });
+
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "tool_use", id: "call-1", name: "read_file", input: {} },
+    ]);
+  });
+
+  test.each(["", "   ", '{"path":', "not-json"])(
+    "uses an object placeholder for empty, incomplete or malformed tool JSON: %s",
+    (partialJson) => {
+      const accumulator = new StreamAccumulator();
+      accumulator.push({ type: "tool_start", index: 0, id: "call-1", name: "read_file" });
+      accumulator.push({ type: "input_json_delta", index: 0, partialJson });
+
+      expect(accumulator.snapshot().content).toEqual([
+        { type: "tool_use", id: "call-1", name: "read_file", input: {} },
+      ]);
+    },
+  );
+
+  test.each([
+    { label: "empty object", input: {} },
+    {
+      label: "object containing numbers, booleans, null and arrays",
+      input: { count: 42, enabled: true, optional: null, nested: { values: [1, false] } },
+    },
+  ])("preserves valid tool input: $label", ({ input }) => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ type: "tool_start", index: 0, id: "call-1", name: "read_file" });
+    accumulator.push({ type: "input_json_delta", index: 0, partialJson: JSON.stringify(input) });
+
+    // 只限制参数的顶层类型；对象内部的数字、布尔值和数组都是有效 JSON 值。
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "tool_use", id: "call-1", name: "read_file", input },
+    ]);
+  });
+
+  test("replaces an incomplete input placeholder without changing the previous snapshot", () => {
+    const accumulator = new StreamAccumulator();
+    accumulator.push({ type: "tool_start", index: 0, id: "call-1", name: "read_file" });
+    accumulator.push({ type: "input_json_delta", index: 0, partialJson: '{"path":' });
+    const partial = accumulator.snapshot();
+    expect(partial.content).toEqual([
+      { type: "tool_use", id: "call-1", name: "read_file", input: {} },
+    ]);
+    const originalPartial = structuredClone(partial);
+
+    accumulator.push({ type: "input_json_delta", index: 0, partialJson: '"a.ts"}' });
+    expect(accumulator.snapshot().content).toEqual([
+      { type: "tool_use", id: "call-1", name: "read_file", input: { path: "a.ts" } },
+    ]);
+    expect(partial).toEqual(originalPartial);
   });
 });
 ```
@@ -1716,6 +2175,40 @@ SDK、鉴权、模型配置与 streaming 是否能一起工作。没有 API key 
 
 #### 7.4.1 创建真实模型示例
 
+先在练习项目根目录创建 `.env.example`，集中列出 API key、请求基础 URL 和模型名。
+[Bun 会自动加载 `.env`](https://bun.com/docs/runtime/environment-variables)，代码仍通过 `Bun.env` 读取配置，无需安装 `dotenv`。
+
+<details>
+<summary>展开配置模板：<code>.env.example</code></summary>
+
+```dotenv
+# 复制为 .env 后，只需填写本次使用的 Provider；API key 留空时示例会提示配置。
+
+# OpenAI 或兼容 Chat Completions 的服务
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4.1-mini
+
+# Anthropic 或兼容 Messages API 的服务
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=https://api.anthropic.com
+ANTHROPIC_MODEL=claude-sonnet-4-20250514
+```
+
+</details>
+
+首次配置时复制模板，再在 `.env` 中填写所选 Provider 的 key、URL 和可用模型名：
+
+```bash
+cp -n .env.example .env
+```
+
+如果已有 `.env`，直接补充所需字段即可。`.env` 保存本地配置并由 `.gitignore` 忽略，
+`.env.example` 保留空 key，作为可提交的模板。URL 填服务的基础地址；
+使用兼容服务时按其要求填写，不要在末尾追加 `/chat/completions` 或 `/messages`。
+
+然后创建示例文件：
+
 ```bash
 mkdir -p examples
 touch examples/stage-07-real-model.ts
@@ -1726,7 +2219,8 @@ touch examples/stage-07-real-model.ts
 目标文件：`examples/stage-07-real-model.ts`
 
 示例只把可见 text snapshot 写到终端；最终 JSON 中的 thinking 内容保留 canonical shape，
-但用 `[hidden]` 替换原文。模型名可通过对应环境变量覆盖。
+但用 `[hidden]` 替换原文。两个 Provider 都从 `.env` 读取 key、基础 URL 和模型名；
+URL 留空时使用 SDK 默认地址，模型名留空时使用代码中的默认值。
 
 <details>
 <summary>展开完整代码：<code>stage-07-real-model.ts</code></summary>
@@ -1764,17 +2258,20 @@ async function main(): Promise<void> {
 
   const config: Record<Vendor, {
     apiKey: string | undefined;
+    baseURL: string | undefined;
     modelName: string;
     providerName: string;
   }> = {
     openai: {
-      apiKey: Bun.env.OPENAI_API_KEY,
-      modelName: Bun.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+      apiKey: Bun.env.OPENAI_API_KEY?.trim(),
+      baseURL: Bun.env.OPENAI_BASE_URL?.trim() || undefined,
+      modelName: Bun.env.OPENAI_MODEL?.trim() || "gpt-4.1-mini",
       providerName: "OpenAI",
     },
     anthropic: {
-      apiKey: Bun.env.ANTHROPIC_API_KEY,
-      modelName: Bun.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-20250514",
+      apiKey: Bun.env.ANTHROPIC_API_KEY?.trim(),
+      baseURL: Bun.env.ANTHROPIC_BASE_URL?.trim() || undefined,
+      modelName: Bun.env.ANTHROPIC_MODEL?.trim() || "claude-sonnet-4-20250514",
       providerName: "Anthropic",
     },
   };
@@ -1782,16 +2279,19 @@ async function main(): Promise<void> {
 
   if (!selected.apiKey) {
     console.log(`Missing ${vendor === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY"}.`);
-    console.log("Configure the key and run this optional integration example again.");
+    console.log("Configure the key in the project-root .env file and run this example again.");
     return;
   }
 
   const provider: ModelProvider = vendor === "openai"
     ? new OpenAIModelProvider({
         apiKey: selected.apiKey,
-        baseURL: Bun.env.OPENAI_BASE_URL,
+        baseURL: selected.baseURL,
       })
-    : new AnthropicModelProvider({ apiKey: selected.apiKey });
+    : new AnthropicModelProvider({
+        apiKey: selected.apiKey,
+        baseURL: selected.baseURL,
+      });
   const model = new Model({ name: selected.modelName, provider });
   const userMessage: UserMessage = {
     role: "user",
@@ -1828,16 +2328,18 @@ await main();
 
 #### 7.4.2 运行与观察
 
+配置完成后，在练习项目根目录运行；命令中不再填写 key 或 URL。
+
 OpenAI-compatible endpoint：
 
 ```bash
-OPENAI_API_KEY=... bun run examples/stage-07-real-model.ts openai
+bun run examples/stage-07-real-model.ts openai
 ```
 
 Anthropic：
 
 ```bash
-ANTHROPIC_API_KEY=... bun run examples/stage-07-real-model.ts anthropic
+bun run examples/stage-07-real-model.ts anthropic
 ```
 
 示例应打印：
