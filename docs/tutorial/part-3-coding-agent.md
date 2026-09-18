@@ -665,8 +665,7 @@ touch src/community/openai/__tests__/stream-accumulator.test.ts
 
 `_toolCalls` 保存拼接中的 `argumentsText`，而 `ToolUseContent` 要求解析后的 `input`。
 在 `snapshot()` 中完成这次转换：先加入非空 thinking、正文，再按 Tool call index 从小到大
-加入工具调用。`AssistantMessageContent` 本身就是数组类型，可以逐个 `push` 内容块；
-不能只给内部记录补上 `type`，也不要把整个工具数组作为一个元素加入 `content`。
+逐个加入工具调用。`AssistantMessageContent` 本身就是数组类型，可以逐个 `push` 内容块。
 
 参数可能分多次到达，例如 `'{"path":"/tmp/'` 和 `'demo"}'`。沿用原项目的处理方式：
 没有收到 usage 时，暂不输出 JSON 尚不能解析的工具调用，但其他已完整的调用仍可输出；
@@ -2218,9 +2217,15 @@ touch examples/stage-07-real-model.ts
 
 目标文件：`examples/stage-07-real-model.ts`
 
-示例只把可见 text snapshot 写到终端；最终 JSON 中的 thinking 内容保留 canonical shape，
+示例只把累计 snapshot 中新增的可见 text 写到终端；最终 JSON 中的 thinking 内容保留 canonical shape，
 但用 `[hidden]` 替换原文。两个 Provider 都从 `.env` 读取 key、基础 URL 和模型名；
 URL 留空时使用 SDK 默认地址，模型名留空时使用代码中的默认值。
+
+`Model.stream()` 返回累计快照，展示层用 `printedText` 记录已输出的文本，
+每次只追加 `text.slice(printedText.length)`。这依赖当前正文只追加的流式语义；
+仅更新 thinking、签名、usage 或重复最终快照时，可见文本没有增加，就不会重复打印。
+不要用 `\r` 加完整快照覆盖输出：`\r` 只回到当前行首，无法覆盖已换行的整段文本，
+日志面板也可能不支持这种覆盖方式。
 
 <details>
 <summary>展开完整代码：<code>stage-07-real-model.ts</code></summary>
@@ -2299,13 +2304,16 @@ async function main(): Promise<void> {
   };
   const startedAt = performance.now();
   let finalMessage: AssistantMessage | undefined;
+  let printedText = "";
 
   console.log(`provider=${selected.providerName} model=${selected.modelName}`);
   for await (const snapshot of model.stream({
     prompt: "Answer concisely. Do not expose hidden reasoning.",
     messages: [userMessage],
   })) {
-    process.stdout.write(`\r${visibleText(snapshot)}`);
+    const text = visibleText(snapshot);
+    process.stdout.write(text.slice(printedText.length));
+    printedText = text;
     finalMessage = snapshot;
   }
   process.stdout.write("\n");
@@ -2345,10 +2353,12 @@ bun run examples/stage-07-real-model.ts anthropic
 示例应打印：
 
 - provider name 和 model name；
-- streaming progress，不打印隐藏 reasoning 原文；
+- streaming progress，只追加新增正文，不重复打印累计文本，也不打印隐藏 reasoning 原文；
 - 最终 canonical `AssistantMessage`；
 - prompt/output/total tokens；
 - 总耗时。
+
+末尾 JSON 会再次包含完整正文，这是最终消息的展示；流式输出阶段的正文应只出现一次。
 
 如果没有 key，示例给出配置提示后 exit 0；测试套件不能因此失败。
 
