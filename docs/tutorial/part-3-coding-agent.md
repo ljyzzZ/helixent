@@ -1,26 +1,41 @@
 # 第三部分：Coding Agent 与交互客户端
 
-这一部分完成阶段 7～10。阶段 10 结束时，你会得到一个实现了基础 coding 能力的 v1 coding agent：能接真实模型、读写代码、加载项目指令和 Skills、管理 Todo、流式交互，并在副作用 Tool 前请求人工审批。
+这一部分完成阶段 7～10。阶段 10 结束时，你会得到一个具备基础编码能力的 v1 Coding Agent：能接真实模型、读写代码、加载项目指令和 Skills、管理 Todo、流式交互，并在执行会修改文件等有副作用的工具前请求人工审批。
 
-真实 API 验证始终是 optional integration test。核心测试继续使用 fake provider，避免网络波动、费用和模型随机性破坏质量门。
+真实 API 验证始终是可选的集成测试。核心测试继续使用模拟 Provider（按预设返回结果，不访问真实模型服务），避免网络波动、费用和模型随机性影响质量检查。
 
 ## 阶段 7：实现 Provider Adapter
 
-> 上一阶段回顾：阶段 6 建立了 Middleware 生命周期和明确的 mutation boundary，把日志、审批等横切策略从 Agent 主循环中分离出来。
+> 上一阶段回顾：阶段 6 建立了 Middleware 生命周期，并明确各环节可以修改哪些状态，把日志、审批等通用策略从 Agent 主循环中分离出来。
 
 ### 本阶段解决的问题
 
 不同模型厂商在以下方面并不一致：
 
-- system prompt 放置方式；
-- Tool definition schema；
-- Tool call id 和参数编码；
-- thinking/reasoning 内容；
-- streaming chunk 结构；
-- token usage 字段；
-- abort 和错误类型。
+- 系统提示词的放置方式；
+- 工具定义和参数结构；
+- 工具调用标识和参数编码；
+- 思考内容（thinking/reasoning）；
+- 流式响应的数据片段结构；
+- token 用量字段；
+- 中止请求的方式和错误类型。
 
-Adapter 的职责是吸收这些差异，让 Agent runtime 只看到 canonical Message。
+Provider 是模型调用接口的实现；Adapter（适配器）负责转换项目与模型厂商之间的数据格式。
+它吸收这些差异，让 Agent 运行时只处理统一的 `Message`。
+
+本阶段会反复遇到以下术语，先按这里的含义理解即可：
+
+| 术语 | 在本教程中的含义 |
+|---|---|
+| canonical | 项目内部统一采用的格式，例如 `Message`；不同厂商的请求和响应都要与它相互转换 |
+| schema | 数据的结构与校验规则，例如工具参数有哪些字段、各是什么类型、是否必填 |
+| endpoint | 模型服务的 API 地址；同一套 SDK 可以通过配置地址连接不同的兼容服务 |
+| converter | 格式转换函数，例如将 `Message[]` 转成 SDK 所需的消息数组 |
+| fake client / fake provider | 模拟客户端或模拟 Provider，按测试预设返回响应，代替真实网络调用 |
+| fixture | 为测试预先准备的数据或环境，例如一段固定的 SDK 响应、一份临时文件 |
+| contract（契约） | 接口对输入、输出和行为的约定；契约测试通过公开接口验证这些约定 |
+
+其中 schema 可以理解为“数据应当长什么样”的说明。参见 [JSON Schema 对 schema 的解释](https://json-schema.org/understanding-json-schema/about)。
 
 ### 7.0 阅读路线
 
@@ -29,10 +44,10 @@ Adapter 的职责是吸收这些差异，让 Agent runtime 只看到 canonical M
 
 | 里程碑 | 对应章节 | 本次完成什么 | 可以停止并检查的证据 |
 |---|---|---|---|
-| 7A | [7.1 OpenAI 非流式调用](#stage-7a) | 消息与 Tool schema 转换、`invoke` | converter tests、fake client test |
-| 7B | [7.2 OpenAI streaming](#stage-7b) | 累计 snapshot、Tool JSON fragments、`stream` | accumulator tests、fake stream test |
-| 7C | [7.3 Anthropic Adapter](#stage-7c) | 在独立章节复用同一 canonical 契约 | Anthropic converter、accumulator、fake client tests |
-| 7D | [7.4 真实 API 验证](#stage-7d) | 配置 endpoint 并观察真实响应 | 可选 smoke example，不替代离线测试 |
+| 7A | [7.1 OpenAI 非流式调用](#stage-7a) | 消息与工具参数结构转换、`invoke` | 转换函数测试、模拟客户端测试 |
+| 7B | [7.2 OpenAI 流式调用](#stage-7b) | 累计快照、工具参数的 JSON 片段、`stream` | 累积器测试、模拟流式响应测试 |
+| 7C | [7.3 Anthropic Adapter](#stage-7c) | 在独立章节复用同一套内部格式与行为约定 | Anthropic 转换函数、累积器、模拟客户端测试 |
+| 7D | [7.4 真实 API 验证](#stage-7d) | 配置服务地址并观察真实响应 | 可选的基本连通性示例，不替代离线测试 |
 
 先画出 `Message[] → request → SDK response → AssistantMessage`，每次只实现一个箭头。
 7A～7C 均不需要 API key；只运行当前小节列出的测试，7C 完成后再运行两个 Provider 的完整测试。
@@ -72,9 +87,9 @@ Agent 使用统一的 `Message` 类型记录对话，OpenAI SDK 则使用自己�
 
 | 函数 | 输入 | 输出 |
 |---|---|---|
-| `convertToOpenAIMessages` | canonical `Message[]` | SDK 请求中的消息数组 |
-| `convertToOpenAITools` | `Tool[]` | SDK 的 function Tool definitions |
-| `parseOpenAIAssistantMessage` | SDK assistant response 与 usage | canonical `AssistantMessage` |
+| `convertToOpenAIMessages` | 内部统一的 `Message[]` | SDK 请求中的消息数组 |
+| `convertToOpenAITools` | `Tool[]` | SDK 的函数工具定义 |
+| `parseOpenAIAssistantMessage` | SDK 的助手响应与用量数据 | 内部统一的 `AssistantMessage` |
 
 本节基于 OpenAI Chat Completions 实现消息转换，并支持 `reasoning_content` 扩展。
 assistant 的正文、思考内容和工具调用分别映射到 `content`、`reasoning_content` 和
@@ -83,7 +98,7 @@ assistant 的正文、思考内容和工具调用分别映射到 `content`、`re
 以下对两个特殊字段作出说明：
 
 - `reasoning_content` 是第三方扩展字段，DeepSeek 和 Qwen 等思考模式都使用它。
-  本节适配为：接收时解析为 canonical `thinking`，流式调用时累积片段，发送历史消息时写回该字段。
+  本节适配为：接收时解析为内部的 `thinking` 内容块，流式调用时累积片段，发送历史消息时写回该字段。
 
   这是厂商扩展字段，不属于 OpenAI 官方 Chat Completions 协议，因此 SDK 的标准类型中没有对应声明。本节通过扩展类型补充声明，实际是否支持由所接入的 endpoint 决定。
 
@@ -219,7 +234,7 @@ export function parseOpenAIAssistantMessage(
 
 目标文件：`src/community/openai/__tests__/utils.test.ts`
 
-将下面的完整测试保存到该文件。测试中的 `as never` 用于适配省略了无关 SDK 字段的 fixture。
+将下面的完整测试保存到该文件。测试中的 `as never` 用于适配省略了无关 SDK 字段的测试数据。
 
 <details>
 <summary>展开完整代码：<code>utils.test.ts</code></summary>
@@ -445,7 +460,7 @@ bun test src/community/openai/__tests__/utils.test.ts
 目标文件：`src/community/openai/model-provider.ts`
 
 上一节的转换函数只处理数据格式。本节把它们与 SDK 调用连接起来，让 `invoke` 接收一次
-模型调用的参数，发出请求，再返回 canonical `AssistantMessage`。
+模型调用的参数，发出请求，再返回内部统一的 `AssistantMessage`。
 
 调用链是 `Model.invoke(context) → provider.invoke(params)`。`Model` 会把模型名称、
 模型 options 和本轮上下文整理为 `ModelProviderInvokeParams`：
@@ -453,7 +468,7 @@ bun test src/community/openai/__tests__/utils.test.ts
 | 参数 | 来源与用途 |
 |---|---|
 | `model` | `Model.name`，指定 endpoint 上要调用的模型 |
-| `messages` | `Model` 将 prompt（如果有）和对话历史组成的 canonical 消息数组 |
+| `messages` | `Model` 将提示词（如果有）和对话历史组成的内部消息数组 |
 | `tools` | 本轮允许模型选择的工具，由上下文提供；可省略 |
 | `options` | 创建 `Model` 时传入的模型参数，如 `temperature`、`max_tokens` |
 | `signal` | 本轮上下文的取消信号，用来中止正在进行的请求；可省略 |
@@ -534,8 +549,8 @@ export class OpenAIModelProvider implements ModelProvider {
 方法里的 `return` 返回 SDK 请求体，因此只构造数据，不会发送请求。各字段的处理方式如下：
 
 - `model` 原样传入，告诉 endpoint 使用哪个模型。
-- `messages` 调用上一节的 `convertToOpenAIMessages`，将 canonical 消息转成 SDK 格式。
-- `tools` 有传入时调用 `convertToOpenAITools`，生成工具名称、描述和参数 schema；未传入时
+- `messages` 调用上一节的 `convertToOpenAIMessages`，将内部消息转成 SDK 格式。
+- `tools` 有传入时调用 `convertToOpenAITools`，生成工具名称、描述和参数结构；未传入时
   保持 `undefined`。这里传递工具定义，工具的实际执行仍由 Agent 负责。
 - `temperature: 0` 保留默认模型参数。末尾的 `...options` 将调用方传入的参数展开
   到同一个对象中；同名字段以后面的值为准。例如 `options` 中设置 `temperature: 0.6`，
@@ -565,13 +580,13 @@ TODO 2 才发出请求。`this._client` 是构造函数中保存的 SDK client�
 它不属于模型要读取的 JSON 数据。`await` 等待这次非流式调用完成，得到完整响应。
 
 这里的 `params.options` 用于设置模型参数，与构造函数中的连接配置、SDK 第二个参数中的
-请求控制选项用途不同。API key 由 SDK 用于鉴权，不应写入消息、日志或测试 snapshot。
+请求控制选项用途不同。API 密钥由 SDK 用于鉴权，不应写入消息、日志或测试快照。
 
 最后完成 TODO 3。SDK 响应中的 `choices` 保存候选回复；本项目取第一项的 `message`，
 交给 `parseOpenAIAssistantMessage`，继续使用上一节已经实现的正文、thinking 和工具调用解析。
 代码中的 `!` 是 TypeScript 非空断言：这里沿用项目取首项回复的约定，它本身不做运行时校验。
 
-`usage` 位于 SDK 响应的顶层，需要先经 `toTokenUsage` 转成 canonical 字段：
+`usage` 位于 SDK 响应的顶层，需要先经 `toTokenUsage` 转成内部统一的字段：
 `prompt_tokens → promptTokens`、`completion_tokens → completionTokens`、
 `total_tokens → totalTokens`。整个 `usage` 缺省时保留 `undefined`；存在时，个别缺省字段按
 原项目取 `0`。把转换后的 usage 作为解析函数的第二个参数，`invoke` 最终就能返回同时包含
@@ -637,19 +652,31 @@ describe("OpenAIModelProvider", () => {
 
 </details>
 
-SDK `create` 的第二个参数承载 `signal`；不要把 signal 混进 JSON request body。
-测试通过构造函数注入 fake client，不创建真实 SDK client，也不需要 API key。
+SDK `create` 的第二个参数承载 `signal`；不要把取消信号混进 JSON 请求体。
+测试通过构造函数注入模拟客户端，不创建真实 SDK 客户端，也不需要 API 密钥。
 
 ```bash
 bun test src/community/openai/__tests__/model-provider.test.ts
 ```
 
-**7A 完成检查**：转换测试和 fake client test 通过，`invoke` 返回 canonical
-`AssistantMessage`，调用方 options 能覆盖默认值，`signal` 已透传到 SDK。
+**7A 完成检查**：转换测试和模拟客户端测试通过，`invoke` 返回内部统一的
+`AssistantMessage`，调用方的 `options` 能覆盖默认值，`signal` 已透传到 SDK。
 
-### 7.2 OpenAI：streaming 与 Tool 参数片段（7B） {#stage-7b}
+### 7.2 OpenAI：流式输出与工具参数片段（7B） {#stage-7b}
 
-在已通过测试的 OpenAI 非流式路径上增加 streaming。本节继续只修改 OpenAI adapter。
+在已通过测试的 OpenAI 非流式路径上增加流式输出（streaming）：模型逐步返回生成内容，
+调用方可以边接收边处理，不必等待完整回答。本节继续只修改 OpenAI 适配器。
+
+这里要区分“本次收到的片段”和“目前累计的完整内容”：
+
+| 术语 | 含义与例子 |
+|---|---|
+| chunk（数据片段） | 流中每次收到的一个数据对象；可能携带新增文本、工具参数或用量数据 |
+| delta（增量） | 相比上一次新增的部分，例如先收到“你”，再收到“好” |
+| accumulator（累积器） | 保存并合并历次片段的对象；本节对应 `StreamAccumulator` |
+| snapshot（快照） | 某一时刻累计状态的独立副本；上述两次文本的快照分别是“你”和“你好” |
+
+工具参数的 fragments 也是逐步到达的片段，只是内容为 JSON 文本，需要先拼接再解析。
 
 ```bash
 touch src/community/openai/stream-accumulator.ts
@@ -660,8 +687,8 @@ touch src/community/openai/__tests__/stream-accumulator.test.ts
 
 目标文件：`src/community/openai/stream-accumulator.ts`
 
-定义 provider-local accumulator。文本 delta 分支是标准实现示例；thinking、Tool fragment
-和 usage 分别保留为独立 TODO，每个 Tool call 按 index 分别累计参数。
+定义仅供这个 Provider 使用的累积器。文本增量分支是标准实现示例；思考内容、工具参数片段
+和用量分别保留为独立 TODO，每个工具调用按 `index` 分别累计参数。
 
 `_toolCalls` 保存拼接中的 `argumentsText`，而 `ToolUseContent` 要求解析后的 `input`。
 在 `snapshot()` 中完成这次转换：先加入非空 thinking、正文，再按 Tool call index 从小到大
@@ -725,9 +752,9 @@ export class StreamAccumulator {
 
 </details>
 
-这里的 `ProviderChunk` 是 OpenAI adapter 内部的 normalized chunk。`index` 在一次响应内
-稳定，`argumentsDelta` 按同一 Tool call index 拼接，usage 只在 provider 明确报告时出现。
-SDK chunk 到这个类型的转换留在 `model-provider.ts`，不要让 SDK type 进入 Agent。
+这里的 `ProviderChunk` 是 OpenAI 适配器内部整理后的片段类型。`index` 是工具调用在本次响应中的序号，
+同一次调用的序号保持不变；`argumentsDelta` 按相同序号拼接，`usage` 只在 Provider 明确报告时出现。
+SDK 片段到这个类型的转换留在 `model-provider.ts`，不要让 SDK 类型进入 Agent。
 
 **对应测试**
 
@@ -1223,13 +1250,14 @@ src/community/anthropic/
 
 目标文件：`src/community/anthropic/utils.ts`
 
-Anthropic 的 `thinking` block 包含 `thinking` 文本和不透明的 `signature`。在 thinking
-伴随 Tool use 的对话中，返回 Tool result 时必须一并回传之前完整、未修改的 thinking block。
+Anthropic 将消息分成内容块（content block），每块承载文本、思考内容或工具调用等一种内容。
+其中 `thinking` 内容块包含思考文本和 `signature` 签名；客户端不解释签名的内容，只原样保存和回传。
+在思考内容伴随工具调用的对话中，返回工具结果时必须一并回传之前完整、未修改的思考内容块。
 即使文本为空，也要保留其签名。协议说明见 [Anthropic Thinking](https://platform.claude.com/docs/en/build-with-claude/thinking)。
 
 本节用 adapter 内部的 `_anthropicSignature` 保存签名，发送请求时还原为 SDK 的 `signature`。
-它随 canonical thinking block 保存在对话记录中，不需要修改 foundation 的类型。
-下面给出可通过类型检查的练习骨架：system 提取、user 文本与 URL 图片转换、签名辅助函数和 usage 映射已作为示例实现，
+它随内部的思考内容块保存在对话记录中，不需要修改 `foundation` 的类型。
+下面给出可通过类型检查的练习骨架：系统消息提取、用户文本与 URL 图片转换、签名辅助函数和用量映射已作为示例实现，
 其余分支按编号 TODO 完成。每个待实现分支暂时抛出错误，完成时用对应的返回值替换 `throw`。
 
 <details>
@@ -1398,10 +1426,10 @@ export function parseAnthropicAssistantMessage(message: Anthropic.Message): Assi
 </details>
 
 建议按 `TODO 2.1–2.4 → TODO 3 → TODO 4.1–4.3` 的顺序实现：先转换消息，
-再转换工具定义，最后解析响应。`map` 回调标注了目标 block 类型，便于把类型错误定位到具体分支。
+再转换工具定义，最后解析响应。`map` 回调标注了目标内容块类型，便于把类型错误定位到具体分支。
 user 示例中的图片使用 `{ type: "url", url }` 作为 `source`，不能直接传内部的 `{ url, detail? }` 对象。
 
-这些函数必须是纯函数，保持消息与内容块顺序，不修改输入。先用下面的固定 fixture 测完，再调用 SDK。
+这些函数必须是纯函数，保持消息与内容块顺序，不修改输入。先用下面的固定测试数据测完，再调用 SDK。
 骨架通过类型检查只说明类型结构成立；未替换的 TODO 仍会抛错，必须补齐实现并运行转换测试。
 
 **对应测试**
@@ -1562,8 +1590,8 @@ text、thinking、Tool id 与 usage 在转换中保留；thinking 的文本和�
 
 目标文件：`src/community/anthropic/stream-accumulator.ts`
 
-Anthropic event 先转成以下固定 provider-local union，再进入同名 accumulator；不要让 SDK
-event type 泄漏到 Agent：
+Anthropic 事件先转成以下仅供该 Provider 使用的联合类型（union，即一个值可以属于列出的几种类型之一），
+再交给累积器；不要让 SDK 的事件类型进入 Agent。
 
 下面预先搭好状态类型、事件分派和快照结构，并用 text 累积与 usage 映射作为示例。
 按 `TODO 1.1–1.5 → TODO 2` 补齐 thinking、Tool 和 JSON 解析逻辑；完成一个分支时，
@@ -1726,10 +1754,10 @@ export class StreamAccumulator {
 
 </details>
 
-这里的 `index` 表示一次响应内的 content block index。`partialJson` 只能追加到同一
-index 的 Tool；usage 只在 provider 明确报告时出现。SDK event 先在 `model-provider.ts`
-中转换为上面的 union，再交给 accumulator。thinking block 在 start 时就要建立状态，
-随后将 `signature_delta.signature` 原样赋给对应 block 的签名；签名不参与文本拼接。
+这里的 `index` 表示内容块在本次响应中的序号。`partialJson` 只能追加到同一序号的工具调用；
+`usage` 只在 Provider 明确报告时出现。SDK 事件先在 `model-provider.ts`
+中转换为上面的联合类型，再交给累积器。思考内容块在开始事件到达时就要建立状态，
+随后将 `signature_delta.signature` 原样赋给对应内容块的签名；签名不参与文本拼接。
 
 实现时可以先单独验证 text 和 usage，再补 thinking 与 Tool：
 
@@ -1893,8 +1921,8 @@ describe("Anthropic StreamAccumulator", () => {
 bun test src/community/anthropic/__tests__/stream-accumulator.test.ts
 ```
 
-通过后应确认：thinking、text 和 Tool 按 block index 输出，JSON fragments 正确拼接，
-签名保存在所属 thinking block，旧 snapshot 保持不变，输入与输出 tokens 合并为 canonical `TokenUsage`。
+通过后应确认：思考内容、正文和工具调用按内容块序号输出，JSON 片段正确拼接，
+签名保存在所属思考内容块，旧快照保持不变，输入与输出 token 用量合并为内部统一的 `TokenUsage`。
 
 #### 7.3.4 实现 Provider.invoke，并用 fake client 验证
 
@@ -1938,7 +1966,7 @@ export class AnthropicModelProvider implements ModelProvider {
 `messages.create` 的第二个参数中。通过构造函数注入 fake client，测试无需 key。
 
 先实现 `invoke` 并通过下面的测试，再连接本章已验证的 accumulator 实现 `stream`。
-`index.ts` 导出 `AnthropicModelProvider`，API key 不进入日志、trace 或测试 snapshot。
+`index.ts` 导出 `AnthropicModelProvider`，API 密钥不进入日志、运行追踪记录或测试快照。
 
 **对应测试**
 
@@ -2393,15 +2421,15 @@ bun run check
 - [ ] streaming 最终 snapshot 与 non-stream response 语义一致；
 - [ ] fragmented Tool arguments 有测试；
 - [ ] signal 传入 SDK 请求；
-- [ ] `ADR-008` 解释 canonical protocol 与 vendor wire protocol 的边界。
+- [ ] `ADR-008` 解释内部统一协议与厂商实际请求、响应格式之间的边界。
 
 ## 阶段 8：实现 Coding Tools
 
-> 上一阶段回顾：阶段 7 把 canonical protocol 映射到 OpenAI 与 Anthropic，并统一了 streaming、Tool call、usage 和 abort 语义。
+> 上一阶段回顾：阶段 7 把内部统一协议映射到 OpenAI 与 Anthropic，并统一了流式输出、工具调用、用量和中止请求的行为。
 
 ### 本阶段原则
 
-Coding Agent 的能力不来自“更长的 prompt”，而来自高质量的环境接口。Tool 应窄、可组合、有明确 error code，并回显模型下一步决策需要的信息。
+Coding Agent 的能力不来自“更长的提示词”，而来自高质量的环境接口。工具应职责单一、可组合、有明确错误码，并回显模型下一步决策需要的信息。
 
 先按依赖跑通一条最小路径，再扩展到完整工具集：
 
@@ -2409,12 +2437,12 @@ Coding Agent 的能力不来自“更长的 prompt”，而来自高质量的环
 |---|---|---|
 | 8A | 路径校验 + `read_file` | 读取一份临时文件；范围和越界测试通过 |
 | 8B | `str_replace` | 读出旧值 → 唯一替换 → 再读出新值；失败时文件不变 |
-| 8C | `bash` | 执行 fixture 的检查命令；捕获输出、超时和运行中 abort |
+| 8C | `bash` | 执行测试目录中的检查命令；捕获输出、超时和运行中取消 |
 | 8D | `file_info`、`list_files`、`glob_search`、`grep_search` | 搜索结果的路径、行号和截断状态正确 |
 | 8E | `mkdir`、`write_file`、`apply_patch`、`move_path` | 在磁盘上检查新增、修改、移动结果 |
 
-8A～8C 的 playground 直接 import 当前 Tool factory，只注册已实现的 Tool。8E 完成后才填充
-8.5 的 `defineCodingTools()`，再运行依赖完整工具集的示例和 8.6 contract tests。这样未完成的
+8A～8C 的演练示例直接导入当前工具的工厂函数（factory，即接收配置并返回工具实例的函数），只注册已实现的工具。8E 完成后才填充
+8.5 的 `defineCodingTools()`，再运行依赖完整工具集的示例和 8.6 的契约测试。这样未完成的
 空文件不会阻塞第一个读写闭环。
 
 不要一开始实现一个万能 `filesystem` Tool。窄 Tool 更容易描述、审批、测试、统计和限制权限。
@@ -2456,12 +2484,12 @@ examples/
 └── stage-08-coding-tools.ts            # 在临时 workspace 演示读写与 diff
 ```
 
-这个循环只创建空文件，不覆盖内容。所有 Tool 的公开行为集中在一个完整 contract test，
+这个循环只创建空文件，不覆盖内容。所有工具的公开行为集中在一个完整的契约测试文件中，
 路径安全单独测试；迭代时可用 `bun test -t "read_file"` 只运行相关用例。
 
-各 Tool factory 的导出如下：
+各工具工厂函数的导出如下：
 
-| 文件 | public export |
+| 文件 | 公开导出 |
 |---|---|
 | `file-info.ts` | `defineFileInfoTool` |
 | `list-files.ts` | `defineListFilesTool` |
@@ -2475,12 +2503,28 @@ examples/
 | `move-path.ts` | `defineMovePathTool` |
 | `bash.ts` | `defineBashTool` |
 
-### 8.1 Workspace boundary
+### 8.1 工作区边界 {#_8-1-workspace-boundary}
 
-创建 `src/coding/tools/tool-utils.ts`：
+**工作区（workspace）**：允许工具访问的项目目录，由固定的 `cwd` 指定。
+本节建立工作区边界：接受内部路径，拒绝通过 `../` 或符号链接访问外部，并支持尚未创建的目标。
+函数只解析路径，不创建文件。
+
+**符号链接（symlink，也叫软链接）**：保存了另一条目标路径的文件系统对象。访问它时，
+系统通常会沿目标路径继续查找。例如 `/work/project/escape` 指向 `/outside`，
+那么访问 `escape/config.ts` 实际访问的是 `/outside/config.ts`，即使输入路径看起来位于工作区内。
+这就是“符号链接越界（symlink escape）”。参见 [GNU 对符号链接的说明](https://www.gnu.org/software/coreutils/manual/html_node/ln-invocation.html)。
+
+难点是：`resolve()` 只整理路径字符串，`realpath()` 才会解析符号链接，得到实际路径，但要求路径已存在。
+因此目标不存在时，要先向上找到已存在的祖先路径（父目录、父目录的父目录等），解析它，再拼回未创建的部分。
+`lstat()` 检查路径项本身；最后一项是符号链接时，它检查链接，而不是链接目标。
+相关 API 可对照 [Node.js 文件系统文档](https://nodejs.org/api/fs.html#fspromisesrealpathpath-options)。
+
+目标文件 `src/coding/tools/tool-utils.ts`。下面给出步骤 1 和查找循环，TODO 2～4
+分别补“记录路径段”“判断越界”“返回路径”，每处只需几行：
 
 ```ts
-import { resolve } from "node:path";
+import { lstat, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export type PathValidationResult =
   | { ok: true; path: string }
@@ -2490,24 +2534,113 @@ export async function resolveWorkspacePath(options: {
   cwd: string;
   inputPath: string;
 }): Promise<PathValidationResult> {
-  // 标准实现示例：第一步只做词法规范化，不能据此判定安全。
-  const absolutePath = resolve(options.cwd, options.inputPath);
+  try {
+    // 步骤 1（已给出）：解析可信 workspace；不存在时由外层 catch 返回 INVALID_PATH。
+    // realpath 解析 workspace 的符号链接；resolve 只拼接路径，不要求目标存在。
+    const realCwd = await realpath(options.cwd);
+    const absolutePath = resolve(options.cwd, options.inputPath);
+    let ancestor = absolutePath;
+    const missingParts: string[] = [];
 
-  // TODO 1：realpath cwd；cwd 不存在时返回 INVALID_PATH。
-  // TODO 2：向上找到 absolutePath 最近的已存在祖先并 realpath，处理 symlink。
-  // TODO 3：用 relative(realCwd, realAncestor) 判断是否越界；拒绝 ".." 和绝对结果。
-  // TODO 4：将尚不存在的尾部路径重新接到真实祖先，并返回最终 path。
-  throw new Error("TODO: implement resolveWorkspacePath");
+    // 目标可能尚未创建，逐级向上查找，直到找到存在的路径或遇到无法处理的错误。
+    while (true) {
+      try {
+        // lstat 检查路径项本身，末尾是符号链接时也不跟随它；成功后退出循环。
+        await lstat(ancestor);
+        break;
+      } catch (error) {
+        // 只有“路径不存在”才向上找，其他 I/O 错误交给外层 catch。
+        if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+        // dirname 去掉最后一个路径段；根目录的父路径还是它自己，不能继续上移。
+        const parent = dirname(ancestor);
+        if (parent === ancestor) throw error;
+
+        // TODO 2：记录被剥离的最后一个路径段，然后向父目录继续查找。
+        // basename 取最后一段；unshift 放到数组头部，保持后续拼接时的父到子顺序。
+        // 再将 ancestor 更新为 parent，进入下一轮循环。
+        throw new Error("TODO 2: collect missingParts and advance ancestor");
+      }
+    }
+
+    // 解析找到的路径实际指向的位置，避免 workspace 内的链接指向外部。
+    const realAncestor = await realpath(ancestor);
+    // relative 计算从 workspace 到真实路径的路线，如 "src"、"" 或 "../outside"。
+    const relativePath = relative(realCwd, realAncestor);
+
+    // TODO 3：越界时返回 { ok: false, code: "PATH_OUTSIDE_WORKSPACE", error: ... }。
+    // 拒绝 relativePath === ".."、以 `..${sep}` 开头，或 isAbsolute(relativePath)。
+    // 需要先向上走就表示越界；Windows 跨盘符时结果可能是绝对路径，也应拒绝。
+    // 空字符串表示 workspace 本身，允许通过；sep 是平台的路径分隔符。
+    throw new Error("TODO 3: reject an ancestor outside realCwd");
+
+    // TODO 4：通过边界检查后，返回 { ok: true, path: ... }。
+    // 在真实路径上拼回尚不存在的部分，保留符号链接解析后的结果。
+    // 用 resolve(realAncestor, ...missingParts) 拼回路径；不要返回 absolutePath。
+  } catch (error) {
+    return {
+      ok: false,
+      code: "INVALID_PATH",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 ```
 
-这是课程对基础参考实现的安全增强。需要明确测试：
+#### 用一个未创建的文件演算 TODO 2
+
+假设 `cwd = /work/project`，只存在 `/work/project/src`，输入为
+`src/generated/config.ts`，且这些已存在的目录都不是符号链接：
+
+| 本轮 `ancestor` | 更新后的 `missingParts` | 下一步 |
+|---|---|---|
+| `/work/project/src/generated/config.ts` | `["config.ts"]` | 不存在，上移到 `generated` |
+| `/work/project/src/generated` | `["generated", "config.ts"]` | 不存在，上移到 `src` |
+| `/work/project/src` | 保持不变 | 已存在，`break` |
+
+因此 `realAncestor = /work/project/src`，`relativePath = src`，祖先在工作区内。
+拼回后返回 `/work/project/src/generated/config.ts`，磁盘上的文件仍未创建。
+如果目标已经存在，第一轮就 `break`，`missingParts` 为空，最终返回目标的 `realpath()`。
+
+用 `unshift()`，是为了让路径段保持 `generated → config.ts` 的拼接顺序。
+
+TODO 3 必须比较真实路径。例如 `escape` 指向 `/outside`，输入 `escape/new.ts` 时，
+`realAncestor` 是 `/outside`，相对工作区的路径为 `../../outside`，应拒绝。
+也不要用字符串前缀判断：`/work/project-other` 以 `/work/project` 开头，但属于外部目录。
+
+<details>
+<summary>仍然卡住时，展开 TODO 2～4 的填空提示</summary>
+
+用以下两行替换 TODO 2 的 `throw`：
+
+```ts
+missingParts.unshift(basename(ancestor));
+ancestor = parent;
+```
+
+用以下分支替换 TODO 3 的 `throw`：
+
+```ts
+if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+  return { ok: false, code: "PATH_OUTSIDE_WORKSPACE", error: `Path is outside workspace: ${options.inputPath}` };
+}
+```
+
+在 TODO 4 后添加成功返回：
+
+```ts
+return { ok: true, path: resolve(realAncestor, ...missingParts) };
+```
+
+</details>
+
+完成后运行
+`bun test src/coding/tools/__tests__/tool-utils.test.ts`（完整测试见 8.6），检查以下行为：
 
 - 相对路径；
 - 正常绝对路径；
 - `../` 越界；
 - 相似前缀目录；
-- 指向 workspace 外的 symlink；
+- 指向工作区外的符号链接；
 - 尚不存在的目标文件。
 
 ### 8.2 Tool 实现配方
@@ -2515,28 +2648,72 @@ export async function resolveWorkspacePath(options: {
 每个 Tool 按同一顺序实现：
 
 1. 定义用户目标和最小输入；
-2. Zod schema 的第一个字段放 `description`；
-3. 验证 path/range/size；
+2. Zod 参数定义的第一个字段放 `description`；
+3. 验证路径、范围和大小；
 4. 执行单一动作；
-5. success result 返回 `summary + data`；
-6. expected failure 返回 `summary + error + code + details`；
-7. 写 happy path、error code 和 boundary tests；
+5. 成功时返回 `summary + data`；
+6. 预期内的失败返回 `summary + error + code + details`；
+7. 测试正常成功流程（happy path）、错误码和边界情况；
 8. 注册到 `src/coding/tools/index.ts`。
 
-以 `read_file` 为例，目标文件是 `src/coding/tools/read-file.ts`。Tool 必须通过 factory
-绑定 workspace；`cwd` 是已初始化的可信边界，不允许模型通过 Tool input 修改：
+本节给出两个完整示例：`read_file` 展示文件 Tool 的标准结构，8.4 的 `bash` 展示
+子进程的资源管理。其余工具提供独立的工厂函数、参数定义和分项 TODO；长代码可按需展开。
+所有工厂函数都绑定可信 `cwd`，模型只能传入工具参数，不能修改工作区或输出上限。
+
+| 阅读顺序 | 内容 | 实现方式 |
+|---|---|---|
+| 8.2.1 | 结果辅助函数 + `read_file` | 完整示例，先跑通全文件读取 |
+| 8.3 | `str_replace` | 补齐读取、唯一替换、写入 |
+| 8.4 | `bash` | 完整示例，逐段观察退出、截断和取消 |
+| 8.2.2 | `file_info`、`list_files`、`glob_search`、`grep_search` | 按各自骨架补齐查询逻辑 |
+| 8.2.3 | `mkdir`、`write_file`、`move_path`、`apply_patch` | 按各自骨架补齐修改逻辑 |
+
+骨架里的 `throw new Error("TODO: ...")` 是待替换的位置，不是最终错误处理。
+成功返回 `okToolResult()`；预期失败返回 `errorToolResult(summary, error, code, details)`，
+沿用阶段 3 的四参数签名。I/O 异常统一由下面的 `errorFromException()` 处理。
+
+#### 8.2.1 完整示例：`read_file`
+
+目标文件 `src/coding/tools/tool-result.ts`。复用阶段 3 的结果构造函数，并将不存在的路径
+映射为 `FILE_NOT_FOUND`，取消映射为 `ABORTED`，其他异常使用各工具的失败错误码：
 
 ```ts
+export { errorToolResult, okToolResult } from "@/foundation/tools";
+
+export function errorFromException(error: unknown, fallbackCode: string, details?: Record<string, unknown>) {
+  const message = error instanceof Error ? error.message : String(error);
+  // 保留取消、文件不存在这两类可识别错误；其他异常使用工具传入的兜底错误码。
+  const code = error instanceof Error && error.name === "AbortError" ? "ABORTED"
+    : typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
+      ? "FILE_NOT_FOUND" : fallbackCode;
+  // as const 保留 ok 的字面量 false 类型，便于调用方按成功/失败分支收窄类型。
+  return { ok: false as const, summary: message, error: message, code, details };
+}
+```
+
+目标文件 `src/coding/tools/read-file.ts`。按“路径检查 → 读取 → 范围处理 → 截断”阅读。
+全文件读取保留原文的末尾换行；指定范围时输出 `行号: 内容`。范围端点必须成对提供，
+末尾换行产生的空项不计入行数；字符上限只限制保留的正文，超限追加 `[truncated]`。
+
+<details>
+<summary>展开完整示例：<code>read-file.ts</code></summary>
+
+```ts
+import { stat } from "node:fs/promises";
+
 import { z } from "zod";
 
 import { defineTool } from "@/foundation/tools";
 
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
 import { resolveWorkspacePath } from "./tool-utils";
 
 export function defineReadFileTool(options: { cwd: string; maxCharacters?: number }) {
+  // 工具通过闭包保留宿主指定的 workspace 和输出长度限制。
   return defineTool({
     name: "read_file",
     description: "Read a UTF-8 text file or a bounded line range",
+    // Registry 会用这个 schema 校验参数；对外的行号从 1 开始。
     parameters: z.object({
       description: z.string(),
       path: z.string(),
@@ -2544,33 +2721,495 @@ export function defineReadFileTool(options: { cwd: string; maxCharacters?: numbe
       endLine: z.number().int().positive().optional(),
     }),
     invoke: async (input, signal) => {
-      signal?.throwIfAborted();
-      const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
-      if (!resolved.ok) return { ...resolved, summary: resolved.error };
+      try {
+        signal?.throwIfAborted();
+        // 解析真实路径并检查 workspace 边界，后续只使用校验后的路径。
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+        // stat 提供文件类型信息，isFile() 排除目录等非普通文件。
+        if (!(await stat(resolved.path)).isFile()) {
+          return errorToolResult("Not a file", input.path, "NOT_A_FILE");
+        }
 
-      // 标准路径：边界通过后才读取；不存在的文件是业务失败，不是路径越界。
-      const file = Bun.file(resolved.path);
-      if (!(await file.exists())) {
-        return { ok: false, summary: "File not found", code: "FILE_NOT_FOUND", error: input.path };
+        const text = await Bun.file(resolved.path).text();
+        const lines = text === "" ? [] : text.split("\n");
+        // 末尾换行会让 split 多出一个空元素，不将它计为额外的一行。
+        if (text.endsWith("\n")) lines.pop();
+        let content = text;
+        const { startLine, endLine } = input;
+
+        if (startLine !== undefined || endLine !== undefined) {
+          // 指定行范围时，起止行必须成对提供、顺序正确且不超出文件行数。
+          if (startLine === undefined || endLine === undefined || startLine > endLine) {
+            return errorToolResult("Invalid line range", input.path, "INVALID_LINE_RANGE");
+          }
+          if (startLine > lines.length) {
+            return errorToolResult("Start line is out of range", input.path, "START_LINE_OUT_OF_RANGE");
+          }
+          if (endLine > lines.length) {
+            return errorToolResult("End line is out of range", input.path, "INVALID_LINE_RANGE");
+          }
+          // slice 从 0 开始且不包含右端点；例如第 2～4 行对应 slice(1, 4)。
+          // 为选中的文本加上原始行号，方便模型定位后续修改。
+          content = lines.slice(startLine - 1, endLine)
+            .map((line, index) => `${startLine + index}: ${line}`).join("\n");
+        }
+
+        // 文件读取期间也可能收到取消请求，因此返回前再检查一次。
+        signal?.throwIfAborted();
+        // 限制返回给模型的文本长度；此时文件已完整读入，限制的是输出量。
+        const limit = options.maxCharacters ?? 12_000;
+        const truncated = content.length > limit;
+        if (truncated) content = `${content.slice(0, limit)}\n[truncated]`;
+        return okToolResult(`Read ${input.path}`, { path: resolved.path, content, truncated });
+      } catch (error) {
+        // 将文件系统和取消异常转换为统一的工具失败结果。
+        return errorFromException(error, "READ_FAILED", { path: input.path });
       }
-      // TODO 1：用 stat 检查普通文件；目录返回 NOT_A_FILE，其他 I/O 错误规范化。
-      // TODO 2：读取 UTF-8 文本；把 text.split("\n") 的末尾空项排除出 lineCount，
-      // 但无范围时必须返回原始 text，保留末尾换行。
-      // TODO 3：有且仅有一个范围端点，或 start > end 时返回 INVALID_LINE_RANGE；
-      // start 超过 lineCount 返回 START_LINE_OUT_OF_RANGE，end 越界返回 INVALID_LINE_RANGE。
-      // TODO 4：范围输出固定为 `${lineNumber}: ${lineText}`，以换行连接。
-      // TODO 5：maxCharacters 限制保留的正文字符数，超限追加 "\n[truncated]"；
-      // 返回 { ok: true, summary, data: { path: resolved.path, content, truncated } }。
-      throw new Error("TODO: implement read_file");
     },
   });
 }
 ```
 
-补齐 TODO 时再导入所选的 `stat` API。
-先实现全文件读取，再补范围和截断，按 8.6 中的 `read_file` 用例逐个转绿。
+</details>
 
-建议稳定 error codes：
+先直接导入 `defineReadFileTool`，在临时文件上观察两种返回值：
+
+```ts
+const tool = defineReadFileTool({ cwd: workspace }); // workspace 是已创建的临时目录
+await tool.invoke({ description: "Read the file", path: "input.ts" });
+await tool.invoke({ description: "Read the first line", path: "input.ts", startLine: 1, endLine: 1 });
+```
+
+假设原文为 `const value = 1;\n`，两次的 `data.content` 分别是原文和
+`1: const value = 1;`。后续骨架沿用同一套路径校验和结果处理，不需要重新设计工具契约。
+
+#### 8.2.2 只读 Tool 骨架（8D）
+
+先实现 `file_info` 和 `list_files`，再实现文件名模式匹配（glob，例如 `**/*.ts` 匹配各级目录下的 TypeScript 文件）和文本搜索。以下代码分别放入同名文件；
+各 Tool 的输出字段与 8.5、8.6 一致。
+
+`file_info`：使用 `stat()` 得到文件类型和字节大小。
+
+<details>
+<summary>展开骨架与 TODO：<code>file-info.ts</code></summary>
+
+```ts
+import { stat } from "node:fs/promises";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineFileInfoTool(options: { cwd: string }) {
+  return defineTool({
+    name: "file_info",
+    description: "Inspect a file or directory",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+    }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+
+        // TODO 1：const info = await stat(resolved.path)。不存在由 catch 返回 FILE_NOT_FOUND。
+        // TODO 2：用 info.isFile()/isDirectory() 得到 type: "file" | "directory"。
+        // TODO 3：返回 okToolResult(summary, { path: resolved.path, type, size: info.size })。
+        throw new Error("TODO: implement file_info");
+      } catch (error) {
+        return errorFromException(error, "FILE_INFO_FAILED", { path: input.path });
+      }
+    },
+  });
+}
+```
+
+</details>
+
+`list_files`：列出请求目录的直接子项，排序后截取 `maxResults`；返回相对该目录的名称。
+
+<details>
+<summary>展开骨架与 TODO：<code>list-files.ts</code></summary>
+
+```ts
+import { readdir, stat } from "node:fs/promises";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineListFilesTool(options: { cwd: string; maxResults?: number; }) {
+  return defineTool({
+    name: "list_files",
+    description: "List the immediate entries in a directory",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+    }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+
+        // TODO 1：stat 后确认是目录；否则用 errorToolResult(summary, error, "NOT_A_DIRECTORY") 返回。
+        // TODO 2：await readdir(resolved.path) 得到直接子项名称，不需要递归；先 sort()。
+        // TODO 3：limit = options.maxResults ?? 200；entries = names.slice(0, limit)。
+        // TODO 4：返回 { entries, truncated: names.length > limit }，而非只返回 ok。
+        throw new Error("TODO: implement list_files");
+      } catch (error) {
+        return errorFromException(error, "LIST_FILES_FAILED", { path: input.path });
+      }
+    },
+  });
+}
+```
+
+</details>
+
+`glob_search`：用 `Bun.Glob` 枚举候选；确认候选仍在工作区内，再返回相对工作区的路径。
+扫描 API 可对照 [Bun Glob 文档](https://bun.com/docs/runtime/glob)。
+
+<details>
+<summary>展开骨架与 TODO：<code>glob-search.ts</code></summary>
+
+```ts
+import { realpath, stat } from "node:fs/promises";
+import { relative } from "node:path";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineGlobSearchTool(options: { cwd: string; maxResults?: number; }) {
+  return defineTool({
+    name: "glob_search",
+    description: "Find paths matching a glob pattern",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+      pattern: z.string(),
+    }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+
+        // TODO 1：确认 resolved.path 是目录；否则返回 NOT_A_DIRECTORY。
+        // TODO 2：new Bun.Glob(input.pattern).scan({ cwd: resolved.path, onlyFiles: true, followSymlinks: false })。
+        // 用 for await 消费结果；每个候选以 resolved.path 为基准再次 resolveWorkspacePath，跳过越界项。
+        // TODO 3：realCwd = await realpath(options.cwd)，用 relative(realCwd, candidate.path)
+        // 将通过校验的路径转换为相对 workspace 的路径；排序后再截取 maxResults ?? 200。
+        // TODO 4：返回 { paths, truncated }；truncated 表示匹配总数超过上限。
+        throw new Error("TODO: implement glob_search");
+      } catch (error) {
+        return errorFromException(error, "GLOB_SEARCH_FAILED", { path: input.path });
+      }
+    },
+  });
+}
+```
+
+</details>
+
+`grep_search`：先复用文件枚举思路，再逐行匹配。`regex` 默认为 false，表示普通文本查找；
+true 时使用正则。这里直接读取 UTF-8 文本实现，不依赖额外安装 `rg`。
+
+<details>
+<summary>展开骨架与 TODO：<code>grep-search.ts</code></summary>
+
+```ts
+import { realpath, stat } from "node:fs/promises";
+import { relative } from "node:path";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineGrepSearchTool(options: { cwd: string; maxResults?: number; }) {
+  return defineTool({
+    name: "grep_search",
+    description: "Search UTF-8 text files by text or regex",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+      pattern: z.string(),
+      regex: z.boolean().optional(),
+    }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+
+        // TODO 1：确认是目录；regex 为 true 时构造 new RegExp(input.pattern)，否则用 includes。
+        // TODO 2：用 Bun.Glob("**/*") 枚举文件（scan 选项同 glob_search），按路径排序。
+        // 每个候选再次验证 workspace 边界后，才用 Bun.file(candidate.path).text() 读取。
+        // TODO 3：逐行匹配；每条结果为 { path: relative(realCwd, candidate.path), line: index + 1, text }。
+        // realCwd = await realpath(options.cwd)；末尾换行产生的空项不计作一行。
+        // TODO 4：保留 maxResults ?? 200 条；再找到一条时 truncated=true，可以结束搜索。
+        // 返回 { matches, truncated }；没有匹配是成功，matches 为 []。
+        throw new Error("TODO: implement grep_search");
+      } catch (error) {
+        return errorFromException(error, "GREP_SEARCH_FAILED", { path: input.path });
+      }
+    },
+  });
+}
+```
+
+</details>
+
+#### 8.2.3 修改型 Tool 骨架（8E）
+
+`mkdir`：完成路径校验后创建目录，`recursive` 默认 true。
+
+<details>
+<summary>展开骨架与 TODO：<code>mkdir.ts</code></summary>
+
+```ts
+import { mkdir } from "node:fs/promises";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineMkdirTool(options: { cwd: string }) {
+  return defineTool({
+    name: "mkdir",
+    description: "Create a directory inside the workspace",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+      recursive: z.boolean().optional(),
+    }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+
+        // TODO 1：写入前再检查 signal；await mkdir(resolved.path, { recursive: input.recursive ?? true })。
+        // TODO 2：返回 okToolResult(summary, { path: resolved.path })。
+        throw new Error("TODO: implement mkdir");
+      } catch (error) {
+        return errorFromException(error, "MKDIR_FAILED", { path: input.path });
+      }
+    },
+  });
+}
+```
+
+</details>
+
+`write_file`：准备父目录，然后创建或覆盖文件。
+
+<details>
+<summary>展开骨架与 TODO：<code>write-file.ts</code></summary>
+
+```ts
+import { mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineWriteFileTool(options: { cwd: string }) {
+  return defineTool({
+    name: "write_file",
+    description: "Create or overwrite a UTF-8 text file",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+      content: z.string(),
+    }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+
+        // TODO 1：await mkdir(dirname(resolved.path), { recursive: true }) 准备父目录。
+        // TODO 2：写入前再检查 signal；await Bun.write(resolved.path, input.content)。
+        // TODO 3：返回 okToolResult(summary, { path: resolved.path })。
+        // 此 Tool 明确允许覆盖已有文件；修改现有片段时使用 str_replace。
+        throw new Error("TODO: implement write_file");
+      } catch (error) {
+        return errorFromException(error, "WRITE_FILE_FAILED", { path: input.path });
+      }
+    },
+  });
+}
+```
+
+</details>
+
+`move_path`：源与目标都必须通过工作区边界检查，源必须存在，再调用 `rename()`。
+
+<details>
+<summary>展开骨架与 TODO：<code>move-path.ts</code></summary>
+
+```ts
+import { rename, stat } from "node:fs/promises";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineMovePathTool(options: { cwd: string }) {
+  return defineTool({
+    name: "move_path",
+    description: "Move or rename a file or directory inside the workspace",
+    parameters: z.object({ description: z.string(), from: z.string(), to: z.string() }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const source = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.from });
+        if (!source.ok) return errorToolResult(source.error, source.error, source.code);
+        const target = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.to });
+        if (!target.ok) return errorToolResult(target.error, target.error, target.code);
+
+        // TODO 1：await stat(source.path) 确认源存在；ENOENT 由 catch 转为 FILE_NOT_FOUND。
+        // TODO 2：移动前检查 signal；await rename(source.path, target.path)。
+        // TODO 3：返回 okToolResult(summary, { from: source.path, to: target.path })。
+        throw new Error("TODO: implement move_path");
+      } catch (error) {
+        return errorFromException(error, "MOVE_FAILED", { from: input.from, to: input.to });
+      }
+    },
+  });
+}
+```
+
+</details>
+
+`apply_patch`：解析 unified diff，再根据原文**校验和应用修改块**。
+**hunk（修改块）**：补丁中描述一处局部修改的单元，以 `@@ ... @@` 开头，后面跟着这一处的
+上下文行、删除行和新增行。一个文件可以有多个修改块，一份补丁也可以涉及多个文件。
+
+这里拆成两个纯函数，避免把解析、内容匹配和磁盘写入混在一起。先跑通下面只有一个修改块的
+单文件更新，再扩展到多个修改块和多个文件：
+
+```diff
+--- a/input.ts
++++ b/input.ts
+@@ -1 +1 @@
+-const value = 1;
++const value = 2;
+```
+
+`---` 和 `+++` 分别标出修改前、后的文件路径。`@@ -1 +1 @@` 是修改块头（hunk header），
+表示修改前、后都从第 1 行开始，各涉及 1 行，等价于 `@@ -1,1 +1,1 @@`。
+代码里的 `oldStart/newStart` 对应起始行号，`oldCount/newCount` 对应涉及的行数。
+
+修改块内部用行首字符区分三种行：以空格开头的是未修改、需要与原文匹配的上下文行；
+`-` 开头的行要删除；`+` 开头的行要新增。上例没有上下文行，只把 `const value = 1;`
+替换为 `const value = 2;`。注意“以空格开头的行”不等于“空白行”。
+格式说明见 [GNU unified diff 文档](https://www.gnu.org/software/diffutils/manual/html_node/Detailed-Unified.html)。
+
+路径检查使用本教程的
+`resolveWorkspacePath()`；新增文件使用 `--- /dev/null`，文件删除不在这个 Tool 的契约内。
+
+<details>
+<summary>展开骨架与 TODO：<code>apply-patch.ts</code></summary>
+
+```ts
+import { mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+interface PatchHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: { kind: "context" | "delete" | "add"; text: string }[];
+}
+
+interface PatchFile {
+  oldPath: string;
+  newPath: string;
+  hunks: PatchHunk[];
+}
+
+function parsePatch(patch: string): PatchFile[] {
+  // TODO 1：按行扫描 ---/+++ 文件头，剥离 a/、b/ 前缀。
+  // TODO 2：用 /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/ 读取修改块头。
+  // 未写行数时按 1 处理；后续行按首字符 " "、"-"、"+" 保存 kind 和去掉前缀的 text。
+  // TODO 3：context+delete 数量应等于 oldCount，context+add 数量应等于 newCount。
+  // 无文件头、无修改块或数量不符时 throw，由 invoke 转为 PATCH_APPLY_FAILED。
+  throw new Error("TODO: parse unified diff");
+}
+
+function applyHunks(original: string, hunks: PatchHunk[]): string {
+  // TODO 1：将原文按行拆分，记录原文是否以换行结尾；末尾空项不作为正文行。
+  // TODO 2：保持 sourceIndex 和 output；先拷贝修改块前未改动的原文行。
+  // oldStart 从 1 开始计数；空文件插入修改块的 oldStart=0。当前位置已越过修改块时拒绝。
+  // TODO 3：context/delete 行必须与 source[sourceIndex] 相等，否则 throw。
+  // context 拷贝并前移，delete 只前移，add 只追加；后续修改块的坐标仍以原文为基准。
+  // TODO 4：拷贝原文剩余行，join("\n") 并保留原文末尾换行。
+  throw new Error("TODO: apply verified hunks");
+}
+
+export function defineApplyPatchTool(options: { cwd: string }) {
+  return defineTool({
+    name: "apply_patch",
+    description: "Apply a unified diff patch inside the workspace",
+    parameters: z.object({ description: z.string(), patch: z.string() }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const files = parsePatch(input.patch);
+        // TODO 1：逐个文件验证 oldPath/newPath 的 workspace 边界（跳过 /dev/null），失败时保留原 code 返回。
+        // 用 resolveWorkspacePath({ cwd: options.cwd, inputPath: file.newPath })，不要直接信任 patch 路径。
+        // TODO 2：普通更新读取旧文件；--- /dev/null 表示新增，原文取 ""；不支持删除文件。
+        // 用 applyHunks(original, file.hunks) 得到新文本；先完成内容校验，再写入对应文件。
+        // TODO 3：准备目标父目录，检查 signal，用 Bun.write 写入；记录 changedPaths。
+        // TODO 4：返回 okToolResult(summary, { paths: changedPaths })。
+        throw new Error("TODO: implement apply_patch");
+      } catch (error) {
+        return errorFromException(error, "PATCH_APPLY_FAILED");
+      }
+    },
+  });
+}
+```
+
+</details>
+
+建议固定以下错误码：
 
 ```text
 INVALID_PATH
@@ -2595,68 +3234,256 @@ ABORTED
 - 0 个匹配：`PATTERN_NOT_FOUND`；
 - 1 个匹配：执行替换；
 - 多个匹配且未显式允许：`AMBIGUOUS_REPLACEMENT`；
-- success data 返回替换位置和修改后的摘要。
+- 成功时在 `data` 中返回替换位置和修改后的摘要。
 
 这能阻止模型的局部意图意外变成全局修改。
 
-在 `src/coding/tools/str-replace.ts` 的 `invoke` 中，按下面的骨架补齐。输入 schema 使用
-`description/path/oldText/newText`，其中 `oldText` 必须非空，`newText` 可以为空：
+目标文件 `src/coding/tools/str-replace.ts`。下面补齐工厂函数与参数定义；
+`oldText` 必须非空，`newText` 可以为空。按四个 TODO 完成读取、匹配、替换和写入：
+
+<details>
+<summary>展开骨架与 TODO：<code>str-replace.ts</code></summary>
 
 ```ts
-// 此段位于 invoke 内；先完成路径校验、文件存在性检查和 signal 检查。
-const matches = original.split(input.oldText).length - 1;
-if (matches !== 1) {
-  return {
-    ok: false,
-    summary: "Replacement requires exactly one match",
-    error: `Found ${matches} matches`,
-    code: matches === 0 ? "PATTERN_NOT_FOUND" : "AMBIGUOUS_REPLACEMENT",
-  };
+import { stat } from "node:fs/promises";
+
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+import { resolveWorkspacePath } from "./tool-utils";
+
+export function defineStrReplaceTool(options: { cwd: string }) {
+  return defineTool({
+    name: "str_replace",
+    description: "Replace exactly one literal occurrence",
+    parameters: z.object({
+      description: z.string(),
+      path: z.string(),
+      oldText: z.string().min(1),
+      newText: z.string(),
+    }),
+    invoke: async (input, signal) => {
+      try {
+        signal?.throwIfAborted();
+        const resolved = await resolveWorkspacePath({ cwd: options.cwd, inputPath: input.path });
+        if (!resolved.ok) return errorToolResult(resolved.error, resolved.error, resolved.code);
+
+        // TODO 1：stat 确认普通文件（否则 NOT_A_FILE），再用 Bun.file(resolved.path).text() 读取 original。
+        // TODO 2：matches = original.split(input.oldText).length - 1。
+        // 0 次返回 PATTERN_NOT_FOUND，多次返回 AMBIGUOUS_REPLACEMENT，均不能写文件。
+        // TODO 3：updated = original.replace(input.oldText, () => input.newText)。
+        // callback 保证 $&、$1 等被当作普通文本；不要直接把 newText 当替换表达式。
+        // TODO 4：写入前检查 signal，Bun.write(resolved.path, updated)。
+        // 返回 okToolResult(summary, { path: resolved.path, replacements: 1 })。
+        throw new Error("TODO: implement str_replace");
+      } catch (error) {
+        return errorFromException(error, "STR_REPLACE_FAILED", { path: input.path });
+      }
+    },
+  });
 }
-const updated = original.replace(input.oldText, () => input.newText);
-// TODO：写入前再检查 signal，然后写 updated；成功后返回修改路径与 replacements: 1。
-// 使用 callback 返回 newText，避免 $&、$1 等被 String.replace 当成替换表达式。
 ```
 
-`original` 来自通过校验后的文件内容；0/多匹配分支必须发生在任何写入之前。
-先在临时文件上手动跑通“读 → 替换 → 再读”，再测试失败时文件的字节内容保持不变。
+</details>
+
+先在临时文件上手动跑通“读 → 替换 → 再读”，再用 8.6 检查 0/多匹配时文件保持不变，
+以及 `$&` 等文本不会被当成替换表达式。
 
 ### 8.4 `bash` 的边界
 
-`bash` Tool 负责进程执行和结果捕获，不负责自行决定是否安全。审批由阶段 10 的 Policy Middleware 完成。
+`bash` 工具负责进程执行和结果捕获，不负责自行决定是否安全。审批由阶段 10 的审批中间件完成。
 
 必须支持：
 
 - 明确的 `cwd`；
-- stdout、stderr、exit code；
-- timeout；
-- `AbortSignal` 时 kill 子进程；
-- 输出大小上限和 truncation marker；
-- non-zero exit 返回 structured error。
+- 标准输出（stdout）、标准错误输出（stderr）和退出码（exit code）；
+- 超时处理；
+- 收到 `AbortSignal` 取消信号时终止子进程；
+- 输出大小上限和截断标记，例如 `[truncated]`；
+- 退出码非零时返回包含错误码等字段的结构化错误。
 
-不要把 command 插入另一层未转义的 shell string。若契约接收完整 shell command，应明确这是 intentional shell execution，并把原始 command 展示在审批界面。
+不要把命令插入另一层未转义的 shell 字符串。若接口接收完整的 shell 命令，应明确它会交由 shell 解释执行，并把原始命令展示在审批界面。
 
 本课程的 `bash` 示例面向 macOS/Linux。先实现普通命令，再增加下面这些资源所有权：
 
 | 资源 | 创建位置 | 结束条件 |
 |---|---|---|
-| 子进程及进程组 | `Bun.spawn(["bash", "-c", command], { cwd, detached: true, ... })` | 正常退出，或 timeout/abort 后终止整个进程组 |
-| stdout/stderr reader | spawn 后立即并发消费 | 读到 EOF；达到保留上限后继续 drain，丢弃多余正文 |
-| timeout timer | spawn 后 | 所有退出路径 `clearTimeout` |
-| abort listener | spawn 前检查，spawn 后注册并再检查一次 | `finally` 移除 |
+| 子进程及进程组 | `Bun.spawn(["bash", "-c", command], { cwd, detached: true, ... })` | 正常退出，或超时、取消后终止整个进程组 |
+| 标准输出与错误输出的读取器 | 启动子进程后立即并发读取 | 读到流结束；达到保留上限后继续读取，丢弃多余正文 |
+| 超时计时器 | 启动子进程后 | 所有退出路径都调用 `clearTimeout` |
+| 取消事件监听器 | 启动子进程前检查，启动后注册并再检查一次 | 在 `finally` 中移除 |
 
-在 `src/coding/tools/bash.ts` 的 `invoke` 中依次完成这些块：
+这里的“继续读取直到流结束”也叫 drain：即使不再保留正文，也要把后续输出读走，
+避免输出管道写满后子进程无法继续。EOF 表示已经读到流末尾，没有后续数据。
+
+目标文件 `src/coding/tools/bash.ts`。这是第二个完整示例，沿用上面的现有要求。
+建议按 `captureOutput()` → `stop()` → 结果分支 → `finally` 的顺序阅读：
+
+- 两个读取器同时启动，各自最多保留 `maxOutputCharacters` 个正文字符，之后继续读取并丢弃超出部分；
+- `stop()` 只记录第一次超时或取消，先终止进程组，再等待 100ms 宽限期并发送 SIGKILL（强制终止信号）；
+- 等子进程和两个读取器都结束，才返回结果并清理计时器和监听器。
+
+<details>
+<summary>展开完整示例：<code>bash.ts</code></summary>
 
 ```ts
-// 这是 invoke 内的执行顺序骨架；变量和结果类型使用本文件的 Tool contract。
-// TODO 1：若 signal.aborted，直接返回 structured ABORTED，不能 spawn。
-// TODO 2：spawn 一个独立进程组，固定 cwd，同时开始读取 stdout 和 stderr。
-// TODO 3：把结束原因保存为 "exit" | "timeout" | "abort"，第一次原因生效后不可覆盖。
-// TODO 4：timeout/abort 先向进程组发 SIGTERM，宽限期后仍未退出则发 SIGKILL。
-// POSIX 进程组使用 process.kill(-child.pid, signal)；ESRCH 表示已经退出，可忽略。
-// TODO 5：等待 child.exited 和两个 reader 完成，再返回结果；finally 清理所有 timer/listener。
-// TODO 6：成功 data 包含 stdout/stderr/exitCode/truncated；超时和 abort 使用不同 code。
+import { z } from "zod";
+
+import { defineTool } from "@/foundation/tools";
+
+import { errorFromException, errorToolResult, okToolResult } from "./tool-result";
+
+// 达到保留上限后继续读到 EOF，避免子进程因 pipe 填满而阻塞。
+async function captureOutput(stream: ReadableStream<Uint8Array>, limit: number) {
+  // reader 独占读取该流；TextDecoder 默认将输出字节按 UTF-8 解码。
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let content = "";
+  let truncated = false;
+  const retain = (text: string) => {
+    // 只保留剩余空间内的文本；空间用完后仍读取，但不再追加内容。
+    const remaining = Math.max(0, limit - content.length);
+    content += text.slice(0, remaining);
+    // ||= 保留已有的 true，只要发生过截断就不会再恢复为 false。
+    truncated ||= text.length > remaining;
+  };
+  try {
+    while (true) {
+      // await 等待下一块输出，不会空转；done 表示已经读到流末尾（EOF）。
+      const { done, value } = await reader.read();
+      if (done) break;
+      // stream: true 保留解码状态，处理一个 UTF-8 字符被拆到不同块的情况。
+      retain(decoder.decode(value, { stream: true }));
+    }
+    // 输入结束后刷新 decoder，处理内部尚未输出的内容。
+    retain(decoder.decode());
+    return { content: truncated ? `${content}\n[truncated]` : content, truncated };
+  } finally {
+    // 成功或抛错都释放读取锁，避免该流一直被这个 reader 占用。
+    reader.releaseLock();
+  }
+}
+
+function signalProcessGroup(pid: number, signal: "SIGTERM" | "SIGKILL") {
+  try {
+    // macOS/Linux 上负 PID 指向整个进程组，包含仍留在组内的命令后代。
+    process.kill(-pid, signal);
+  } catch (error) {
+    // ESRCH 表示进程组已不存在，可忽略；其他错误继续交给调用方处理。
+    if (!(error instanceof Error && "code" in error && error.code === "ESRCH")) throw error;
+  }
+}
+
+export function defineBashTool(options: {
+  cwd: string;
+  timeoutMs?: number;
+  maxOutputCharacters?: number;
+}) {
+  // 创建工具时保留宿主配置，真正的命令执行发生在 invoke 被调用时。
+  return defineTool({
+    name: "bash",
+    description: "Execute a shell command and capture its output",
+    // Registry 用 schema 校验每次调用的参数；实际执行的是 command。
+    parameters: z.object({ description: z.string(), command: z.string() }),
+    invoke: async (input, signal) => {
+      // 调用开始前就已取消时，直接返回，避免启动子进程。
+      if (signal?.aborted) return errorToolResult("Command aborted", input.command, "ABORTED");
+      try {
+        // -c 让 Bash 解析整段命令；spawn 返回进程对象，不等待命令完成。
+        const child = Bun.spawn(["bash", "-c", input.command], {
+          // cwd 只设置初始工作目录，命令仍可通过 cd 等方式切换目录。
+          cwd: options.cwd,
+          // 创建独立进程组，组长 PID 用于后续向整组发送终止信号。
+          detached: true,
+          // 不提供交互式输入；通过 pipe 捕获标准输出和标准错误。
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        // stdout、stderr 各自应用此上限，长度按 JS 字符串的 length 计数。
+        const limit = options.maxOutputCharacters ?? 12_000;
+        // 立即同时读取两条流，暂不 await，避免某条 pipe 填满后卡住子进程。
+        const stdoutTask = captureOutput(child.stdout, limit);
+        const stderrTask = captureOutput(child.stderr, limit);
+        const state: { reason?: "exit" | "timeout" | "abort" } = {};
+        // ReturnType 提取定时器句柄类型；Promise<void> 只表示升级终止步骤完成。
+        let killTimer: ReturnType<typeof setTimeout> | undefined;
+        let escalationTask: Promise<void> | undefined;
+
+        const stop = (reason: "timeout" | "abort") => {
+          // 保留首次记录的停止原因，避免超时和取消重复安排终止操作。
+          if (state.reason !== undefined) return;
+          state.reason = reason;
+          // 先请求退出，给进程自行收尾的机会。
+          signalProcessGroup(child.pid, "SIGTERM");
+          // 约 100ms 后强制终止仍在组内的进程，并用 Promise 跟踪这一步。
+          escalationTask = new Promise((resolve, reject) => {
+            killTimer = setTimeout(() => {
+              try {
+                signalProcessGroup(child.pid, "SIGKILL");
+                resolve();
+              } catch (error) {
+                reject(error);
+              }
+            }, 100);
+          });
+        };
+        const onAbort = () => stop("abort");
+        // 超时和外部取消共用 stop；定时器到期才调用 callback，不阻塞当前函数。
+        const timeoutTimer = setTimeout(() => stop("timeout"), options.timeoutMs ?? 10_000);
+
+        try {
+          // once: true 让监听器触发一次后自动移除。
+          signal?.addEventListener("abort", onAbort, { once: true });
+          // 已取消的 signal 不会补发 abort 事件，注册后再检查一次以免漏掉。
+          if (signal?.aborted) onAbort();
+          // 同时等待退出码和两条流读完；进程退出时可能还有输出尚未读取。
+          const [exitCode, stdout, stderr] = await Promise.all([child.exited, stdoutTask, stderrTask]);
+          // 等待宽限期结束，收回仍留在进程组内的后代。
+          // 正常完成时任务为 undefined，await 不需要等待任何异步任务。
+          await escalationTask;
+          // ??= 只在原因未设置时记为正常退出，保留已有的 timeout/abort。
+          state.reason ??= "exit";
+          const data = {
+            stdout: stdout.content,
+            stderr: stderr.content,
+            exitCode,
+            truncated: stdout.truncated || stderr.truncated,
+          };
+          // 优先返回取消或超时原因；被终止后的非零退出码不能覆盖这些原因。
+          if (state.reason === "abort")
+            return errorToolResult("Command aborted", input.command, "ABORTED", data);
+          if (state.reason === "timeout")
+            return errorToolResult("Command timed out", input.command, "COMMAND_TIMED_OUT", data);
+          if (exitCode !== 0) return errorToolResult("Command failed", input.command, "COMMAND_FAILED", data);
+          return okToolResult("Command completed", data);
+        } catch (error) {
+          // reader 等执行环节失败时，也要收回子进程和两个 pipe。
+          signalProcessGroup(child.pid, "SIGKILL");
+          // 清理时即使某个任务失败，也等其余任务结束，再抛出原始异常。
+          await Promise.allSettled([child.exited, stdoutTask, stderrTask]);
+          throw error;
+        } finally {
+          // return 或抛错也会执行，清除定时器和监听器，避免执行结束后再触发。
+          clearTimeout(timeoutTimer);
+          if (killTimer !== undefined) clearTimeout(killTimer);
+          signal?.removeEventListener("abort", onAbort);
+        }
+      } catch (error) {
+        // 内层负责收尾，这里将传播出来的异常转换为统一的工具失败结果。
+        return errorFromException(error, "COMMAND_FAILED", { command: input.command });
+      }
+    },
+  });
+}
 ```
+
+</details>
+
+`Bun.spawn()` 的参数与输出管道读取可对照 [Bun 子进程文档](https://bun.com/docs/runtime/child-process)。
+先运行 8.6 的普通命令测试，再观察输出上限、超时和运行中取消的测试。
 
 只调用 `child.kill()` 可能留下 shell 启动的孙进程。8.6 会启动一个延迟写文件的孙进程，
 检查取消后它没有继续产生副作用。不要用 `Promise.race` 返回超时后就丢弃仍在运行的进程。
@@ -2665,10 +3492,27 @@ const updated = original.replace(input.oldText, () => input.newText);
 
 目标文件：`src/coding/tools/index.ts`
 
-用 `defineCodingTools()` 创建阶段 8 的全部 Tool：
+各 Tool 完成后，用 `defineCodingTools()` 组装。下面给出完整接线代码；
+所有文件系统工具共享 `cwd`，组装时把各项上限转发到需要它们的工厂函数。
+在 8A～8C 迭代时仍直接导入当前工厂函数，避免尚未实现的模块阻塞验证。
+
+<details>
+<summary>展开完整示例：<code>index.ts</code></summary>
 
 ```ts
 import type { Tool } from "@/foundation/tools";
+
+import { defineApplyPatchTool } from "./apply-patch";
+import { defineBashTool } from "./bash";
+import { defineFileInfoTool } from "./file-info";
+import { defineGlobSearchTool } from "./glob-search";
+import { defineGrepSearchTool } from "./grep-search";
+import { defineListFilesTool } from "./list-files";
+import { defineMkdirTool } from "./mkdir";
+import { defineMovePathTool } from "./move-path";
+import { defineReadFileTool } from "./read-file";
+import { defineStrReplaceTool } from "./str-replace";
+import { defineWriteFileTool } from "./write-file";
 
 export interface DefineCodingToolsOptions {
   cwd: string;
@@ -2678,16 +3522,33 @@ export interface DefineCodingToolsOptions {
 }
 
 export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
-  // TODO：构造并返回阶段 8 的全部 Tool；每个 filesystem Tool 共享 options.cwd。
-  // 提示：只读 Tool 放前、修改型 Tool 放后，并保持数组顺序稳定供测试与 UI 使用。
-  // bashTimeoutMs/maxOutputCharacters 只传给需要它们的 Tool，不能接受模型侧覆盖。
-  throw new Error("TODO: implement defineCodingTools");
+  return [
+    defineFileInfoTool(options),
+    defineListFilesTool(options),
+    defineGlobSearchTool(options),
+    defineGrepSearchTool(options),
+    defineReadFileTool({ cwd: options.cwd, maxCharacters: options.maxOutputCharacters }),
+    defineMkdirTool(options),
+    defineWriteFileTool(options),
+    defineStrReplaceTool(options),
+    defineApplyPatchTool(options),
+    defineMovePathTool(options),
+    defineBashTool({ cwd: options.cwd, timeoutMs: options.bashTimeoutMs, maxOutputCharacters: options.maxOutputCharacters }),
+  ];
 }
+
+export {
+  defineApplyPatchTool, defineBashTool, defineFileInfoTool, defineGlobSearchTool,
+  defineGrepSearchTool, defineListFilesTool, defineMkdirTool, defineMovePathTool,
+  defineReadFileTool, defineStrReplaceTool, defineWriteFileTool,
+};
 ```
+
+</details>
 
 8D/8E 的输出字段固定如下，便于测试内容而不是只测试 `ok`：
 
-| Tool | success `data` 的必要字段 |
+| 工具 | 成功结果中 `data` 的必要字段 |
 |---|---|
 | `file_info` | `path`（绝对路径）、`type`（`file`/`directory`）、`size` |
 | `list_files` | `entries`（相对请求目录的名称，排序）、`truncated` |
@@ -2698,15 +3559,15 @@ export function defineCodingTools(options: DefineCodingToolsOptions): Tool[] {
 | `bash` | `stdout`、`stderr`、`exitCode`、`truncated` |
 
 `maxResults` 控制 list/glob/grep 的条数；`maxOutputCharacters` 转发为 read_file 的
-`maxCharacters`，并控制 bash 保留的输出正文。上限由 composition 配置，不能由模型放大。
+`maxCharacters`，并控制 bash 保留的输出正文。上限由组装工具的调用方配置，不能由模型放大。
 
-参数规则：所有 Tool input 的首字段都是 `description`；文件路径相对固定 `cwd`；
-`startLine/endLine` 为 1-based 且必须成对出现；bash timeout 来自 composition 配置而非模型。
+参数规则：所有工具输入的首字段都是 `description`；文件路径相对固定 `cwd`；
+`startLine/endLine` 从 1 开始计数且必须成对出现；bash 超时时间由组装工具的调用方配置。
 
 目标文件：`examples/stage-08-coding-tools.ts`
 
-示例在系统临时目录中创建 fixture，三种模式都通过公开 Tool contract 操作。结束时输出
-简化 workspace diff，并在 `finally` 中删除临时目录。
+示例在系统临时目录中准备测试文件，三种模式都通过工具的公开接口操作。结束时输出
+工作区修改前后的简化差异，并在 `finally` 中删除临时目录。
 
 <details>
 <summary>展开完整代码：<code>stage-08-coding-tools.ts</code></summary>
@@ -2803,7 +3664,7 @@ await main();
 
 ### 运行与观察
 
-创建一个临时 fixture repo，依次运行：
+创建一个用于测试的临时项目目录，依次运行：
 
 ```bash
 bun run examples/stage-08-coding-tools.ts inspect
@@ -2811,20 +3672,20 @@ bun run examples/stage-08-coding-tools.ts edit
 bun run examples/stage-08-coding-tools.ts reject-path
 ```
 
-示例最后打印 workspace diff，而不只是打印 `ok: true`。你应能看到每个 Tool 对外部世界造成的具体变化。
+示例最后打印工作区修改前后的差异，而不只是打印 `ok: true`。你应能看到每个工具对外部世界造成的具体变化。
 
 ### 8.6 完整测试
 
 目标文件：`src/coding/tools/__tests__/tool-utils.test.ts`
 
-每个 filesystem Tool 都依赖这里固定的 workspace boundary。下面是完整测试文件：
+每个文件系统工具都依赖这里固定的工作区边界。下面是完整测试文件：
 
 <details>
 <summary>展开完整代码：<code>tool-utils.test.ts</code></summary>
 
 ```ts
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -2834,8 +3695,9 @@ let workspace: string;
 let outside: string;
 
 beforeEach(async () => {
-  workspace = await mkdtemp(join(tmpdir(), "harness-lab-tool-"));
-  outside = await mkdtemp(join(tmpdir(), "harness-lab-outside-"));
+  // macOS 的 tmpdir() 可能经过 /var symlink；预期值也统一为真实路径。
+  workspace = await realpath(await mkdtemp(join(tmpdir(), "harness-lab-tool-")));
+  outside = await realpath(await mkdtemp(join(tmpdir(), "harness-lab-outside-")));
 });
 
 afterEach(async () => {
@@ -2992,12 +3854,11 @@ describe("mutating coding tools", () => {
 
   test("apply_patch applies a valid patch and diagnoses an invalid one", async () => {
     const patch = [
-      "*** Begin Patch",
-      "*** Update File: input.ts",
-      "@@",
+      "--- a/input.ts",
+      "+++ b/input.ts",
+      "@@ -1 +1 @@",
       "-const value = 1;",
       "+const value = 2;",
-      "*** End Patch",
     ].join("\n");
 
     expect(await invoke("apply_patch", { patch })).toMatchObject({ ok: true });
@@ -3076,15 +3937,15 @@ bun test src/coding/tools
 ### 验收
 
 - [ ] 所有修改型 Tool 都有副作用测试；
-- [ ] path traversal 和 symlink escape 被拒绝；
+- [ ] 通过 `../` 访问工作区外部，以及符号链接越界，都被拒绝；
 - [ ] `str_replace` 不做隐式多处替换；
-- [ ] bash 超时和 abort 不遗留子进程；
+- [ ] bash 超时和取消不遗留子进程；
 - [ ] 输出有大小上限；
 - [ ] `ADR-009` 解释为什么采用多个窄 Tool。
 
 ## 阶段 9：组装 Coding Agent、Skills、Todo 与项目指令
 
-> 上一阶段回顾：阶段 8 建立了一组窄而安全的 Coding Tools，统一了 workspace boundary、结构化结果、超时与中止行为。
+> 上一阶段回顾：阶段 8 建立了一组职责单一的 Coding Tools，统一了工作区边界、结构化结果、超时与中止行为。
 
 创建新增文件：
 
@@ -3131,7 +3992,8 @@ examples/
 
 ### 9.1 Coding Agent composition root
 
-不要把 Coding 逻辑放回通用 `Agent`。
+composition root 指“组装入口”：集中创建模型、工具和中间件，并把它们连接为一个 Agent。
+不要把编码场景特有的逻辑放回通用 `Agent`。
 
 目标文件：`src/coding/agents/coding-agent.ts`
 
@@ -3163,22 +4025,24 @@ export async function defineCodingAgent(options: {
 }
 ```
 
-composition root 只做组装，不实现 filesystem 或 loop 细节。
+组装入口只做组装，不实现文件系统操作或 Agent 循环的细节。
 
 ### 9.2 `AGENTS.md`
 
-启动时查找 workspace root 的 `AGENTS.md`：
+启动时查找工作区根目录的 `AGENTS.md`：
 
 - 不存在时正常运行；
-- 存在时读取为 project guidance；
-- trace 中记录文件路径和 content hash，不默认复制完整内容；
-- 不把 guidance 称为“模型学习到的长期记忆”。它只是每次 run 可重载的持久化指令。
+- 存在时读取为项目指令（project guidance）；
+- 运行追踪记录（trace）中记录文件路径和内容哈希值，用于辨别内容是否变化，不默认复制完整内容；
+- 不把项目指令称为“模型学习到的长期记忆”。它只是每次运行可重新加载的持久化指令。
 
-为防止 project guidance 无限制膨胀，设置字符或 token 上限，超限时给出明确 warning。
+对话记录（transcript）保存用户、助手和工具之间的消息；运行追踪记录则关注一次运行经历的步骤、耗时和结果。
+为防止项目指令无限制膨胀，设置字符或 token 上限，超限时给出明确警告。
 
 ### 9.3 Skills progressive loading
 
-定义最小 frontmatter：
+Skills 采用渐进式加载（progressive loading）：先只加载名称和简介，需要时再读取完整内容。
+frontmatter 是 Markdown 文件开头由两行 `---` 包围的元数据；这里用 YAML 写名称和描述：
 
 ```yaml
 ---
@@ -3191,7 +4055,7 @@ description: Use when adding or repairing automated tests.
 Instructions...
 ```
 
-Skill discovery 只读取 `name`、`description`、`path`，把列表注入 model prompt。只有模型选择 Skill 或用户显式指定 Skill 后，才调用 `read_file` 加载完整 `SKILL.md`。
+发现可用 Skill 时，只读取 `name`、`description`、`path`，把列表注入模型提示词。只有模型选择 Skill 或用户显式指定 Skill 后，才调用 `read_file` 加载完整 `SKILL.md`。
 
 目标文件：`src/agent/skills/skill-reader.ts`
 
@@ -3226,23 +4090,23 @@ export async function readSkill(options: {
 必须测试：
 
 - 目录不存在；
-- malformed frontmatter；
-- 重复 path；
-- 同名不同 path；
+- 元数据格式错误；
+- 重复路径；
+- 同名但路径不同；
 - 显式选择 Skill；
-- Skill 内容只在选择后进入 transcript。
+- Skill 内容只在选择后进入对话记录。
 
 ### 9.4 Todo system
 
 Todo 由一个 Tool 和一个 Middleware 组成：
 
 - `todo_write` Tool 管理结构化状态；
-- Middleware 在长时间未更新时注入 reminder；
-- 最多一个 item 为 `in_progress`；
-- `merge=true` 按 id 更新，`merge=false` 全量替换；
-- UI 从结构化 store 渲染，不从 assistant 文本猜 Todo。
+- Middleware 在长时间未更新时注入提醒；
+- 最多一个待办项为 `in_progress`；
+- `merge=true` 按 `id` 更新，`merge=false` 全量替换；
+- UI 从结构化状态渲染，不从助手回复中猜测 Todo。
 
-这是一项很好的 Middleware 练习：状态属于 Todo system，通用 Agent 只负责调用 hooks。
+这是一项很好的 Middleware 练习：状态属于待办系统，通用 Agent 只负责调用生命周期钩子。
 
 目标文件：`src/agent/todos/todo-system.ts`
 
@@ -3317,11 +4181,11 @@ export function defineAskUserQuestionTool(options: {
 }
 ```
 
-测试 handler 被并发 Tool 调度调用时不会丢失 call id。
+测试处理函数被并发工具调度调用时不会丢失调用标识。
 
 ### 运行与观察
 
-准备 fixture workspace：
+准备用于测试的工作区：
 
 ```text
 fixture/                                      # 离线 Coding Agent 示例 workspace
@@ -3332,8 +4196,8 @@ fixture/                                      # 离线 Coding Agent 示例 works
 
 目标文件：`examples/stage-09-coding-agent.ts`
 
-`fixture/AGENTS.md` 应包含一条可辨识的 project guidance，Skill frontmatter 的 name 应为
-`test-writer`。示例会确认二者进入首次 model view，然后使用 scripted responses 驱动
+`fixture/AGENTS.md` 应包含一条可辨识的项目指令，Skill 元数据中的 `name` 应为
+`test-writer`。示例会确认二者进入首次模型请求，再使用预设响应驱动
 Skill 文件读取、Todo 更新和源码读取。
 
 <details>
@@ -3470,7 +4334,7 @@ await main();
 bun run examples/stage-09-coding-agent.ts fixture
 ```
 
-使用 scripted provider 完成一次“读取 guidance → 列出 Skill → 加载 Skill → 建 Todo → 读取文件 → 最终回答”的 run。输出 transcript，并断言没有真实 API。
+使用按预设脚本返回结果的模拟 Provider，完成一次“读取项目指令 → 列出 Skill → 加载 Skill → 建 Todo → 读取文件 → 最终回答”的运行。输出对话记录，并断言没有调用真实 API。
 
 ### 9.6 完整测试
 
@@ -3729,12 +4593,12 @@ bun test src/agent/skills src/agent/todos src/coding/agents src/coding/tools/__t
 
 ### 验收
 
-- [ ] Coding Agent 通过 composition 构造；
-- [ ] 通用 Agent 不 import coding layer；
+- [ ] Coding Agent 通过组装入口构造；
+- [ ] 通用 Agent 不导入 `coding` 层；
 - [ ] Skill 完整内容按需加载；
 - [ ] Todo 状态可独立测试；
-- [ ] `AGENTS.md` 有 size guard；
-- [ ] `ADR-010` 区分 project guidance、Skill、Todo 和 transcript。
+- [ ] `AGENTS.md` 有内容大小限制；
+- [ ] `ADR-010` 区分项目指令、Skill、Todo 和对话记录。
 
 ## 阶段 10：CLI/TUI、模型配置与 Human-in-the-loop
 
@@ -3742,16 +4606,17 @@ bun test src/agent/skills src/agent/todos src/coding/agents src/coding/tools/__t
 
 ### 本阶段目标
 
-把 runtime 变成真正可用的终端产品，同时建立人工审批边界。完成后打 `v0.1.0` tag，表示基础复刻结束。
+把运行时变成真正可用的终端产品，同时建立人工审批边界。Human-in-the-loop 指“人在执行流程中参与决策”，
+这里体现为人工审批工具操作，以及回答 Agent 提出的问题。完成后创建 `v0.1.0` 版本标签，表示基础复刻结束。
 
 本阶段再分四步，不要求第一次就写出七个组件：
 
 | 小里程碑 | 范围 | 反馈 |
 |---|---|---|
-| 10A | 配置解析 + 文本客户端 | 输入一行，消费一次 Agent stream，显示结果 |
+| 10A | 配置解析 + 文本客户端 | 输入一行，读取一次 Agent 流式输出，显示结果 |
 | 10B | reducer + 最小 Ink 界面 | 输入、忙碌提示、消息历史；沿用同一 Agent |
-| 10C | 审批和 Ask user | 等待、允许、拒绝、取消都能结束；并发请求不会覆盖 |
-| 10D | Todo、token、slash commands 和组件拆分 | 完成本节手工验收，最后执行完整 gate |
+| 10C | 审批和向用户提问 | 等待、允许、拒绝、取消都能结束；并发请求不会覆盖 |
+| 10D | Todo、token、斜杠命令（如 `/clear`）和组件拆分 | 完成本节手工验收，最后执行完整质量检查 |
 
 配置和文本客户端先独立运行，确认 provider、Tools、Agent 都正常之后再排查 React 状态。
 
@@ -3908,10 +4773,10 @@ export function resolveDefaultModel(config: HarnessConfig): ModelConfig {
 
 原则：
 
-- 配置只保存环境变量名，不保存 secret value；
-- schema validation error 显示完整字段路径；
-- default model 必须真实存在；
-- provider factory 只在 composition root 创建 SDK client。
+- 配置只保存环境变量名，不保存密钥值；
+- 配置校验错误显示完整字段路径；
+- 默认模型必须真实存在；
+- Provider 工厂函数只在组装入口创建 SDK 客户端。
 
 至少支持：
 
@@ -3978,12 +4843,14 @@ try {
 
 | 概念 | 在这里的职责 |
 |---|---|
-| component/props | 用函数描述界面，通过 props 接收 Agent；不要在 render 中重新创建 Agent |
-| `useReducer` | 根据事件计算下一份 state；不能直接修改旧数组 |
-| `useRef` | 同步保存 busy 标志，避免 React 更新提交前连续 Enter 触发两次 run |
-| `useEffect` cleanup | 组件卸载时 abort 并移除监听，防止后台 run 留存 |
+| component / props（组件 / 传入组件的参数） | 用函数描述界面，通过参数接收 Agent；不要在渲染时重新创建 Agent |
+| `useReducer` | 根据事件计算下一份状态；不能直接修改旧数组 |
+| `useRef` | 同步保存忙碌标志，避免 React 更新提交前连续按 Enter 触发两次运行 |
+| `useEffect` 的清理函数（cleanup） | 组件卸载时中止运行并移除监听，防止后台任务留存 |
 
-先完成下面的 reducer，再填充 hook 和界面骨架；无需同时学习复杂 React 优化。
+reducer 是“根据旧状态和事件计算新状态”的函数，例如收到 `run_start` 事件后将运行标志设为真。
+Hook 是 React 中使用状态等能力的函数，例如 `useReducer`；本节的 `useAgentLoop` 则把 Agent 与界面连接起来。
+先完成下面的 reducer，再填充 Hook 和界面骨架；无需同时学习复杂 React 优化。
 
 目标文件：`src/cli/tui/state.ts`
 
@@ -4063,7 +4930,7 @@ export function reduceAgentEvent(
 
 `Agent` 增加公开方法
 `clearMessages(): void`：运行中拒绝清除，空闲时把 `_context.messages` 置为空数组。
-hook 先调用这个方法，成功后再 dispatch `cleared`，避免 UI 与 transcript 不一致。
+Hook 先调用这个方法，成功后再派发 `cleared` 事件，避免 UI 与对话记录不一致。
 
 目标文件：`src/cli/tui/hooks/use-agent-loop.ts`：
 
@@ -4143,11 +5010,11 @@ export function mountApp(agent: Agent) {
 ```
 
 运行前先完成 reducer 中的 `user_submitted/run_start/run_end/progress` 分支。
-这个最小界面还没有审批和 slash command；进入 10C 时，在 `submit` 调模型之前解析 slash
-command，审批弹出时将 `TextInput` 的 focus 关闭，并用单独的状态显示 API error。
+这个最小界面还没有审批和斜杠命令；进入 10C 时，在 `submit` 调模型之前解析斜杠命令，
+审批弹出时取消 `TextInput` 的输入焦点，并用单独的状态显示 API 错误。
 
 当前 `AgentEvent.progress` 提供生成状态及 Tool 参数提示，不包含正文增量；因此先做
-忙碌指示和最终消息展示。若要正文逐字输出，需要显式扩展 progress snapshot 契约及测试，
+忙碌指示和最终消息展示。若要正文逐字输出，需要显式扩展进度快照的契约及测试，
 不能让 UI 读取 Agent 私有状态。不要把“进度提示”描述成已经实现了正文流式渲染。
 
 最低组件：
@@ -4155,7 +5022,7 @@ command，审批弹出时将 `TextInput` 的 focus 关闭，并用单独的状�
 - `MessageHistory`；
 - `InputBox`；
 - `StreamingIndicator`；
-- `Footer`：model、最新 input token、session total；
+- `Footer`：模型名称、最近一次输入的 token 数、会话累计 token 数；
 - `TodoPanel`；
 - `ApprovalPrompt`；
 - `AskUserQuestionPrompt`。
@@ -4163,10 +5030,10 @@ command，审批弹出时将 `TextInput` 的 focus 关闭，并用单独的状�
 支持：
 
 - Enter 提交；
-- Ctrl+C 中止当前 run，再次 Ctrl+C 退出；
+- Ctrl+C 中止当前运行，再次 Ctrl+C 退出；
 - `/clear`、`/help`、`/exit`；
 - 模型输出期间禁止重复提交；
-- 普通 API error 显示在 UI 错误区域，不写成模型回复或使 TUI 崩溃。
+- 普通 API 错误显示在 UI 错误区域，不写成模型回复或使 TUI 崩溃。
 
 ### 10.4 审批 Middleware
 
@@ -4231,21 +5098,22 @@ export function defineApprovalMiddleware(options: {
 `beforeToolUse` 行为：
 
 1. 只读 Tool 直接通过；
-2. 项目 allowlist 已包含 Tool 时通过；
+2. 项目的允许列表（allowlist）已包含该工具时通过；
 3. 否则排队展示审批；
-4. deny 返回 `__skip` result，让模型看到拒绝；
-5. `allow_always_project` 持久化 Tool name；
-6. persistence failure 不应把已批准动作变成未知状态，但必须记录 warning。
+4. 拒绝（`deny`）时返回 `__skip` 结果，让模型看到拒绝；
+5. `allow_always_project` 持久化工具名称；
+6. 持久化失败不应把已批准动作变成未知状态，但必须记录警告。
 
-审批队列要有限长，溢出时 fail closed。并发 Tool calls 不能同时覆盖一个全局 prompt。
+审批队列要有限长，溢出时拒绝执行，这叫 fail closed（出错时默认拒绝）；
+相反，出错时仍默认放行叫 fail open。并发工具调用的审批提示不能互相覆盖。
 
-阶段 13 会把“按 Tool name”升级为 command/path/network-aware policy；本阶段不要提前实现复杂 DSL。
+阶段 13 会把“按工具名称判断”升级为结合命令、路径和网络目标的权限策略；本阶段不要提前设计复杂的专用规则语言。
 
 ### 10.5 Token usage
 
 目标文件：`src/cli/tui/token-usage.ts`
 
-只从 assistant message 的 provider-reported usage 聚合：
+token 是模型处理文本时的计量单位，不等同于字数或词数。这里仅汇总助手消息中由 Provider 实际报告的 `usage`：
 
 ```ts
 import type { AssistantMessage, NonSystemMessage } from "@/foundation/messages";
@@ -4266,7 +5134,8 @@ export function calculateTokenUsage(messages: NonSystemMessage[]) {
 }
 ```
 
-它是观测值，不是 context window 的精确 tokenizer。阶段 13 会另建 token estimator/budget。
+这些用量是服务端报告的观测值，不能精确算出下一次请求会占用多少上下文空间。
+tokenizer（分词器）按模型规则将文本拆成 token；阶段 13 会另建用量估算和预算机制，在请求前控制上下文大小。
 
 ### 运行与观察
 
@@ -4276,12 +5145,12 @@ bun run dev
 
 手工验收脚本：
 
-1. 输入普通问候，观察 streaming 和 token；
+1. 输入普通问候，观察流式输出和 token 用量；
 2. 请求读取文件，确认无审批；
-3. 请求修改文件，选择 deny，确认模型收到拒绝；
-4. 再请求修改，选择 allow once；
-5. 运行慢 command，按 Ctrl+C，确认子进程结束；
-6. 使用 `/clear`，确认 UI 和 Agent transcript 同时清空；
+3. 请求修改文件，选择拒绝（`deny`），确认模型收到拒绝；
+4. 再请求修改，选择仅允许本次（`allow_once`）；
+5. 运行耗时命令，按 Ctrl+C，确认子进程结束；
+6. 使用 `/clear`，确认 UI 和 Agent 对话记录同时清空；
 7. 重启后验证 `allow_always_project`。
 
 把这套步骤写成 `docs/manual-test.md`，阶段 15 录制演示时直接复用。
@@ -4547,14 +5416,14 @@ bun test src/cli src/coding/permissions
 ### 基础复刻总验收
 
 - [ ] `bun run check` 全部通过；
-- [ ] scripted/offline demo 始终可运行；
-- [ ] 有 key 时真实 provider 可用；
-- [ ] read-only 与 mutating Tool 审批行为不同；
-- [ ] abort 能结束模型请求和子进程；
+- [ ] 使用预设响应的离线示例始终可运行；
+- [ ] 配置密钥后真实 Provider 可用；
+- [ ] 只读工具与修改型工具的审批行为不同；
+- [ ] 取消操作能结束模型请求和子进程；
 - [ ] Skills、Todo、`AGENTS.md` 在 TUI 可观察；
-- [ ] 配置不保存 secret；
+- [ ] 配置不保存密钥；
 - [ ] `ADR-011` 解释 Human-in-the-loop 的 fail-open/fail-closed 选择；
-- [ ] 创建 `v0.1.0` tag。
+- [ ] 创建 `v0.1.0` 版本标签。
 
 ## 第三部分复盘
 
@@ -4579,10 +5448,10 @@ TUI input
 
 你必须能指出：
 
-- 哪些数据是 canonical state；
-- 哪些只是单次请求 view；
+- 哪些数据属于内部统一状态；
+- 哪些只是为单次请求临时整理的数据；
 - 哪些是外部副作用；
-- 哪些信息适合写入 trace；
+- 哪些信息适合写入运行追踪记录；
 - 异常中断时最少要保存什么才能恢复。
 
 最后一个问题正是下一部分的起点。
