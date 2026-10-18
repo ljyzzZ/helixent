@@ -129,11 +129,12 @@
 
 ## 阶段 9：Context 能力
 
-- [ ] Coding Agent 只在 composition root 组装；
-- [ ] `AGENTS.md` 不存在/超限均有明确行为；
-- [ ] Skills progressive loading 可观察；
-- [ ] Todo merge/reminder 可测试；
-- [ ] Ask user Tool 保留 call id；
+- [ ] 按 9.1～9.5 完成各节实现与随节测试，9.6 离线对话跑通；
+- [ ] Coding Agent 只在 composition root 组装，Tool/Middleware 共用同一个 TodoSystem；
+- [ ] `AGENTS.md` 不存在/超限均有明确行为，文件内容不写入 canonical transcript；
+- [ ] Skills hook 返回临时 Model view，不修改 canonical context；正文只在选择后通过 Tool result 加载；
+- [ ] Todo merge 原子提交、快照隔离、成功更新与重复提醒的计时均有测试；
+- [ ] Ask user 的并发答案各自配对，signal 透传且取消后的答案被拒绝；
 - [ ] ADR-010 完成。
 
 ## 阶段 10：CLI/TUI 与审批
@@ -144,7 +145,10 @@
 - [ ] 配置不保存 secret value；
 - [ ] 忙碌状态、最终消息、token、Todo 在 TUI 可见；正文流式显示若实现则另有契约与测试；
 - [ ] Ctrl+C 中止并可开始下一轮；
-- [ ] 审批队列 FIFO 且 overflow fail closed；
+- [ ] 审批队列 FIFO 且 overflow fail closed，容量包含当前展示中的请求；
+- [ ] signal 贯穿 beforeToolUse 和输入队列，取消、卸载均结束等待；
+- [ ] 并发提问答案按 id 配对，迟到答案不能回答下一条请求；
+- [ ] 审批持久化失败发出 warning；重启复用时按项目隔离；
 - [ ] deny 结果反馈模型；
 - [ ] `docs/manual-test.md` 跑通；
 - [ ] `bun run check` 通过；

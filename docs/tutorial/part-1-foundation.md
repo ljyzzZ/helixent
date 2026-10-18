@@ -172,7 +172,7 @@ Agent 不是“反复拼字符串”。它维护一个有角色、有内容类�
 1. `role` 是 Message union 的 discriminator；
 2. `type` 是 Content union 的 discriminator；
 3. `ToolResultContent.tool_use_id` 必须引用之前的 `ToolUseContent.id`；
-4. 内部只保存 canonical message，不把 OpenAI/Anthropic wire type 泄漏进来。
+4. 内部只保存 canonical message（采用项目内部统一格式的消息），不把 OpenAI/Anthropic wire type 泄漏进来。
 
 ### 1.1 文件结构
 
@@ -192,14 +192,14 @@ touch examples/stage-01-transcript.ts
 执行后应得到：
 
 ```text
-src/foundation/messages/          # canonical Message 模块
+src/foundation/messages/          # canonical Message（项目内部统一的消息类型）模块
 ├── types/                        # Message 与 Content 类型定义
 │   ├── content.ts                # 定义各类 Content 及其 union
 │   ├── message.ts                # 定义各角色 Message 及其 union
 │   └── index.ts                  # 汇总导出 types
 ├── __tests__/                    # Message 模块的自动化测试
 │   └── transcript.test.ts        # 验证 transcript 格式与调用关联
-├── transcript.ts                 # 将 canonical messages 格式化为可读文本
+├── transcript.ts                 # 将 canonical messages（采用内部统一格式的消息）格式化为可读文本
 └── index.ts                      # 导出 Message 模块的公共 API
 examples/
 └── stage-01-transcript.ts        # 演示 transcript 的格式化输出
@@ -453,7 +453,7 @@ assistant: 北京今天晴，26°C。
 bun run examples/stage-01-transcript.ts
 ```
 
-把 formatter 输出保留下来。阶段 11 的 trace viewer 会复用同一套 canonical type，而不是重新解析 provider response。
+把 formatter 输出保留下来。阶段 11 的 trace viewer 会复用同一套 canonical type（项目内部统一的数据类型），而不是重新解析 provider response。
 
 ### 1.4 完整测试
 
@@ -551,11 +551,11 @@ bun test src/foundation/messages
 
 ## 阶段 2：隔离模型与 Provider
 
-> 上一阶段回顾：阶段 1 定义了 canonical Message/Content union、Tool call 关联规则和 transcript formatter，让后续各层共享同一种对话表示。
+> 上一阶段回顾：阶段 1 定义了 canonical Message/Content union（项目内部统一的消息与内容联合类型）、Tool call 关联规则和 transcript formatter，让后续各层共享同一种对话表示。
 
 ### 本阶段的系统能力
 
-Agent 只依赖 `Model`，不知道请求最终发往哪个厂商。Provider adapter 负责 canonical Message 与外部 API 之间的转换。
+Agent 只依赖 `Model`，不知道请求最终发往哪个厂商。Provider adapter 负责 canonical Message（项目内部统一的消息表示）与外部 API 之间的转换。
 
 必须保持的不变量：
 
@@ -582,7 +582,7 @@ touch examples/stage-02-model-stream.ts
 
 ```text
 src/foundation/models/                  # 通用模型调用边界
-├── model-context.ts                    # 定义每次模型调用的 canonical 输入
+├── model-context.ts                    # 定义每次模型调用的 canonical 输入（项目内部统一的请求表示）
 ├── model-provider.ts                   # 定义 Provider 必须实现的接口
 ├── model.ts                            # 封装模型名、选项和 Provider 调用
 ├── scripted-model-provider.ts          # 按脚本返回结果，供离线示例与测试使用
@@ -784,7 +784,7 @@ export { ScriptedModelProvider } from "./scripted-model-provider";
 目标文件：`examples/stage-02-model-stream.ts`
 
 下面的示例通过 `Model.stream()` 消费累计快照。循环只读取 canonical
-`AssistantMessage`，不接触 `ScriptedModelProvider` 的内部状态。
+`AssistantMessage`（项目内部统一的助手消息表示），不接触 `ScriptedModelProvider` 的内部状态。
 
 <details>
 <summary>展开完整代码：<code>stage-02-model-stream.ts</code></summary>
@@ -830,7 +830,7 @@ console.log(JSON.stringify(finalMessage, null, 2));
 bun run examples/stage-02-model-stream.ts
 ```
 
-示例每 50ms 覆盖打印当前累计文本，并在结束时打印 canonical `AssistantMessage` JSON。观察 UI 只依赖 canonical snapshot，不依赖 fake provider 的内部表示。
+示例每 50ms 覆盖打印当前累计文本，并在结束时打印 canonical `AssistantMessage`（项目内部统一的助手消息表示）的 JSON。观察 UI 只依赖 canonical snapshot（采用内部统一消息格式的累计快照），不依赖 fake provider 的内部表示。
 
 ### 2.4 完整测试
 
@@ -1692,7 +1692,7 @@ bun run examples/foundation-demo.ts 7 8
 ```
 
 第一条命令的累计快照最终是“计算结果是 5。”，第二条则会根据真实 Tool 输出得到
-“计算结果是 15。”。随后打印的 canonical transcript 依次包含 user message、模型生成的
+“计算结果是 15。”。随后打印的 canonical transcript（采用内部统一消息格式的正式对话记录）依次包含 user message、模型生成的
 `tool_use`、关联的 `tool_result` 和基于该 result 生成的最终 assistant message。
 
 这里仍然是一个确定性 fake provider：它只模拟“第一次请求 Tool、第二次读取 observation”

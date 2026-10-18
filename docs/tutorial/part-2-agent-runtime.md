@@ -226,7 +226,7 @@ export function serializeToolResult(result: unknown): string {
 }
 ```
 
-不要把原始对象塞进 canonical `ToolResultContent`，否则 checkpoint、provider converter 和 TUI 会分别发明序列化行为。
+不要把原始对象塞进 canonical `ToolResultContent`（项目内部统一的工具结果内容类型），否则 checkpoint、provider converter 和 TUI 会分别发明序列化行为。
 
 最后填充本阶段创建的 Agent barrel：
 
@@ -250,7 +250,7 @@ content 数组顺序生成快照，每个快照都保留已经完成的 block：
 - `text.text` 和 `thinking.thinking` 按 Unicode code point 累积；
 - `tool_use` 保持 `id` 稳定，先累积 `name`，再逐个填充 `input` 字段。字符串字段逐字累积，
   数字、布尔值、null、数组和嵌套对象作为一个字段值整体加入；
-- `input` 始终是对象，不把不完整的 JSON 字符串冒充 canonical input。真实 Provider 的
+- `input` 始终是对象，不把不完整的 JSON 字符串冒充 canonical input（按内部统一约定表示的工具参数对象）。真实 Provider 的
   fragmented JSON 解析留到阶段 7；这里模拟的是解析后的累计对象；
 - 空 content、空文本、空 thinking 和空参数也有最终快照。中间快照相互独立，
   最终快照与同一脚本 response 的 `invoke()` 结果深度相等。

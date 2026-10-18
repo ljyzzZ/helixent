@@ -94,7 +94,7 @@ Eval runner → fixtures → isolated workspace → agent run → graders → re
 | 6. Middleware | lifecycle demo | 完整 hook 调用顺序 | `feat(agent): 引入中间件生命周期` |
 | 7. Provider | 真实模型 chat | OpenAI/Anthropic 流式回复 | `feat(provider): 接入模型适配器` |
 | 8. Coding tools | workspace agent | 读取、搜索、修改临时仓库 | `feat(coding): 实现编码工具集` |
-| 9. Context 能力 | coding agent composition | Skills/Todo/项目指令生效 | `feat(coding): 组装编码智能体` |
+| 9. Context 能力 | coding agent composition | Skills/Todo/`AGENTS.md` 生效 | `feat(coding): 组装编码智能体` |
 | 10. CLI/TUI 与审批 | 交互式 coding agent | 进度提示、token、审批弹窗 | `feat(cli): 完成交互式客户端` |
 | 11. Observability | trace recorder/viewer | step/tool/token/latency 时间线 | `feat(trace): 记录运行轨迹` |
 | 12. Recovery | resume/replay CLI | 中断后续跑、无模型重放 | `feat(runtime): 支持断点恢复` |
