@@ -2405,14 +2405,6 @@ bun run check
 
 这里汇总前面已运行的离线测试，不再引入新的测试文件，也不依赖 7D 的真实 API 配置。
 
-#### 阶段后对照
-
-- `src/community/openai/model-provider.ts`
-- `src/community/openai/utils.ts`
-- `src/community/openai/stream-utils.ts`（练习项目将对应文件命名为 `stream-accumulator.ts`）
-- `src/community/anthropic/model-provider.ts`
-- `src/community/anthropic/utils.ts`
-- `src/community/anthropic/stream-utils.ts`（练习项目将对应文件命名为 `stream-accumulator.ts`）
 
 #### 验收
 
@@ -4108,12 +4100,6 @@ describe("bash", () => {
 bun test src/coding/tools
 ```
 
-### 阶段后对照
-
-- `src/coding/tools/` 下各实现；
-- `src/coding/tools/__tests__/`；
-- `src/coding/tools/tool-utils.ts`；
-- `src/coding/tools/tool-result.ts`。
 
 ### 验收
 
@@ -4562,6 +4548,24 @@ bun test src/agent/skills
 
 ### 9.3 让 Todo 更新影响后续推理
 
+Todo 就是“待办事项”。在这里，它是 Agent 为当前任务维护的一份结构化工作清单，
+记录要做什么、正在做什么、已经完成什么。例如用户要求“修复登录失败并补测试”，
+Agent 可以把工作拆成三项：
+
+| 待办事项 | 状态 | 含义 |
+|---|---|---|
+| 定位登录失败的原因 | `in_progress` | 正在处理 |
+| 修改登录逻辑 | `pending` | 尚未开始 |
+| 补充并运行回归测试 | `pending` | 尚未开始 |
+
+定位完成后，Agent 将第一项改为 `completed`（已完成），再把第二项改为 `in_progress`。
+这样，多步读文件、改代码、跑测试之后，仍有一份明确的进度记录可供检查，后面的 TUI
+也可以直接展示它。简单的一步问答通常不需要拆清单，多步骤任务才更能体现它的作用。
+
+这份清单由模型调用 `todo_write` 主动更新，保存在程序的 `TodoSystem` 中；它不会自动
+执行清单上的工作，也不会验证任务是否真的完成。如果模型连续多步没有更新清单，
+我们就把未完成项作为提醒加入下一次模型请求，让模型重新检查进度、决定后续行动。
+
 Todo 需要同时服务两条路径：`todo_write` 改变结构化状态；模型多步没有更新任务时，
 Middleware 根据该状态生成提醒。两者必须引用同一个 `TodoSystem`。
 
@@ -4572,8 +4576,24 @@ touch src/agent/todos/todo-system.ts src/agent/todos/index.ts src/agent/todos/__
 
 #### 9.3.1 练习：合并状态与决定提醒时机
 
+先实现管理清单的 `TodoSystem`，下一节再把它接入 Agent。每个 `TodoItem` 用稳定的
+`id` 标识同一项工作，`text` 描述工作内容，`status` 记录上述三种状态。本节约定最多
+一项处于 `in_progress`，让清单明确当前正在推进的重点。
+
+读代码前，先理解它提供的三个操作：
+
+- `write({ merge: false, items })`：用传入的完整列表替换旧清单，适合首次制定或重新制定计划。
+  `merge: true` 则按 `id` 更新已有项、追加新项，保留未提及的项，适合推进部分任务的状态。
+- `snapshot()`：返回当前清单的副本，供工具结果和 UI 读取，避免调用方意外修改内部状态。
+- `reminderForStep(step)`：检查是否需要提醒。这里的 step 是 Agent 的推理步骤计数，
+  不是待办项数量或经过的秒数；`reminderAfterSteps: 3` 表示至少间隔三步才再次提醒。
+  成功更新清单会重新计时，全部完成后停止提醒。
+
 目标文件：`src/agent/todos/todo-system.ts`。全量替换、候选状态校验、提交和快照是完整参照；
 你需要实现按 id 合并，以及提醒的时间判断。
+
+<details>
+<summary>展开练习骨架：<code>todo-system.ts</code></summary>
 
 ```ts
 import { z } from "zod";
@@ -4655,6 +4675,8 @@ export class TodoSystem {
   }
 }
 ```
+
+</details>
 
 先完成 `write` 的 merge 分支。它与已给出的 replace 分支都只负责准备 `next`，
 之后统一检查“最多一个 `in_progress`”，最后才提交。可用以 id 为 key 的 `Map`，
@@ -5390,8 +5412,18 @@ await main();
 bun run examples/stage-09-coding-agent.ts fixture
 ```
 
-观察三件事：首次模型请求包含 `AGENTS.md` 内容和 Skill 元数据；选择后出现与 `skill-1` 配对的
-正文读取结果；`ask-1` 的答案返回后，`todo-2` 把任务更新为 completed。
+首次模型请求包含 `AGENTS.md` 内容和 Skill 元数据。随后，模拟模型按预设顺序发出以下内容，
+可以逐步对照 Agent 的执行结果：
+
+| 步骤 | 模拟模型发出的内容 | Agent 执行结果 |
+| --- | --- | --- |
+| 1 | 调用 `read_file`，读取 `.agents/skills/test-writer/SKILL.md` | 返回 Skill 正文，其中要求先读源码、添加测试、运行测试 |
+| 2 | 调用 `todo_write`，`merge: false` | 创建任务 `inspect`，状态为 `in_progress` |
+| 3 | 调用 `read_file`，读取 `src/math.ts` | 返回 `export const add = (a: number, b: number) => a + b;` |
+| 4 | 调用 `ask_user_question` | 得到预设回答 `fixture answer: Should we add a test next?` |
+| 5 | 调用 `todo_write`，`merge: true` | 按相同的 `id: "inspect"`，把任务更新为 `completed` |
+| 6 | 返回普通文本 | 没有新的工具调用，Agent 结束本轮运行 |
+
 最后的快照应只有已完成的 `inspect` 任务。提醒会出现在 Model view 中，而不会冒充
 用户消息出现在 canonical transcript（作为事实来源维护的正式对话记录）中。
 
@@ -5402,12 +5434,7 @@ bun test src/agent/skills src/agent/todos src/coding/agents src/coding/tools/__t
 bun run check:types
 ```
 
-### 阶段后对照
 
-- `src/coding/agents/lead-agent.ts`
-- `src/agent/skills/`
-- `src/agent/todos/`
-- `src/coding/tools/ask-user-question.ts`
 
 ### 验收
 
@@ -6965,13 +6992,6 @@ describe("HumanInputQueue", () => {
 bun test src/cli src/coding/permissions
 ```
 
-### 阶段后对照
-
-- `src/cli/`
-- `src/cli/tui/hooks/use-agent-loop.ts`
-- `src/cli/tui/components/`
-- `src/cli/config/` 和 `src/cli/settings/`
-- `src/coding/permissions/`
 
 ### 基础复刻总验收
 
